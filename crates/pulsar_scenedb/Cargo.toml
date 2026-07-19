@@ -1,0 +1,83 @@
+[package]
+name = "pulsar_scenedb"
+version = "0.1.0"
+edition = "2021"
+description = "SceneDB 2.0 — engine-wide spatial database (Layer 1 storage core)"
+
+[features]
+default = []
+gpu = ["dep:wgpu"]
+telemetry = ["dep:socket2", "dep:serde", "gpu"]
+
+[dependencies]
+pulsar_reflection = { path = "../../../pulsar_reflection/crates/pulsar_reflection" }
+serde_json        = { workspace = true }
+socket2           = { workspace = true, optional = true }
+serde             = { workspace = true, optional = true }
+ahash             = "0.8"
+profiling         = { path = "../../../profiling/crates/profiling" }
+tracing           = { workspace = true }
+wgpu              = { version = "30", optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+criterion = { version = "=0.8.2" }
+pollster = "1.0"
+naga = { version = "30", features = ["wgsl-in"] }
+ratatui = "0.29"
+crossterm = "0.28"
+pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
+
+[[example]]
+name = "stress_tui"
+required-features = []
+
+[[bench]]
+name = "ecs_bench"
+harness = false
+
+[[bench]]
+name = "hotpath_profiler"
+harness = false
+
+[[bench]]
+name = "ecs_detailed_bench"
+harness = false
+
+[[bench]]
+name = "scenedb_bench"
+harness = false
+
+[[bench]]
+name = "gpu_timing"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "legacy_model_bench"
+harness = false
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_store"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_layout"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_assets"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_harvest"
+required-features = ["gpu"]
+
+[[test]]
+name = "alloc_gate_gpu"
+required-features = ["gpu"]
+
+[[test]]
+name = "stress_gpu"
+required-features = ["gpu"]
