@@ -10,12 +10,12 @@ gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
-pulsar_reflection = { path = "../../../pulsar_reflection/crates/pulsar_reflection" }
+pulsar_reflection = { path = "../../../Pulsar-Native/crates/core/pulsar_reflection" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
 ahash             = "0.8"
-profiling         = { path = "../../../profiling/crates/profiling" }
+profiling         = { path = "../../../Pulsar-Native/crates/core/profiling" }
 tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
 
