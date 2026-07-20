@@ -1140,12 +1140,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = sim.end().end().end().run(&mut _telemetry.store, &mut cell_slots);
                 }
             }
-            // ── Push full snapshot (cells + GPU store data) ────────────
+            // ── Build cell snapshots from workload metrics ─────────────
+            let mut workload_snaps: Vec<pulsar_scenedb::telemetry::CellSnapshot> = Vec::new();
+            let total_ops: u64 = state.metrics.iter().map(|m| m.ops.load(Ordering::Relaxed)).sum();
+            for (i, m) in state.metrics.iter().enumerate() {
+                let ops = m.ops.load(Ordering::Relaxed);
+                let errs = m.errors.load(Ordering::Relaxed);
+                let lat_ns = m.latency_ns.load(Ordering::Relaxed);
+                let running = m.running.load(Ordering::Relaxed);
+                workload_snaps.push(pulsar_scenedb::telemetry::CellSnapshot {
+                    id: 1000 + i as u32,
+                    rows_in_use: (ops % 1_000_000) as u32,
+                    capacity: 1_000_000,
+                    user_column_count: 3,
+                    pod_columns: vec![(1, 0), (2, 1), (3, 2)],
+                    generic_columns: Vec::new(),
+                    pod_data: vec![
+                        pulsar_scenedb::telemetry::ColumnData {
+                            component_id: 1, element_size: 4,
+                            rows_hex: vec![format!("{:08x}", ops as u32)],
+                        },
+                        pulsar_scenedb::telemetry::ColumnData {
+                            component_id: 2, element_size: 4,
+                            rows_hex: vec![format!("{:08x}", errs as u32)],
+                        },
+                        pulsar_scenedb::telemetry::ColumnData {
+                            component_id: 3, element_size: 8,
+                            rows_hex: vec![format!("{:016x}", lat_ns)],
+                        },
+                    ],
+                    slot_column: vec![0, 1, 2],
+                    liveness_bits: vec![0xFFFFFFFFFFFFFFFF],
+                    cell_type_name: format!("{} {}", m.name, if running { "▶" } else { "⏹" }),
+                });
+            }
+            // ── Get GPU store snapshot, replace cells with workload data ─
             let pairs: Vec<(pulsar_scenedb::gpu::CellId, &CellStorage)> = _telemetry.ids
                 .iter().copied()
                 .zip(_telemetry.cells.iter().collect::<Vec<_>>())
                 .collect();
-            let snap = pulsar_scenedb::telemetry::TelemetrySnapshot::collect(&_telemetry.store, &pairs);
+            let mut snap = pulsar_scenedb::telemetry::TelemetrySnapshot::collect(&_telemetry.store, &pairs);
+            snap.cells = workload_snaps;
             _telemetry.server.push_snapshot(snap);
         }
 
