@@ -3,8 +3,10 @@
 import { useState } from "react";
 import { usePoll, fetchGpu, fetchGpuBuffers, type GpuSnapshot, type GpuBufferSnapshot } from "@/lib/api";
 
+const EMPTY_GPU: GpuSnapshot = { gen_writes: 0, buffers: [], cell_gpu_states: [] };
+
 export default function GpuPage() {
-  const [gpu, setGpu] = useState<GpuSnapshot | null>(null);
+  const [gpu, setGpu] = useState<GpuSnapshot>(EMPTY_GPU);
   const [buffers, setBuffers] = useState<GpuBufferSnapshot[]>([]);
 
   usePoll(async () => {
@@ -12,7 +14,41 @@ export default function GpuPage() {
     setGpu(g); setBuffers(b);
   }, []);
 
-  if (!gpu) return <p className="text-github-text-muted text-center py-20">Loading...</p>;
+  const hasGpu = buffers.length > 0 || gpu.cell_gpu_states.some(s => s.alive || s.dirty_column_count > 0);
+
+  if (!hasGpu) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-xl font-semibold">GPU Store</h1>
+        </div>
+        <div className="card max-w-xl">
+          <div className="flex items-start gap-4 py-4">
+            <div className="w-10 h-10 rounded-lg bg-github-blue/10 flex items-center justify-center shrink-0 mt-1">
+              <svg className="w-5 h-5 text-github-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <rect x="8" y="7" width="8" height="6" rx="1" />
+                <circle cx="12" cy="10" r="1.5" fill="currentColor" />
+              </svg>
+            </div>
+            <div>
+              <p className="font-medium mb-1">No GPU Store Configured</p>
+              <p className="text-sm text-github-text-secondary leading-relaxed">
+                The connected SceneDB instance is running in CPU-only mode. GPU telemetry requires
+                a <code className="text-github-accent text-xs bg-github-border-muted/50 px-1 rounded">SceneGpuStore</code> —
+                enable it by registering cells through the GPU store API and activating the
+                <code className="text-github-accent text-xs bg-github-border-muted/50 px-1 rounded ml-1">gpu</code> feature.
+              </p>
+              <p className="text-sm text-github-text-secondary mt-3">
+                The stress TUI (<code className="text-xs bg-github-border-muted/50 px-1 rounded">examples/stress_tui.rs</code>)
+                runs CPU workloads only. Switch to a GPU-enabled SceneDB instance to see GPU state here.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const activeCells = gpu.cell_gpu_states.filter((s) => s.alive);
   const totalDirty = gpu.cell_gpu_states.reduce((s, c) => s + c.dirty_column_count, 0);

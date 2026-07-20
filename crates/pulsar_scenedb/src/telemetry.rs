@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -105,6 +107,103 @@ pub struct PoolInfo {
     pub region_size: u32,
     pub total: u32,
     pub free: u32,
+}
+
+// ── Query log ─────────────────────────────────────────────────────────────
+// Lock-free ring buffer for tracking recent spatial queries.
+// Enabled only when `telemetry` feature is active; zero-cost when disabled.
+
+#[derive(Clone, Serialize)]
+pub struct QueryLogEntry {
+    pub timestamp_ms: u64,
+    pub query_type: String,
+    pub cell_id: u32,
+    pub duration_ns: u64,
+    pub rows_returned: u32,
+    pub total_rows: u32,
+}
+
+#[derive(Clone, Serialize)]
+pub struct FrequentQuery {
+    pub query_type: String,
+    pub cell_id: u32,
+    pub count: u64,
+    pub avg_duration_ns: u64,
+}
+
+pub struct QueryLog {
+    entries: Mutex<VecDeque<QueryLogEntry>>,
+    max_entries: usize,
+}
+
+impl QueryLog {
+    pub const fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::new()),
+            max_entries,
+        }
+    }
+
+    pub fn log(&self, entry: QueryLogEntry) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push_back(entry);
+            while entries.len() > self.max_entries {
+                entries.pop_front();
+            }
+        }
+    }
+
+    pub fn recent(&self, n: usize) -> Vec<QueryLogEntry> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(n)
+            .cloned()
+            .collect()
+    }
+
+    pub fn frequent(&self, n: usize) -> Vec<FrequentQuery> {
+        use std::collections::HashMap;
+        let entries = self.entries.lock().unwrap();
+        let mut counts: HashMap<(&str, u32), (u64, u64)> = HashMap::new();
+        for e in entries.iter() {
+            let key = (e.query_type.as_str(), e.cell_id);
+            let (count, total_dur) = counts.entry(key).or_insert((0, 0));
+            *count += 1;
+            *total_dur += e.duration_ns;
+        }
+        let mut result: Vec<FrequentQuery> = counts
+            .into_iter()
+            .map(|((qtype, cid), (count, total_dur))| FrequentQuery {
+                query_type: qtype.to_string(),
+                cell_id: cid,
+                count,
+                avg_duration_ns: total_dur / count,
+            })
+            .collect();
+        result.sort_by(|a, b| b.count.cmp(&a.count));
+        result.truncate(n);
+        result
+    }
+}
+
+pub static QUERY_LOG: LazyLock<QueryLog> = LazyLock::new(|| QueryLog::new(4096));
+
+pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned: u32, total_rows: u32) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    QUERY_LOG.log(QueryLogEntry {
+        timestamp_ms,
+        query_type: query_type.to_string(),
+        cell_id,
+        duration_ns,
+        rows_returned,
+        total_rows,
+    });
 }
 
 // ── Snapshot collection ───────────────────────────────────────────────────
@@ -366,6 +465,12 @@ fn handle_route(path: &str, snap: &TelemetrySnapshot) -> HttpResponse {
             status: "200 OK",
             body: "{\"status\":\"ok\"}".into(),
         },
+        "/queries/recent" => {
+            json_response(&QUERY_LOG.recent(100))
+        }
+        "/queries/frequent" => {
+            json_response(&QUERY_LOG.frequent(100))
+        }
         _ if path.starts_with("/cells/") => {
             let rest = &path[7..];
             if let Some(cell_id_str) = rest.split('/').next() {
@@ -446,6 +551,8 @@ const ENDPOINTS: &[(&str, &str)] = &[
     ("/schema", "registered type schemas"),
     ("/stats", "telemetry counters"),
     ("/query?cell=N&col=M&start=R1&end=R2", "query raw row data"),
+    ("/queries/recent", "recent 100 spatial queries"),
+    ("/queries/frequent", "most frequent 100 queries"),
     ("/health", "health check"),
 ];
 

@@ -7,6 +7,7 @@
 //! Dash: cargo run -p scenedb_dashboard -- --telemetry-port 8081
 
 use pulsar_scenedb::*;
+use rand::Rng;
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -21,6 +22,18 @@ fn main() {
         .collect();
 
     let mut handles: Vec<Vec<Handle>> = cells.iter().map(|_| Vec::new()).collect();
+
+    // Spatial cell for query logging
+    let mut spatial = SpatialCell::new(256).unwrap();
+    spatial.set_telemetry_cell_id(10);
+    let mut rng = rand::thread_rng();
+    for _ in 0..200 {
+        let min = [rng.gen::<f32>() * 100.0 - 50.0; 3];
+        let max = [min[0] + rng.gen::<f32>() * 20.0 + 0.1, min[1] + rng.gen::<f32>() * 20.0 + 0.1, min[2] + rng.gen::<f32>() * 20.0 + 0.1];
+        spatial.alloc(Aabb { min, max });
+    }
+    let mut out: Vec<u32> = vec![0u32; 256];
+    let mut liveness_words: Vec<u64> = vec![0u64; 4];
 
     // Seed cells
     for (i, cell) in cells.iter_mut().enumerate() {
@@ -83,6 +96,22 @@ fn main() {
             for (i, cell) in cells.iter().enumerate() {
                 handles[i].retain(|&h| cell.row_of(h).is_some());
             }
+        }
+
+        // Run spatial queries every 4 frames to populate query log
+        if frame % 4 == 0 {
+            let len = spatial.storage().rows_in_use() as usize;
+            let nw = len.div_ceil(64);
+            let words = spatial.storage().liveness().words();
+            for (i, w) in words.iter().enumerate().take(nw) {
+                liveness_words[i] = w.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            // AABB query
+            let q = Aabb { min: [-20.0; 3], max: [20.0; 3] };
+            let _ = spatial.query_aabb_in(&q, &liveness_words[..nw], &mut out[..len]);
+            // Frustum query
+            let planes = [[1.0,0.0,0.0,50.0],[-1.0,0.0,0.0,50.0],[0.0,1.0,0.0,50.0],[0.0,-1.0,0.0,50.0],[0.0,0.0,1.0,50.0],[0.0,0.0,-1.0,50.0]];
+            let _ = spatial.query_frustum_in(&Frustum { planes }, &liveness_words[..nw], &mut out[..len]);
         }
 
         // Push snapshot
