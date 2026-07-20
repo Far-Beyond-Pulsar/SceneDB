@@ -577,9 +577,6 @@ fn handle_connection(mut stream: TcpStream, snap: &TelemetrySnapshot) {
     let path = request
         .split_whitespace()
         .nth(1)
-        .unwrap_or("/")
-        .split('?')
-        .next()
         .unwrap_or("/");
 
     let response = handle_route(path, snap);
