@@ -7,9 +7,9 @@ interface LogLine {
   cls: "output" | "input" | "error" | "prompt" | "help" | "info";
 }
 
-const LINE_HEIGHT = 20;
-const MINIMAP_BAR = 3;
-const MINIMAP_WIDTH = 40;
+const MINIMAP_W = 36;
+const BAR_H = 2;
+const BAR_GAP = 1;
 
 const HELP_TEXT: LogLine[] = [
   { text: "", cls: "help" },
@@ -30,7 +30,7 @@ const HELP_TEXT: LogLine[] = [
   { text: "", cls: "help" },
 ];
 
-const clsToColor: Record<string, string> = {
+const CLS_COLOR: Record<string, string> = {
   input: "#58a6ff",
   error: "#f85149",
   help: "#8b949e",
@@ -46,11 +46,10 @@ export default function QueryShell() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx] = useState(-1);
-  const [scrollTop, setScrollTop] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const minimapRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef(false);
+  const dragging = useRef(false);
   const [busy, setBusy] = useState(false);
 
   const add = useCallback((text: string, cls: LogLine["cls"] = "output") =>
@@ -61,6 +60,10 @@ export default function QueryShell() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return JSON.stringify(await res.json(), null, 2);
   };
+
+  const scrollToBottom = () => requestAnimationFrame(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  });
 
   const run = async (cmd: string) => {
     const trimmed = cmd.trim();
@@ -95,91 +98,50 @@ export default function QueryShell() {
     requestAnimationFrame(() => { inputRef.current?.focus(); scrollToBottom(); });
   };
 
-  const scrollToBottom = () => {
-    requestAnimationFrame(() => {
-      if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    });
-  };
-
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" && !busy) { run(input); setInput(""); }
     else if (e.key === "ArrowUp") { e.preventDefault(); if (history.length) { const idx = histIdx < 0 ? history.length - 1 : Math.max(0, histIdx - 1); setHistIdx(idx); setInput(history[idx]); } }
     else if (e.key === "ArrowDown") { e.preventDefault(); if (histIdx >= 0) { if (histIdx >= history.length - 1) { setHistIdx(-1); setInput(""); } else { const idx = histIdx + 1; setHistIdx(idx); setInput(history[idx]); } } }
   };
 
-  const onScroll = useCallback(() => {
-    if (scrollRef.current) setScrollTop(scrollRef.current.scrollTop);
-  }, []);
-
-  const [viewHeight, setViewHeight] = useState(400);
-  useEffect(() => {
-    const el = scrollRef.current?.parentElement;
-    if (el) setViewHeight(el.clientHeight - 48);
-  }, []);
-
-  const totalLines = logs.length;
-  const scrollMax = Math.max(totalLines * LINE_HEIGHT - viewHeight, 1);
-
-  const minimapSeek = (clientY: number) => {
-    const rect = minimapRef.current?.getBoundingClientRect();
-    if (!rect || !scrollRef.current) return;
-    const frac = (clientY - rect.top) / rect.height;
-    scrollRef.current.scrollTop = Math.round(frac * scrollMax);
+  const seek = (clientY: number) => {
+    const r = minimapRef.current?.getBoundingClientRect();
+    const s = scrollRef.current;
+    if (!r || !s) return;
+    const maxScroll = s.scrollHeight - s.clientHeight;
+    if (maxScroll <= 0) return;
+    const frac = Math.max(0, Math.min(1, (clientY - r.top) / r.height));
+    s.scrollTop = frac * maxScroll;
   };
 
-  const minimapDown = (e: MouseEvent<HTMLDivElement>) => {
-    draggingRef.current = true;
-    minimapSeek(e.clientY);
-  };
+  const onMinimapDown = (e: MouseEvent<HTMLDivElement>) => { dragging.current = true; seek(e.clientY); };
+  const onMinimapMove = (e: MouseEvent<HTMLDivElement>) => { if (dragging.current) seek(e.clientY); };
+  const onMinimapUp = () => { dragging.current = false; };
 
   return (
-    <div className="card p-0 flex flex-col font-mono text-sm" style={{ height: "70vh" }}>
-      <div className="flex flex-1 min-h-0">
-        <div
-          ref={scrollRef}
-          onScroll={onScroll}
-          className="flex-1 overflow-y-auto overscroll-contain"
-        >
-          <div className="p-4 pb-0 space-y-0.5 select-text" style={{ minHeight: "100%" }} onClick={() => inputRef.current?.focus()}>
-            {logs.map((l, i) => (
-              <div key={i} style={{ color: clsToColor[l.cls] || "#e6edf3" }} className="whitespace-pre-wrap break-all leading-5">
-                {l.text}
-              </div>
-            ))}
-            <div className="h-4" />
-          </div>
+    <div className="card p-0 flex flex-col font-mono text-sm overflow-hidden relative" style={{ height: "70vh" }}>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        <div className="p-4 pb-0 space-y-0.5 select-text" onClick={() => inputRef.current?.focus()}>
+          {logs.map((l, i) => (
+            <div key={i} style={{ color: CLS_COLOR[l.cls] || "#e6edf3" }} className="whitespace-pre-wrap break-all leading-5">
+              {l.text}
+            </div>
+          ))}
+          <div className="h-4" />
         </div>
+      </div>
 
-        <div
-          ref={minimapRef}
-          onMouseDown={minimapDown}
-          onMouseMove={(e) => { if (draggingRef.current) minimapSeek(e.clientY); }}
-          onMouseUp={() => { draggingRef.current = false; }}
-          onMouseLeave={() => { draggingRef.current = false; }}
-          className="relative shrink-0 border-l border-github-border-muted cursor-pointer select-none overflow-hidden hover:bg-github-border-muted/20 transition-colors"
-          style={{ width: MINIMAP_WIDTH }}
-        >
-          <div className="absolute inset-0 flex flex-col px-[3px] py-[2px] gap-[1px]">
-            {logs.map((l, i) => (
-              <div key={i} style={{
-                height: 2,
-                backgroundColor: clsToColor[l.cls] || "#e6edf3",
-                opacity: 0.4,
-                width: "100%",
-                borderRadius: 1,
-                flexShrink: 0,
-              }} />
-            ))}
-          </div>
-          <div style={{
-            position: "absolute", left: 0, right: 0,
-            top: `${(scrollTop / scrollMax) * 100}%`,
-            height: `${(viewHeight / (totalLines * LINE_HEIGHT)) * 100}%`,
-            backgroundColor: "rgba(88,166,255,0.1)",
-            borderLeft: "2px solid rgba(88,166,255,0.4)",
-            pointerEvents: "none",
-          }} />
-        </div>
+      {/* minimap overlay */}
+      <div
+        ref={minimapRef}
+        onMouseDown={onMinimapDown}
+        onMouseMove={onMinimapMove}
+        onMouseUp={onMinimapUp}
+        onMouseLeave={onMinimapUp}
+        className="absolute right-0 top-0 bottom-12 cursor-pointer select-none z-10"
+        style={{ width: MINIMAP_W }}
+      >
+        <MiniMapBars logs={logs} scrollRef={scrollRef} />
       </div>
 
       <div className="flex items-center gap-2 border-t border-github-border-muted px-4 py-2.5 bg-github-card shrink-0">
@@ -197,3 +159,53 @@ export default function QueryShell() {
     </div>
   );
 }
+
+function MiniMapBars({ logs, scrollRef }: { logs: LogLine[]; scrollRef: React.RefObject<HTMLDivElement | null> }) {
+  const [vp, setVp] = useState({ top: 0, height: 10 });
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => {
+      const max = el.scrollHeight - el.clientHeight;
+      const top = max > 0 ? (el.scrollTop / max) * 100 : 0;
+      const height = Math.max((el.clientHeight / el.scrollHeight) * 100, 2);
+      setVp({ top, height });
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    return () => el.removeEventListener("scroll", update);
+  }, [logs.length, scrollRef]);
+
+  const barH = BAR_H + BAR_GAP;
+  const totalH = logs.length * barH;
+
+  return (
+    <div className="relative w-full h-full">
+      <div className="absolute inset-0 flex flex-col pt-2" style={{ gap: BAR_GAP }}>
+        {logs.map((l, i) => (
+          <div key={i} style={{
+            height: BAR_H,
+            backgroundColor: CLS_COLOR[l.cls] || "#e6edf3",
+            opacity: 0.3,
+            flexShrink: 0,
+            borderRadius: 1,
+            marginLeft: 4,
+            marginRight: 4,
+          }} />
+        ))}
+      </div>
+      <div style={{
+        position: "absolute", left: 1, right: 1,
+        top: `${vp.top}%`,
+        height: `${vp.height}%`,
+        backgroundColor: "rgba(88,166,255,0.08)",
+        borderLeft: "2px solid rgba(88,166,255,0.35)",
+        borderRadius: 2,
+        pointerEvents: "none",
+      }} />
+    </div>
+  );
+}
+
+
