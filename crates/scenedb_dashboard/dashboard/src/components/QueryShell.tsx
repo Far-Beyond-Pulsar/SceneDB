@@ -50,13 +50,13 @@ function drawMinimap(canvas: HTMLCanvasElement, logs: LogLine[], vpFrac: number,
   ctx.save();
   ctx.translate(0, 0);
   ctx.scale(1, s);
-  ctx.font = `${FONT_PX}px monospace`;
+  ctx.font = `${FONT_PX}px ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace`;
   ctx.textBaseline = "top";
   for (let i = 0; i < logs.length; i++) {
     const l = logs[i];
     ctx.fillStyle = CLS_COLOR[l.cls] || "#e6edf3";
-    ctx.globalAlpha = 0.45;
-    ctx.fillText(l.text.slice(0, 60), 2, i * lineH);
+    ctx.globalAlpha = 0.5;
+    ctx.fillText(l.text.slice(0, 28), 2, i * lineH);
   }
   ctx.globalAlpha = 1;
   ctx.restore();
