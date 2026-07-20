@@ -124,6 +124,7 @@ pub struct QueryLogEntry {
     pub duration_ns: u64,
     pub rows_returned: u32,
     pub total_rows: u32,
+    pub args: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,19 +195,31 @@ impl QueryLog {
 
 pub static QUERY_LOG: LazyLock<QueryLog> = LazyLock::new(|| QueryLog::new(4096));
 
-pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned: u32, total_rows: u32) {
+/// Separate ring buffer for queries exceeding the slow threshold.
+/// Stores fewer entries since these are notable outliers.
+pub static SLOW_QUERY_LOG: LazyLock<QueryLog> = LazyLock::new(|| QueryLog::new(500));
+
+/// Queries taking longer than this (in ns) are logged to `SLOW_QUERY_LOG`.
+pub const SLOW_QUERY_THRESHOLD_NS: u64 = 200_000;
+
+pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned: u32, total_rows: u32, args: &str) {
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    QUERY_LOG.log(QueryLogEntry {
+    let entry = QueryLogEntry {
         timestamp_ms,
         query_type: query_type.to_string(),
         cell_id,
         duration_ns,
         rows_returned,
         total_rows,
-    });
+        args: args.to_string(),
+    };
+    QUERY_LOG.log(entry.clone());
+    if duration_ns > SLOW_QUERY_THRESHOLD_NS {
+        SLOW_QUERY_LOG.log(entry);
+    }
 }
 
 // ── Snapshot collection ───────────────────────────────────────────────────
@@ -480,6 +493,9 @@ fn handle_route(path: &str, snap: &TelemetrySnapshot) -> HttpResponse {
         "/queries/frequent" => {
             json_response(&QUERY_LOG.frequent(100))
         }
+        "/queries/slow" => {
+            json_response(&SLOW_QUERY_LOG.recent(100))
+        }
         _ if path.starts_with("/cells/") => {
             let rest = &path[7..];
             if let Some(cell_id_str) = rest.split('/').next() {
@@ -562,6 +578,7 @@ const ENDPOINTS: &[(&str, &str)] = &[
     ("/query?cell=N&col=M&start=R1&end=R2", "query raw row data"),
     ("/queries/recent", "recent 100 spatial queries"),
     ("/queries/frequent", "most frequent 100 queries"),
+    ("/queries/slow", "slow queries (>200µs), last 100"),
     ("/health", "health check"),
 ];
 

@@ -169,7 +169,7 @@ impl SpatialCell {
         let cols = crate::simd::Columns { min_x, max_x, min_y, max_y, min_z, max_z };
         let n = crate::simd::aabb_scan(&qb, &cols, liveness_words, len, out);
         #[cfg(feature = "telemetry")]
-        crate::telemetry::log_query("AABB", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32);
+        crate::telemetry::log_query("AABB", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32, &format!("min=[{:.1} {:.1} {:.1}] max=[{:.1} {:.1} {:.1}]", q.min[0], q.min[1], q.min[2], q.max[0], q.max[1], q.max[2]));
         n
     }
 
@@ -220,7 +220,7 @@ impl SpatialCell {
         let cols = crate::simd::Columns { min_x, max_x, min_y, max_y, min_z, max_z };
         let n = crate::simd::frustum_scan(&fp, &cols, liveness_words, len, out);
         #[cfg(feature = "telemetry")]
-        crate::telemetry::log_query("Frustum", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32);
+        crate::telemetry::log_query("Frustum", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32, &format!("planes=[{:.2} {:.2} {:.2} {:.2} ..]", f.planes[0][0], f.planes[0][1], f.planes[0][2], f.planes[0][3]));
         n
     }
 
