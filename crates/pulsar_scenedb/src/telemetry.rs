@@ -64,6 +64,9 @@ pub struct ColumnData {
 #[derive(Serialize)]
 pub struct GpuSnapshot {
     pub gen_writes: u64,
+    pub sync_ranges: u64,
+    pub sync_bytes: u64,
+    pub write_ops: u64,
     pub buffers: Vec<GpuBufferSnapshot>,
     /// Per-cell GPU state (dirty column counts, pending retires).
     pub cell_gpu_states: Vec<CellGpuSnapshot>,
@@ -211,6 +214,9 @@ pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned
 pub fn collect_gpu_snapshot(store: &SceneGpuStore) -> GpuSnapshot {
     GpuSnapshot {
         gen_writes: store.generation_write_count(),
+        sync_ranges: 0,
+        sync_bytes: 0,
+        write_ops: 0,
         buffers: store
             .telemetry_gpu_buffers()
             .iter()
@@ -231,7 +237,7 @@ pub fn collect_gpu_snapshot(store: &SceneGpuStore) -> GpuSnapshot {
                     row_base: state.row_base,
                     slot_base: state.slot_base,
                     slot_capacity: state.slot_capacity,
-                    dirty_column_count: state.dirty_columns.len(),
+                    dirty_column_count: state.dirty_columns.iter().filter(|m| m.is_some()).count(),
                     pending_retire_count: state.pending.len(),
                     alive: true,
                 },
@@ -380,6 +386,9 @@ impl TelemetrySnapshot {
             cells: cell_snapshots,
             gpu: GpuSnapshot {
                 gen_writes: 0,
+                sync_ranges: 0,
+                sync_bytes: 0,
+                write_ops: 0,
                 buffers: Vec::new(),
                 cell_gpu_states: Vec::new(),
             },
