@@ -54,6 +54,8 @@ pub struct Frustum {
 /// (AVX2/AVX-512/NEON) must produce bit-identical output buffers.
 pub struct SpatialCell {
     storage: CellStorage,
+    #[cfg(feature = "telemetry")]
+    telemetry_cell_id: u32,
 }
 
 impl SpatialCell {
@@ -61,6 +63,8 @@ impl SpatialCell {
         let columns = [ColumnDesc::of::<f32>(); SPATIAL_COLUMNS];
         Ok(Self {
             storage: CellStorage::new(&columns, capacity)?,
+            #[cfg(feature = "telemetry")]
+            telemetry_cell_id: 0,
         })
     }
 
@@ -90,7 +94,11 @@ impl SpatialCell {
         let mut storage = CellStorage::new(&columns, capacity)?;
         storage.register_token_column::<[f32; 16]>(TRANSFORM_COLUMN);
         storage.register_token_column::<InstanceInfo>(INSTANCE_INFO_COLUMN);
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            #[cfg(feature = "telemetry")]
+            telemetry_cell_id: 0,
+        })
     }
 
     /// Spec §8.2 predicate over all physical rows, writing positionally
@@ -146,6 +154,8 @@ impl SpatialCell {
     /// the caller's contract (the harvest pipeline recaptures per cell per
     /// frame).
     pub fn query_aabb_in(&self, q: &Aabb, liveness_words: &[u64], out: &mut [u32]) -> u32 {
+        #[cfg(feature = "telemetry")]
+        let _t0 = std::time::Instant::now();
         let len = self.storage.rows_in_use() as usize;
         assert!(out.len() >= len, "scratch buffer too small");
         debug_assert_eq!(liveness_words.len(), len.div_ceil(64));
@@ -157,7 +167,10 @@ impl SpatialCell {
         let max_z = &self.storage.user_column::<f32>(COL_MAX_Z)[..len];
         let qb = crate::simd::QueryBounds { min: q.min, max: q.max };
         let cols = crate::simd::Columns { min_x, max_x, min_y, max_y, min_z, max_z };
-        crate::simd::aabb_scan(&qb, &cols, liveness_words, len, out)
+        let n = crate::simd::aabb_scan(&qb, &cols, liveness_words, len, out);
+        #[cfg(feature = "telemetry")]
+        crate::telemetry::log_query("AABB", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32);
+        n
     }
 
     /// Frustum query (§8.1). Same positional-token output contract as
@@ -192,6 +205,8 @@ impl SpatialCell {
     /// the caller's contract (the harvest pipeline recaptures per cell per
     /// frame).
     pub fn query_frustum_in(&self, f: &Frustum, liveness_words: &[u64], out: &mut [u32]) -> u32 {
+        #[cfg(feature = "telemetry")]
+        let _t0 = std::time::Instant::now();
         let len = self.storage.rows_in_use() as usize;
         assert!(out.len() >= len, "scratch buffer too small");
         debug_assert_eq!(liveness_words.len(), len.div_ceil(64));
@@ -203,7 +218,15 @@ impl SpatialCell {
         let max_z = &self.storage.user_column::<f32>(COL_MAX_Z)[..len];
         let fp = crate::simd::FrustumPlanes { planes: f.planes };
         let cols = crate::simd::Columns { min_x, max_x, min_y, max_y, min_z, max_z };
-        crate::simd::frustum_scan(&fp, &cols, liveness_words, len, out)
+        let n = crate::simd::frustum_scan(&fp, &cols, liveness_words, len, out);
+        #[cfg(feature = "telemetry")]
+        crate::telemetry::log_query("Frustum", self.telemetry_cell_id, _t0.elapsed().as_nanos() as u64, n as u32, len as u32);
+        n
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub fn set_telemetry_cell_id(&mut self, id: u32) {
+        self.telemetry_cell_id = id;
     }
 
     // ── bench-only seams (perf-val T1/T7) ───────────────────────────────────

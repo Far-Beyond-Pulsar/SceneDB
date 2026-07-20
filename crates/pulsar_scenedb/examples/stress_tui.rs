@@ -843,6 +843,19 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "telemetry")]
+struct TelemetryBundle {
+    server: pulsar_scenedb::telemetry::TelemetryServer,
+    cells: Vec<CellStorage>,
+    handles: Vec<Vec<Handle>>,
+    ids: Vec<pulsar_scenedb::gpu::CellId>,
+    store: pulsar_scenedb::gpu::SceneGpuStore,
+    ctx: pulsar_scenedb::gpu::EngineGpuContext,
+    driver: pulsar_scenedb::gpu::FrameDriver,
+    caps: [u32; 4],
+    frame: u64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -867,6 +880,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     state.log(Color::Green, "SceneDB stress test initialized — 9 workers ready");
+
+    #[cfg(feature = "telemetry")]
+    let mut _telemetry = {
+        use pulsar_scenedb::gpu::{CellId, CellSlot, EngineGpuContext, FrameDriver, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
+        use pulsar_scenedb::spatial::{INSTANCE_INFO_COLUMN, SPATIAL_COLUMNS, TRANSFORM_COLUMN};
+        use pulsar_scenedb::telemetry::{TelemetryServer, TelemetrySnapshot};
+        use std::sync::Arc;
+
+        // Headless wgpu device
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })).expect("no GPU adapter — telemetry needs a local GPU");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("scenedb-telemetry"),
+            ..Default::default()
+        })).expect("wgpu device");
+        let ctx = EngineGpuContext::new(Arc::new(device), Arc::new(queue));
+
+        // SceneGpuStore with two size classes
+        let gpu_cfg = SceneGpuConfig {
+            classes: vec![
+                RegionClassConfig { capacity: 64, max_resident_cells: 8 },
+                RegionClassConfig { capacity: 256, max_resident_cells: 4 },
+            ],
+            tombstone_headroom: 64,
+            max_cells_metadata: 32,
+        };
+        let mut store = SceneGpuStore::new(&ctx, gpu_cfg);
+
+        let server = TelemetryServer::start(8081).expect("telemetry server on 8081");
+        let tele_caps: [u32; 4] = [64, 96, 128, 160];
+
+        // Create cells with transform + InstanceInfo + user columns
+        let mut tele_cells = Vec::new();
+        let mut tele_handles = Vec::new();
+        let mut tele_ids = Vec::new();
+        for (i, &cap) in tele_caps.iter().enumerate() {
+            let mut cols = vec![ColumnDesc::of::<f32>(); SPATIAL_COLUMNS + 4];
+            cols[TRANSFORM_COLUMN] = ColumnDesc::of::<[f32; 16]>();
+            cols[INSTANCE_INFO_COLUMN] = ColumnDesc::of::<InstanceInfo>();
+            cols[SPATIAL_COLUMNS + 2] = ColumnDesc::of::<f32>();
+            cols[SPATIAL_COLUMNS + 3] = ColumnDesc::of::<f64>();
+            let mut storage = CellStorage::new(&cols, cap).unwrap();
+            storage.register_token_column::<[f32; 16]>(TRANSFORM_COLUMN);
+            storage.register_token_column::<InstanceInfo>(INSTANCE_INFO_COLUMN);
+            let class = (i / 2).min(1); // first 2 in class 0, rest in class 1
+            let cid = store.register_cell(&storage, class).expect("register cell");
+            let mut hs = Vec::new();
+            for _ in 0..cap / 2 {
+                if let Some(h) = storage.alloc() {
+                    if let Some(row) = storage.row_of(h) {
+                        if let Some(col) = storage.column_for_mut::<f32>() {
+                            col[row as usize] = i as f32 * 10.0;
+                        }
+                    }
+                    hs.push(h);
+                }
+            }
+            tele_cells.push(storage);
+            tele_handles.push(hs);
+            tele_ids.push(cid);
+        }
+
+        state.log(Color::Cyan, "Telemetry server started on port 8081 — GPU store active");
+        state.log(Color::Cyan, format!("  {} cells registered in {} GPU buffer classes", tele_caps.len(), 2));
+        TelemetryBundle {
+            server, cells: tele_cells, handles: tele_handles, ids: tele_ids,
+            store, ctx, driver: FrameDriver::new(), caps: tele_caps, frame: 0u64,
+        }
+    };
 
     let workers: Vec<(Box<dyn Workload>, &str)> = vec![
         (Box::new(EntityStorm), "EntityStorm"),
@@ -1003,6 +1090,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if should_quit { break; }
 
         terminal.draw(|f| render(f, &state, &ui))?;
+
+        #[cfg(feature = "telemetry")]
+        {
+            _telemetry.frame += 1;
+            for (i, cell) in _telemetry.cells.iter_mut().enumerate() {
+                let cap = _telemetry.caps[i];
+                let hs = &mut _telemetry.handles[i];
+                if hs.len() < (cap as usize * 3 / 4) {
+                    if let Some(h) = cell.alloc() {
+                        if let Some(row) = cell.row_of(h) {
+                            if let Some(col) = cell.column_for_mut::<f32>() {
+                                col[row as usize] = _telemetry.frame as f32 * 0.01;
+                            }
+                        }
+                        hs.push(h);
+                    }
+                }
+                let to_free = (hs.len() / 8).max(1);
+                for _ in 0..to_free {
+                    if let Some(h) = hs.pop() {
+                        cell.free(h);
+                    }
+                }
+            }
+            if _telemetry.frame % 4 == 0 {
+                for cell in _telemetry.cells.iter_mut() {
+                    cell.compact();
+                }
+                for (i, cell) in _telemetry.cells.iter().enumerate() {
+                    _telemetry.handles[i].retain(|&h| cell.row_of(h).is_some());
+                }
+            }
+            // ── GPU frame boundary every 2 frames ───────────────────────
+            {
+                use pulsar_scenedb::gpu::CellSlot;
+                let mut cell_slots: Vec<CellSlot> = _telemetry.cells.iter_mut()
+                    .enumerate()
+                    .map(|(i, c)| CellSlot { id: _telemetry.ids[i], cell: c })
+                    .collect();
+                if _telemetry.frame % 2 == 0 {
+                    let sim = _telemetry.driver.begin();
+                    for (i, slot) in cell_slots.iter_mut().enumerate() {
+                        if let Some(h) = _telemetry.handles[i].first().copied() {
+                            let m = core::array::from_fn(|j| _telemetry.frame as f32 * 0.01 + j as f32);
+                            _telemetry.store.write_transform(_telemetry.ids[i], slot.cell, h, &m, &sim);
+                        }
+                    }
+                    let _ = sim.end().end().end().run(&mut _telemetry.store, &mut cell_slots);
+                }
+            }
+            // ── Push full snapshot (cells + GPU store data) ────────────
+            let pairs: Vec<(pulsar_scenedb::gpu::CellId, &CellStorage)> = _telemetry.ids
+                .iter().copied()
+                .zip(_telemetry.cells.iter().collect::<Vec<_>>())
+                .collect();
+            let snap = pulsar_scenedb::telemetry::TelemetrySnapshot::collect(&_telemetry.store, &pairs);
+            _telemetry.server.push_snapshot(snap);
+        }
 
         // Status log every ~3 seconds (every 90 draws at 30 FPS).
         // Use a static counter to avoid Atomic overhead in the hot loop.
