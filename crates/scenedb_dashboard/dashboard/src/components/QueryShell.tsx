@@ -112,8 +112,13 @@ export default function QueryShell() {
     return () => el.removeEventListener("scroll", onScroll);
   }, [scheduleDraw]);
 
-  const add = useCallback((text: string, cls: LogLine["cls"] = "output") =>
-    setLogs((p) => [...p, { text, cls }]), []);
+  const add = useCallback((text: string, cls: LogLine["cls"] = "output") => {
+    if (text.includes("\n")) {
+      setLogs((p) => [...p, ...text.split("\n").map((t) => ({ text: t, cls }))]);
+    } else {
+      setLogs((p) => [...p, { text, cls }]);
+    }
+  }, []);
 
   const api = async (path: string): Promise<string> => {
     const res = await fetch(`/api${path}`);
