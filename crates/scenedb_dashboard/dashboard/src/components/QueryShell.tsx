@@ -7,8 +7,8 @@ interface LogLine {
   cls: "output" | "input" | "error" | "prompt" | "help" | "info";
 }
 
-const MINIMAP_W = 100;
-const FONT_PX = 6;
+const MINIMAP_W = 120;
+const FONT_PX = 7;
 
 const HELP_TEXT: LogLine[] = [
   { text: "", cls: "help" }, { text: " SceneDB Query Shell", cls: "help" }, { text: "", cls: "help" },
