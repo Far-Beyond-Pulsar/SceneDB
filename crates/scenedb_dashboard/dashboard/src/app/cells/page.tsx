@@ -57,7 +57,7 @@ export default function CellsPage() {
                 return (
                   <tr key={cell.id} className="hover:bg-github-border-muted/30 transition-colors">
                     <td className="table-cell">
-                      <a href={`/cell?id=${cell.id}`} className="font-mono text-github-accent hover:underline">#{cell.id}</a>
+                      <a href={`/cell-detail?id=${cell.id}`} className="font-mono text-github-accent hover:underline">#{cell.id}</a>
                     </td>
                     <td className="table-cell font-mono">{cell.rows_in_use.toLocaleString()}</td>
                     <td className="table-cell font-mono">{cell.capacity.toLocaleString()}</td>

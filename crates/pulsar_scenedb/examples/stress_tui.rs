@@ -1196,7 +1196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 snap.gpu.write_ops = _telemetry.gpu_total_writes;
                 snap.gpu.sync_ranges = _telemetry.gpu_sync_ranges;
                 snap.gpu.sync_bytes = _telemetry.gpu_sync_bytes;
-                snap.cells = ws;
+                snap.cells.extend(ws);
                 _telemetry.server.push_snapshot(snap);
             }
             // ── GPU frame boundary (clears dirtys, advances driver) ────
