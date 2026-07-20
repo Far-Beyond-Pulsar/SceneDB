@@ -7,37 +7,72 @@ interface LogLine {
   cls: "output" | "input" | "error" | "prompt" | "help" | "info";
 }
 
-const MINIMAP_W = 36;
-const BAR_H = 2;
-const BAR_GAP = 1;
+const MINIMAP_W = 80;
+const FONT_PX = 3;
 
 const HELP_TEXT: LogLine[] = [
-  { text: "", cls: "help" },
-  { text: " SceneDB Query Shell", cls: "help" },
-  { text: "", cls: "help" },
-  { text: "  cells                        List all registered cells", cls: "help" },
-  { text: "  cell <id>                    Show cell detail", cls: "help" },
-  { text: "  cell <id> col <cid>          Show column data for cell", cls: "help" },
-  { text: "  raw cell=<id> col=<cid>      Query raw row data (optional: start=N end=N)", cls: "help" },
-  { text: "  stats                        Show aggregate counters", cls: "help" },
-  { text: "  gpu                          Show GPU store state", cls: "help" },
-  { text: "  gpu buffers                  Show GPU buffer info", cls: "help" },
-  { text: "  pools                        Show row/slot region pools", cls: "help" },
-  { text: "  schema                       Show registered type schemas", cls: "help" },
+  { text: "", cls: "help" }, { text: " SceneDB Query Shell", cls: "help" }, { text: "", cls: "help" },
+  { text: "  cells                        List all cells", cls: "help" },
+  { text: "  cell <id>                    Cell detail", cls: "help" },
+  { text: "  cell <id> col <cid>          Column data", cls: "help" },
+  { text: "  raw cell=<id> col=<cid>      Raw row data", cls: "help" },
+  { text: "  stats / gpu / pools / schema  System state", cls: "help" },
   { text: "  health                       Health check", cls: "help" },
-  { text: "  help                         This help", cls: "help" },
-  { text: "  clear                        Clear screen", cls: "help" },
+  { text: "  help / clear                 This / clear", cls: "help" },
   { text: "", cls: "help" },
 ];
 
 const CLS_COLOR: Record<string, string> = {
-  input: "#58a6ff",
-  error: "#f85149",
-  help: "#8b949e",
-  info: "#6e7681",
-  prompt: "#3fb950",
-  output: "#e6edf3",
+  input: "#58a6ff", error: "#f85149", help: "#8b949e",
+  info: "#6e7681", prompt: "#3fb950", output: "#e6edf3",
 };
+
+function drawMinimap(canvas: HTMLCanvasElement, logs: LogLine[], vpFrac: number, vpSize: number) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = MINIMAP_W;
+  const h = canvas.parentElement!.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+
+  const ctx = canvas.getContext("2d")!;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, w, h);
+
+  if (logs.length === 0) return;
+
+  const lineH = FONT_PX;
+  const totalH = logs.length * lineH;
+  const s = Math.min(1, h / Math.max(totalH, h));
+
+  ctx.save();
+  ctx.translate(0, 0);
+  ctx.scale(1, s);
+  ctx.font = `${FONT_PX}px monospace`;
+  ctx.textBaseline = "top";
+  for (let i = 0; i < logs.length; i++) {
+    const l = logs[i];
+    ctx.fillStyle = CLS_COLOR[l.cls] || "#e6edf3";
+    ctx.globalAlpha = 0.45;
+    ctx.fillText(l.text.slice(0, 60), 2, i * lineH);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // viewport
+  const viewportTop = vpFrac * h;
+  const viewportH = Math.max(vpSize * h, 4);
+  ctx.fillStyle = "rgba(88,166,255,0.06)";
+  ctx.fillRect(0, viewportTop, w, viewportH);
+  ctx.strokeStyle = "rgba(88,166,255,0.3)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, viewportTop); ctx.lineTo(w, viewportTop); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, viewportTop + viewportH); ctx.lineTo(w, viewportTop + viewportH); ctx.stroke();
+}
 
 export default function QueryShell() {
   const [logs, setLogs] = useState<LogLine[]>([
@@ -46,11 +81,36 @@ export default function QueryShell() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx] = useState(-1);
+  const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const minimapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragging = useRef(false);
-  const [busy, setBusy] = useState(false);
+  const drawTicket = useRef(0);
+
+  const scheduleDraw = useCallback(() => {
+    drawTicket.current += 1;
+    const ticket = drawTicket.current;
+    requestAnimationFrame(() => {
+      if (ticket !== drawTicket.current) return;
+      const c = canvasRef.current, s = scrollRef.current;
+      if (!c || !s) return;
+      const max = s.scrollHeight - s.clientHeight;
+      const vpFrac = max > 0 ? s.scrollTop / max : 0;
+      const vpSize = s.clientHeight / s.scrollHeight;
+      drawMinimap(c, logs, vpFrac, vpSize);
+    });
+  }, [logs]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    scheduleDraw();
+    const onScroll = () => scheduleDraw();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [scheduleDraw]);
 
   const add = useCallback((text: string, cls: LogLine["cls"] = "output") =>
     setLogs((p) => [...p, { text, cls }]), []);
@@ -108,14 +168,13 @@ export default function QueryShell() {
     const r = minimapRef.current?.getBoundingClientRect();
     const s = scrollRef.current;
     if (!r || !s) return;
-    const maxScroll = s.scrollHeight - s.clientHeight;
-    if (maxScroll <= 0) return;
-    const frac = Math.max(0, Math.min(1, (clientY - r.top) / r.height));
-    s.scrollTop = frac * maxScroll;
+    const max = s.scrollHeight - s.clientHeight;
+    if (max <= 0) return;
+    s.scrollTop = Math.max(0, Math.min(max, ((clientY - r.top) / r.height) * max));
   };
 
-  const onMinimapDown = (e: MouseEvent<HTMLDivElement>) => { dragging.current = true; seek(e.clientY); };
-  const onMinimapMove = (e: MouseEvent<HTMLDivElement>) => { if (dragging.current) seek(e.clientY); };
+  const onMinimapDown = (e: MouseEvent) => { dragging.current = true; seek(e.clientY); };
+  const onMinimapMove = (e: MouseEvent) => { if (dragging.current) seek(e.clientY); };
   const onMinimapUp = () => { dragging.current = false; };
 
   return (
@@ -131,17 +190,15 @@ export default function QueryShell() {
         </div>
       </div>
 
-      {/* minimap overlay */}
       <div
         ref={minimapRef}
         onMouseDown={onMinimapDown}
         onMouseMove={onMinimapMove}
         onMouseUp={onMinimapUp}
         onMouseLeave={onMinimapUp}
-        className="absolute right-0 top-0 bottom-12 cursor-pointer select-none z-10"
-        style={{ width: MINIMAP_W }}
+        className="absolute right-0 top-0 bottom-12 cursor-pointer select-none z-10 border-l border-github-border-muted"
       >
-        <MiniMapBars logs={logs} scrollRef={scrollRef} />
+        <canvas ref={canvasRef} className="block" />
       </div>
 
       <div className="flex items-center gap-2 border-t border-github-border-muted px-4 py-2.5 bg-github-card shrink-0">
@@ -159,53 +216,3 @@ export default function QueryShell() {
     </div>
   );
 }
-
-function MiniMapBars({ logs, scrollRef }: { logs: LogLine[]; scrollRef: React.RefObject<HTMLDivElement | null> }) {
-  const [vp, setVp] = useState({ top: 0, height: 10 });
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const update = () => {
-      const max = el.scrollHeight - el.clientHeight;
-      const top = max > 0 ? (el.scrollTop / max) * 100 : 0;
-      const height = Math.max((el.clientHeight / el.scrollHeight) * 100, 2);
-      setVp({ top, height });
-    };
-    update();
-    el.addEventListener("scroll", update, { passive: true });
-    return () => el.removeEventListener("scroll", update);
-  }, [logs.length, scrollRef]);
-
-  const barH = BAR_H + BAR_GAP;
-  const totalH = logs.length * barH;
-
-  return (
-    <div className="relative w-full h-full">
-      <div className="absolute inset-0 flex flex-col pt-2" style={{ gap: BAR_GAP }}>
-        {logs.map((l, i) => (
-          <div key={i} style={{
-            height: BAR_H,
-            backgroundColor: CLS_COLOR[l.cls] || "#e6edf3",
-            opacity: 0.3,
-            flexShrink: 0,
-            borderRadius: 1,
-            marginLeft: 4,
-            marginRight: 4,
-          }} />
-        ))}
-      </div>
-      <div style={{
-        position: "absolute", left: 1, right: 1,
-        top: `${vp.top}%`,
-        height: `${vp.height}%`,
-        backgroundColor: "rgba(88,166,255,0.08)",
-        borderLeft: "2px solid rgba(88,166,255,0.35)",
-        borderRadius: 2,
-        pointerEvents: "none",
-      }} />
-    </div>
-  );
-}
-
-
