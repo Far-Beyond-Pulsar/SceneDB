@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-github-bg text-github-text antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+      sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-github-border-muted rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-github-border;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-github-card border border-github-border rounded-xl p-5;
+  }
+
+  .card-header {
+    @apply text-xs font-semibold uppercase tracking-wider text-github-text-muted mb-3;
+  }
+
+  .stat-value {
+    @apply text-2xl font-semibold tabular-nums;
+  }
+
+  .stat-label {
+    @apply text-xs text-github-text-muted;
+  }
+
+  .nav-item {
+    @apply flex items-center gap-3 px-4 py-2.5 text-sm rounded-lg transition-colors;
+  }
+
+  .nav-item-active {
+    @apply nav-item bg-github-card text-github-text font-medium;
+  }
+
+  .nav-item-inactive {
+    @apply nav-item text-github-text-secondary hover:bg-github-card hover:text-github-text;
+  }
+
+  .table-header {
+    @apply text-xs font-semibold uppercase tracking-wider text-github-text-muted px-4 py-3 text-left;
+  }
+
+  .table-cell {
+    @apply px-4 py-3 text-sm border-t border-github-border-muted whitespace-nowrap;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full;
+  }
+
+  .badge-green {
+    @apply badge text-github-green bg-github-green/10;
+  }
+
+  .badge-yellow {
+    @apply badge text-github-yellow bg-github-yellow/10;
+  }
+
+  .badge-red {
+    @apply badge text-github-red bg-github-red/10;
+  }
+
+  .badge-blue {
+    @apply badge text-github-blue bg-github-blue/10;
+  }
+
+  .badge-gray {
+    @apply badge text-github-text-secondary bg-github-border-muted/50;
+  }
+}

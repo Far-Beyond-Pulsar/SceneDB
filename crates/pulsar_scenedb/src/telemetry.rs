@@ -270,6 +270,28 @@ fn hex_char(v: u8) -> char {
 }
 
 impl TelemetrySnapshot {
+    /// Collect a cells-only snapshot without GPU data.
+    /// Useful for demos and testing where no GPU store exists.
+    pub fn from_cells(cells: &[(u32, &CellStorage)]) -> Self {
+        let cell_snapshots: Vec<CellSnapshot> = cells
+            .iter()
+            .map(|(id, cell)| collect_cell_snapshot(*id, cell))
+            .collect();
+        TelemetrySnapshot {
+            cells: cell_snapshots,
+            gpu: GpuSnapshot {
+                gen_writes: 0,
+                buffers: Vec::new(),
+                cell_gpu_states: Vec::new(),
+            },
+            schema: Vec::new(),
+            pools: PoolSnapshot {
+                row: Vec::new(),
+                slot: Vec::new(),
+            },
+        }
+    }
+
     /// Collect a full snapshot from GPU store + cell storage pairs.
     pub fn collect(store: &SceneGpuStore, cells: &[(CellId, &CellStorage)]) -> Self {
         let gpu = collect_gpu_snapshot(store);
