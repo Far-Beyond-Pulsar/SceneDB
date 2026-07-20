@@ -854,6 +854,9 @@ struct TelemetryBundle {
     driver: pulsar_scenedb::gpu::FrameDriver,
     caps: [u32; 4],
     frame: u64,
+    gpu_handle_idx: Vec<usize>,        // cycling handle index per cell so gen_writes changes every frame
+    query_cell: SpatialCell,           // live query cell to populate query log
+    query_out: Vec<u32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -929,7 +932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut storage = CellStorage::new(&cols, cap).unwrap();
             storage.register_token_column::<[f32; 16]>(TRANSFORM_COLUMN);
             storage.register_token_column::<InstanceInfo>(INSTANCE_INFO_COLUMN);
-            let class = (i / 2).min(1); // first 2 in class 0, rest in class 1
+            let class = (i / 2).min(1);
             let cid = store.register_cell(&storage, class).expect("register cell");
             let mut hs = Vec::new();
             for _ in 0..cap / 2 {
@@ -947,11 +950,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tele_ids.push(cid);
         }
 
+        // Separate SpatialCell for live query logging
+        let mut query_cell = SpatialCell::new(256).unwrap();
+        for _ in 0..200 {
+            let min = [rand::random::<f32>() * 100.0 - 50.0; 3];
+            let max = [min[0] + rand::random::<f32>() * 20.0 + 0.1, min[1] + rand::random::<f32>() * 20.0 + 0.1, min[2] + rand::random::<f32>() * 20.0 + 0.1];
+            query_cell.alloc(Aabb { min, max });
+        }
+
+        let gpu_handle_idx: Vec<usize> = tele_handles.iter().map(|h| h.len().saturating_sub(1)).collect();
+
         state.log(Color::Cyan, "Telemetry server started on port 8081 — GPU store active");
-        state.log(Color::Cyan, format!("  {} cells registered in {} GPU buffer classes", tele_caps.len(), 2));
+        state.log(Color::Cyan, format!("  {} cells, {} GPU buffer classes, {} batch queries/frame", tele_caps.len(), 2, 8));
         TelemetryBundle {
             server, cells: tele_cells, handles: tele_handles, ids: tele_ids,
             store, ctx, driver: FrameDriver::new(), caps: tele_caps, frame: 0u64,
+            gpu_handle_idx, query_cell, query_out: vec![0u32; 256],
         }
     };
 
@@ -1122,22 +1136,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _telemetry.handles[i].retain(|&h| cell.row_of(h).is_some());
                 }
             }
-            // ── GPU frame boundary every 2 frames ───────────────────────
+            // ── GPU stress: cycle handles so gen_writes changes each frame ─
             {
                 use pulsar_scenedb::gpu::CellSlot;
                 let mut cell_slots: Vec<CellSlot> = _telemetry.cells.iter_mut()
                     .enumerate()
                     .map(|(i, c)| CellSlot { id: _telemetry.ids[i], cell: c })
                     .collect();
-                if _telemetry.frame % 2 == 0 {
-                    let sim = _telemetry.driver.begin();
-                    for (i, slot) in cell_slots.iter_mut().enumerate() {
-                        if let Some(h) = _telemetry.handles[i].first().copied() {
-                            let m = core::array::from_fn(|j| _telemetry.frame as f32 * 0.01 + j as f32);
-                            _telemetry.store.write_transform(_telemetry.ids[i], slot.cell, h, &m, &sim);
-                        }
+                let sim = _telemetry.driver.begin();
+                for (i, slot) in cell_slots.iter_mut().enumerate() {
+                    let hs = &_telemetry.handles[i];
+                    if hs.is_empty() { continue; }
+                    let idx = _telemetry.gpu_handle_idx[i].min(hs.len() - 1);
+                    let h = hs[idx];
+                    let m = core::array::from_fn(|j| _telemetry.frame as f32 * 0.01 + (i * 10 + j) as f32);
+                    _telemetry.store.write_transform(_telemetry.ids[i], slot.cell, h, &m, &sim);
+                    _telemetry.gpu_handle_idx[i] = if idx + 1 >= hs.len() { 0 } else { idx + 1 };
+                }
+                let _ = sim.end().end().end().run(&mut _telemetry.store, &mut cell_slots);
+            }
+
+            // ── Batch spatial queries every frame to populate query log ──
+            {
+                let nd = _telemetry.query_cell.storage().rows_in_use() as usize;
+                if nd > 0 && _telemetry.query_out.len() >= nd {
+                    let nw = nd.div_ceil(64);
+                    let mut qwords = vec![0u64; nw];
+                    for (wi, w) in _telemetry.query_cell.storage().liveness().words().iter().enumerate().take(nw) {
+                        qwords[wi] = w.load(std::sync::atomic::Ordering::Relaxed);
                     }
-                    let _ = sim.end().end().end().run(&mut _telemetry.store, &mut cell_slots);
+                    for qx in 0..4 {
+                        let c = qx as f32 * 40.0 - 60.0;
+                        let q = Aabb { min: [c, c, c], max: [c + 30.0, c + 30.0, c + 30.0] };
+                        _telemetry.query_cell.query_aabb_in(&q, &qwords, &mut _telemetry.query_out[..nd]);
+                    }
+                    for fx in 0..4 {
+                        let offset = fx as f32 * 30.0;
+                        let planes = [
+                            [1.0,0.0,0.0,40.0+offset],[-1.0,0.0,0.0,40.0+offset],
+                            [0.0,1.0,0.0,40.0+offset],[0.0,-1.0,0.0,40.0+offset],
+                            [0.0,0.0,1.0,40.0+offset],[0.0,0.0,-1.0,40.0+offset],
+                        ];
+                        _telemetry.query_cell.query_frustum_in(&Frustum { planes }, &qwords, &mut _telemetry.query_out[..nd]);
+                    }
                 }
             }
             // ── Build cell snapshots from workload metrics ─────────────
