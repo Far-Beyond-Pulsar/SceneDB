@@ -23,8 +23,8 @@ const HELP_TEXT: LogLine[] = [
 ];
 
 const CLS_COLOR: Record<string, string> = {
-  input: "#58a6ff", error: "#f85149", help: "#8b949e",
-  info: "#6e7681", prompt: "#3fb950", output: "#e6edf3",
+  input: "#58a6ff", error: "#f85149", help: "#9198a1",
+  info: "#6e7681", prompt: "#3fb950", output: "#f0f6fc",
 };
 
 function drawMinimap(canvas: HTMLCanvasElement, logs: LogLine[], vpFrac: number, vpSize: number) {
@@ -54,7 +54,7 @@ function drawMinimap(canvas: HTMLCanvasElement, logs: LogLine[], vpFrac: number,
   ctx.textBaseline = "top";
   for (let i = 0; i < logs.length; i++) {
     const l = logs[i];
-    ctx.fillStyle = CLS_COLOR[l.cls] || "#e6edf3";
+    ctx.fillStyle = CLS_COLOR[l.cls] || "#f0f6fc";
     ctx.globalAlpha = 0.5;
     ctx.fillText(l.text.slice(0, 28), 2, i * lineH);
   }
@@ -187,7 +187,7 @@ export default function QueryShell() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="p-4 pb-0 space-y-0.5 select-text" onClick={() => inputRef.current?.focus()}>
           {logs.map((l, i) => (
-            <div key={i} style={{ color: CLS_COLOR[l.cls] || "#e6edf3" }} className="whitespace-pre-wrap break-all leading-5">
+            <div key={i} style={{ color: CLS_COLOR[l.cls] || "#f0f6fc" }} className="whitespace-pre-wrap break-all leading-5">
               {l.text}
             </div>
           ))}
