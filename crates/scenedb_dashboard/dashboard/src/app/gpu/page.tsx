@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { usePoll, fetchGpu, fetchGpuBuffers, type GpuSnapshot, type GpuBufferSnapshot } from "@/lib/api";
 
-const EMPTY_GPU: GpuSnapshot = { gen_writes: 0, buffers: [], cell_gpu_states: [] };
+const EMPTY_GPU: GpuSnapshot = { gen_writes: 0, sync_ranges: 0, sync_bytes: 0, write_ops: 0, buffers: [], cell_gpu_states: [] };
 
 export default function GpuPage() {
   const [gpu, setGpu] = useState<GpuSnapshot>(EMPTY_GPU);
@@ -54,21 +54,30 @@ export default function GpuPage() {
   const totalDirty = gpu.cell_gpu_states.reduce((s, c) => s + c.dirty_column_count, 0);
   const totalPending = gpu.cell_gpu_states.reduce((s, c) => s + c.pending_retire_count, 0);
 
+  function formatBytes(b: number): string {
+    if (b < 1024) return `${b} B`;
+    if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+    if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`;
+    return `${(b / 1073741824).toFixed(1)} GB`;
+  }
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-xl font-semibold">GPU Store</h1>
         <p className="text-sm text-github-text-secondary mt-1">
-          {buffers.length} buffers &middot; {activeCells.length} GPU-resident cells &middot; {gpu.gen_writes.toLocaleString()} total gen writes &middot; 15 fps
+          {buffers.length} buffers &middot; {activeCells.length} cells &middot; {gpu.gen_writes.toLocaleString()} gen writes &middot; {formatBytes(gpu.sync_bytes)} synced
         </p>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-4">
         {[
           { label: "Gen Writes", value: gpu.gen_writes.toLocaleString(), color: "text-github-yellow" as const },
+          { label: "Write Ops", value: gpu.write_ops.toLocaleString(), color: "text-github-accent" as const },
           { label: "GPU Buffers", value: String(buffers.length), color: "text-github-accent" as const },
-          { label: "Dirty Columns", value: String(totalDirty), color: totalDirty > 0 ? "text-github-yellow" as const : "text-github-green" as const },
-          { label: "Pending Retires", value: String(totalPending), color: totalPending > 0 ? "text-github-red" as const : "text-github-green" as const },
+          { label: "Dirty Cols", value: String(totalDirty), color: totalDirty > 0 ? "text-github-yellow" as const : "text-github-green" as const },
+          { label: "Sync Ranges", value: gpu.sync_ranges.toLocaleString(), color: "text-github-green" as const },
+          { label: "Sync Bytes", value: formatBytes(gpu.sync_bytes), color: "text-github-blue" as const },
         ].map((s) => (
           <div key={s.label} className="card">
             <p className="stat-label">{s.label}</p>

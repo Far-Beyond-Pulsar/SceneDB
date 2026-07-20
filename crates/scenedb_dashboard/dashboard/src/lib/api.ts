@@ -30,6 +30,9 @@ export interface ColumnData {
 
 export interface GpuSnapshot {
   gen_writes: number;
+  sync_ranges: number;
+  sync_bytes: number;
+  write_ops: number;
   buffers: GpuBufferSnapshot[];
   cell_gpu_states: CellGpuSnapshot[];
 }
