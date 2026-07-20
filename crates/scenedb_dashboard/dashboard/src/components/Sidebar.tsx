@@ -23,7 +23,7 @@ export default function Sidebar({
   return (
     <aside
       className={`${
-        collapsed ? "w-16" : "w-64"
+        collapsed ? "w-16" : "w-48"
       } flex-shrink-0 bg-github-sidebar flex flex-col min-h-screen transition-all duration-300 ease-in-out`}
     >
       <div
