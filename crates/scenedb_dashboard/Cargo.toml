@@ -1,0 +1,17 @@
+[package]
+name = "scenedb_dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "SceneDB monitoring dashboard — bundles a Next.js static site via build.rs + rust-embed"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+rust-embed = "8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }

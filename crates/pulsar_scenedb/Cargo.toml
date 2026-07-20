@@ -32,6 +32,10 @@ pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
 name = "stress_tui"
 required-features = []
 
+[[example]]
+name = "telemetry_demo"
+required-features = ["telemetry"]
+
 [[bench]]
 name = "ecs_bench"
 harness = false
