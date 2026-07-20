@@ -11,18 +11,36 @@ const NAV_ITEMS = [
   { href: "/schema", label: "Schema", icon: SchemaIcon },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({
+  collapsed,
+  onToggle,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
   const pathname = usePathname();
 
   return (
-    <aside className="w-64 flex-shrink-0 bg-github-sidebar flex flex-col min-h-screen rounded-tr-[24px]">
-      <div className="h-[68px] flex items-center gap-3 px-6 border-b border-github-border-muted shrink-0">
-        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-github-accent to-github-blue flex items-center justify-center text-white text-[10px] font-bold">
+    <aside
+      className={`${
+        collapsed ? "w-16" : "w-64"
+      } flex-shrink-0 bg-github-sidebar flex flex-col min-h-screen transition-all duration-300 ease-in-out`}
+    >
+      <div
+        className={`h-[68px] flex items-center shrink-0 overflow-hidden ${
+          collapsed ? "gap-0 px-4" : "gap-3 px-6"
+        }`}
+      >
+        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-github-accent to-github-blue flex items-center justify-center text-white text-[10px] font-bold shrink-0">
           SD
         </div>
-        <div className="flex flex-col leading-tight">
-          <span className="text-sm font-semibold text-github-text">SceneDB</span>
-          <span className="text-[10px] text-github-text-muted">Monitoring</span>
+        <div
+          className={`flex flex-col leading-tight overflow-hidden transition-all duration-300 ${
+            collapsed ? "max-w-0 opacity-0" : "max-w-48 opacity-100"
+          }`}
+        >
+          <span className="text-sm font-semibold text-github-text whitespace-nowrap">SceneDB</span>
+          <span className="text-[10px] text-github-text-muted whitespace-nowrap">Monitoring</span>
         </div>
       </div>
 
@@ -36,22 +54,52 @@ export default function Sidebar() {
             <a
               key={item.href}
               href={item.href}
-              className={
-                isActive ? "nav-item-active" : "nav-item-inactive"
-              }
+              className={`${isActive ? "nav-item-active" : "nav-item-inactive"} ${collapsed ? "justify-center gap-0 px-2" : ""}`}
+              title={collapsed ? item.label : undefined}
             >
               <item.icon active={isActive} />
-              {item.label}
+              <span
+                className={`overflow-hidden whitespace-nowrap transition-all duration-300 ${
+                  collapsed ? "max-w-0 opacity-0" : "max-w-48 opacity-100"
+                }`}
+              >
+                {item.label}
+              </span>
             </a>
           );
         })}
       </nav>
 
-      <div className="px-3 pb-4 shrink-0">
-        <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-github-bg/30">
-          <div className="w-2 h-2 rounded-full bg-github-green" />
-          <span className="text-xs text-github-text-secondary">Connected</span>
+      <div className="px-3 pb-4 shrink-0 space-y-2">
+        <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-github-bg/30 overflow-hidden">
+          <div className="w-2 h-2 rounded-full bg-github-green shrink-0" />
+          <span
+            className={`text-xs text-github-text-secondary overflow-hidden whitespace-nowrap transition-all duration-300 ${
+              collapsed ? "max-w-0 opacity-0" : "max-w-48 opacity-100"
+            }`}
+          >
+            Connected
+          </span>
         </div>
+        <button
+          onClick={onToggle}
+          className="flex items-center justify-center w-full p-2 rounded-lg hover:bg-github-border-muted transition-colors text-github-text-muted hover:text-github-text"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          <svg
+            className="w-6 h-6 shrink-0"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d={collapsed ? "M9 18l6-6-6-6" : "M15 18l-6-6 6-6"}
+            />
+          </svg>
+        </button>
       </div>
     </aside>
   );
@@ -60,7 +108,7 @@ export default function Sidebar() {
 function DashboardIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -77,7 +125,7 @@ function DashboardIcon({ active }: { active: boolean }) {
 function CellsIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -92,7 +140,7 @@ function CellsIcon({ active }: { active: boolean }) {
 function GpuIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -108,7 +156,7 @@ function GpuIcon({ active }: { active: boolean }) {
 function PoolsIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -122,7 +170,7 @@ function PoolsIcon({ active }: { active: boolean }) {
 function QueriesIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -137,7 +185,7 @@ function QueriesIcon({ active }: { active: boolean }) {
 function SchemaIcon({ active }: { active: boolean }) {
   return (
     <svg
-      className={`w-4 h-4 ${active ? "text-github-text" : "text-github-text-muted"}`}
+      className={`w-6 h-6 ${active ? "text-github-text" : "text-github-text-muted"}`}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
