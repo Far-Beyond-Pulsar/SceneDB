@@ -1,5 +1,3 @@
-use crate::time::GameTime;
-
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -12,13 +10,13 @@ use crate::world::World;
 /// # Lifecycle
 ///
 /// 1. `begin_play` â€” called once when registered (after the world is ready).
-/// 2. `tick` â€” called every frame with the current `GameTime`.
+/// 2. `tick` — called every frame (time-free; see `tick`).
 /// 3. `end_play` â€” called once on deregistration or shutdown.
 ///
 /// # Example
 ///
 /// ```
-/// use pulsar_scenedb::{Actor, World, Entity, GameTime};
+/// use pulsar_scenedb::{Actor, World, Entity};
 ///
 /// struct Player;
 ///
@@ -26,7 +24,7 @@ use crate::world::World;
 ///     fn begin_play(&mut self, entity: Entity, world: &mut World) {
 ///         // Spawn child entities, attach components, etc.
 ///     }
-///     fn tick(&mut self, entity: Entity, world: &mut World, time: GameTime) {
+///     fn tick(&mut self, entity: Entity, world: &mut World) {
 ///         // Read input, apply movement, etc.
 ///     }
 ///     fn end_play(&mut self, entity: Entity, world: &mut World) {
@@ -44,8 +42,15 @@ pub trait Actor: Send + Sync + 'static {
     /// Called once when the actor is deregistered or the engine shuts down.
     fn end_play(&mut self, _entity: Entity, _world: &mut World) {}
 
-    /// Called every tick with the current simulation time.
-    fn tick(&mut self, _entity: Entity, _world: &mut World, _time: GameTime) {}
+    /// Called every tick.
+    ///
+    /// Deliberately time-free: `Actor` does not receive a frame-time value.
+    /// Per-frame timing is the engine's concern (driven through its event
+    /// system), not the data layer's — keeping this trait, and SceneDB,
+    /// decoupled from any `GameTime` type. Actors needing time read it from
+    /// the engine context, not through this signature. (The ECS `Schedule`
+    /// still carries `GameTime` to its systems; that is a separate path.)
+    fn tick(&mut self, _entity: Entity, _world: &mut World) {}
 }
 
 pub(crate) struct ActorEntry {
@@ -107,11 +112,11 @@ impl ActorRegistry {
     }
 
     /// Call [`Actor::tick`] on every alive actor.
-    pub fn tick_all(&mut self, world: &mut World, time: GameTime) {
+    pub fn tick_all(&mut self, world: &mut World) {
         for entry in &mut self.entries {
             if entry.alive {
                 profiling::profile_scope!(format!("Actor::Tick::{}", entry.entity));
-                entry.actor.tick(entry.entity, world, time);
+                entry.actor.tick(entry.entity, world);
             }
         }
     }
