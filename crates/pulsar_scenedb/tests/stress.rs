@@ -552,7 +552,7 @@ impl Actor for TestActor {
     fn end_play(&mut self, _entity: Entity, _world: &mut World) {
         self.ended = true;
     }
-    fn tick(&mut self, _entity: Entity, _world: &mut World, _time: GameTime) {
+    fn tick(&mut self, _entity: Entity, _world: &mut World) {
         self.ticked += 1;
     }
 }
@@ -571,12 +571,7 @@ fn correctness_actor_register_tick_deregister() {
     assert!(world.is_alive(entity));
 
     // Tick once
-    let time = GameTime {
-        elapsed: Duration::from_secs(1),
-        delta: Duration::from_secs_f64(1.0 / 60.0),
-        tick: 1,
-    };
-    registry.tick_all(&mut world, time);
+    registry.tick_all(&mut world);
 
     // Deregister
     registry.deregister(entity, &mut world);
