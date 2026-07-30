@@ -6,7 +6,7 @@
 
 GPU-native ECS and spatial database for game engines, built in Rust.
 
-SceneDB is what you get when you decide your entity storage should be a database, not a bag of loose objects. Everything lives in cache-friendly SoA pages on the CPU side — paged storage, spatial bounds, SIMD queries, the streaming grid, and the phase machine all run on the CPU. Only the dirty bits get synced to GPU buffers each frame (region-partitioned SSBOs, generation buffers, slot mirrors), and handles are stable u64s with generation counters so compaction never leaves you with a dangling pointer. SIMD spatial queries (AVX2, NEON), a streaming grid that decides what's resident based on where players are standing, persistent region pinning, and a compile-time frame phase machine that makes invalid state transitions unrepresentable.
+SceneDB is what you get when you decide your entity storage should be a database, not a bag of loose objects. Everything lives in cache-friendly SoA pages on the CPU side — paged storage, spatial bounds, SIMD queries, the streaming grid, and the phase machine all run on the CPU. Only the GPU-mirrored fields (transform columns, instance info, generation buffers, slot mirrors) use delta-sync — the CPU-side fields like bounds columns stay on the CPU and never touch VRAM, and handles are stable u64s with generation counters so compaction never leaves you with a dangling pointer. SIMD spatial queries (AVX2, NEON), a streaming grid that decides what's resident based on where players are standing, persistent region pinning, and a compile-time frame phase machine that makes invalid state transitions unrepresentable.
 
 ```mermaid
 flowchart LR
