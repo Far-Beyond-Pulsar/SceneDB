@@ -175,4 +175,4 @@ Compile-time witnesses. `SimulateWitness`, `HarvestPhase`, and `RetiredPhase` ar
 
 ## License
 
-Licensed under MIT ([LICENSE-MIT](LICENSE-MIT)) OR Apache-2.0 — your choice.
+Licensed under MIT ([LICENSE-MIT](LICENSE-MIT))
