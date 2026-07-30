@@ -161,6 +161,11 @@ pub enum BudgetError {
 #[derive(Debug)]
 struct GridCellState {
     domain: Domain,
+    /// If `Some`, the cell is pinned to this domain — concentric
+    /// classification is bypassed and the grid forces residency at
+    /// this level regardless of observer distance. `None` (default)
+    /// means the cell follows the standard concentric rules.
+    pinned_domain: Option<Domain>,
     dense_id: u32,
     alpha: f32,
     alpha_target: f32,
@@ -236,6 +241,7 @@ impl StreamingGrid {
             coord,
             GridCellState {
                 domain: Domain::Outer,
+                pinned_domain: None,
                 dense_id: id,
                 alpha: 0.0,
                 alpha_target: 0.0,
@@ -255,6 +261,32 @@ impl StreamingGrid {
 
     pub fn dense_id(&self, coord: CellCoord) -> Option<u32> {
         self.cells.get(&coord).map(|s| s.dense_id)
+    }
+
+    /// Pin a cell to a specific domain, bypassing concentric classification.
+    /// The cell will be forced to `domain` regardless of observer distance.
+    /// Returns `false` if the coord is not tracked (call `materialize` first).
+    pub fn pin(&mut self, coord: CellCoord, domain: Domain) -> bool {
+        if let Some(state) = self.cells.get_mut(&coord) {
+            state.pinned_domain = Some(domain);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a pin, returning the cell to standard concentric classification.
+    /// A no-op for an untracked coord or one that was never pinned.
+    pub fn unpin(&mut self, coord: CellCoord) {
+        if let Some(state) = self.cells.get_mut(&coord) {
+            state.pinned_domain = None;
+        }
+    }
+
+    /// Returns the pinned domain override, if any. `None` means the cell
+    /// follows standard concentric rules.
+    pub fn pinned_domain(&self, coord: CellCoord) -> Option<Option<Domain>> {
+        self.cells.get(&coord).map(|s| s.pinned_domain)
     }
 
     /// The store-side region assignment for a resident cell — `None` for an
@@ -294,6 +326,17 @@ impl StreamingGrid {
         let cell_width = self.cfg.cell_width;
 
         for (&coord, state) in self.cells.iter() {
+            // Pinned cells bypass concentric classification entirely:
+            // queue a forced transition if they don't match their pin target.
+            if let Some(pin) = state.pinned_domain {
+                if state.domain != pin {
+                    let from = state.domain;
+                    // Belt and braces: evict stale queued transitions for this coord.
+                    self.transitions.retain(|t| t.coord != coord);
+                    self.transitions.push(Transition { coord, from, to: pin });
+                }
+                continue;
+            }
             let base = base_bounds(coord, cell_width);
             let to = match state.domain {
                 Domain::Outer => {
@@ -751,6 +794,105 @@ mod tests {
         g.materialize(c);
         g.classify(&[]);
         assert!(g.take_transitions().is_empty());
+        assert_eq!(g.domain(c), Some(Domain::Outer));
+    }
+
+    // ── Persistent (pinned) domain tests ──────────────────────────────────
+
+    #[test]
+    fn pin_starts_none_and_can_be_set_and_read() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        assert_eq!(g.pinned_domain(c), Some(None), "fresh cell has no pin");
+        assert!(g.pin(c, Domain::Inner), "pin returns true for tracked coord");
+        assert_eq!(g.pinned_domain(c), Some(Some(Domain::Inner)));
+        g.unpin(c);
+        assert_eq!(g.pinned_domain(c), Some(None), "unpin clears the override");
+    }
+
+    #[test]
+    fn pin_on_untracked_coord_returns_false() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let untracked = CellCoord { x: 99, z: 99 };
+        assert!(!g.pin(untracked, Domain::Inner), "untracked coord returns false");
+        assert_eq!(g.pinned_domain(untracked), None, "untracked coord has no state");
+    }
+
+    #[test]
+    fn pinned_cell_bypasses_concentric_classification() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        // Pin to Inner before any observer gets close.
+        assert!(g.pin(c, Domain::Inner));
+        // Observer is at 500 — well past the demotion threshold for an unpinned cell.
+        g.classify(&[observer_at(500.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts.len(), 1, "pinned cell queues a forced transition to its pin target");
+        assert_eq!(ts[0], Transition { coord: c, from: Domain::Outer, to: Domain::Inner });
+        g.commit_transition(ts[0]);
+        assert_eq!(g.domain(c), Some(Domain::Inner));
+    }
+
+    #[test]
+    fn pinned_cell_does_not_demote_when_observer_retreats() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        // Promote to Inner via concentric rules first (observer close enough
+        // for inner_promote: base x ∈ [0,100], pad=10 → inner_promote x ∈ [-10,110].
+        // Observer at 50 (AABB x ∈ [40,60]) intersects → Margin→Inner).
+        g.classify(&[observer_at(50.0)]);
+        for t in g.take_transitions() { g.commit_transition(t); }
+        // Observer at 0 (AABB x ∈ [-10,10]) intersects inner_promote [-10,110] → promoting.
+        g.classify(&[observer_at(-5.0)]);
+        for t in g.take_transitions() { g.commit_transition(t); }
+        assert_eq!(g.domain(c), Some(Domain::Inner));
+        // Now pin it to Inner.
+        assert!(g.pin(c, Domain::Inner));
+        // Move observer far away — would demote an unpinned cell.
+        g.classify(&[observer_at(10000.0)]);
+        let ts = g.take_transitions();
+        assert!(ts.is_empty(), "pinned Inner cell does not demote when observer retreats");
+        assert_eq!(g.domain(c), Some(Domain::Inner));
+    }
+
+    #[test]
+    fn unpinned_cell_resumes_concentric_classification() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        // Pin to Inner.
+        assert!(g.pin(c, Domain::Inner));
+        g.classify(&[observer_at(10000.0)]);
+        let t = g.take_transitions().into_iter().next().unwrap();
+        g.commit_transition(t);
+        assert_eq!(g.domain(c), Some(Domain::Inner));
+        // Unpin — next classify with far observer demotes one step (Inner→Margin).
+        g.unpin(c);
+        g.classify(&[observer_at(10000.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts.len(), 1, "unpinned cell demotes one step via concentric rules");
+        assert_eq!(ts[0].to, Domain::Margin);
+        g.commit_transition(ts[0]);
+        // Second classify with far observer demotes the rest of the way (Margin→Outer).
+        g.classify(&[observer_at(10000.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts.len(), 1, "unpinned cell demotes second step");
+        assert_eq!(ts[0].to, Domain::Outer);
+    }
+
+    #[test]
+    fn pin_outer_keeps_cell_unloaded_while_observer_is_close() {
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        // Pin to Outer — should never promote even if observer is right on top.
+        assert!(g.pin(c, Domain::Outer));
+        g.classify(&[observer_at(0.0)]);
+        let ts = g.take_transitions();
+        assert!(ts.is_empty(), "pinned Outer cell does not promote despite nearby observer");
         assert_eq!(g.domain(c), Some(Domain::Outer));
     }
 }
