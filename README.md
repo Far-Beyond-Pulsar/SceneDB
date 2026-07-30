@@ -161,4 +161,4 @@ M1 (paged storage), M2a (GPU mirroring, delta-sync, pin-by-serial retirement), a
 
 ## License
 
-Licensed under MIT OR Apache-2.0.
+Licensed under MIT ([LICENSE-MIT](LICENSE-MIT)) OR Apache-2.0 — your choice.
