@@ -155,10 +155,6 @@ pub struct MyComponent {
 - **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for Pod impls and GPU dispatch boilerplate.
 - **scenedb_dashboard** — runtime TUI monitoring dashboard.
 
-## Status
-
-M1 (paged storage), M2a (GPU mirroring, delta-sync, pin-by-serial retirement), and M2b (region-partitioned store, asset stores, phase machine, streaming grid, persistent pins, harvest pipeline with DEI, leases) are complete. The GPU layer is feature-gated via `--features gpu`. SIMD queries have AVX2 and NEON backends verified bit-identical against the scalar reference. Tests and benchmarks live in `tests/` and `benches/`, plus a stress TUI at `examples/stress_tui.rs`.
-
 ## License
 
 Licensed under MIT ([LICENSE-MIT](LICENSE-MIT)) OR Apache-2.0 — your choice.
