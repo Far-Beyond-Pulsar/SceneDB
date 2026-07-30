@@ -1,9 +1,6 @@
 //! SceneDB 2.0 — Layer 1 storage core (spec Rev 2.3, CONTRACTS.md C0–C6;
 //! C5 material layout pending M3-β (R8-gated), Test 13 pending M3-β).
 //!
-//! Seeded from `pulsar_ecs` (which remains in-tree as the reference
-//! implementation). This crate adds the spec-conformant storage layer:
-//!
 //! - [`Handle`] — packed u64, stable slot index + generation, gen 0 invalid
 //! - [`HandleRegistry`] — slot allocator, generation validation, slot→row
 //!   indirection, permanent retirement at gen `u32::MAX`
@@ -82,8 +79,8 @@ pub mod registry;
 pub mod schedule;
 pub mod simd;
 pub mod snapshot;
-pub mod time;
 pub mod spatial;
+pub mod time;
 pub mod token;
 pub mod world;
 
@@ -100,6 +97,8 @@ pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet}
 pub use component::{component_id, Component, ComponentId};
 pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp, ComponentStore};
 pub use entity::Entity;
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
 pub use handle::Handle;
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;
@@ -107,7 +106,6 @@ pub use page::{
     Column, ColumnDesc, GenericColumn, LayoutError, Page, PageLayout, Pod, PodColumn,
     DEFAULT_PAGE_CAPACITY, MAX_PAGE_CAPACITY, MAX_STRIDE_BYTES,
 };
-pub use time::GameTime;
 pub use query::{QueryIter, WorldQuery};
 pub use registry::{HandleRegistry, NULL_ROW};
 pub use schedule::Schedule;
@@ -116,8 +114,7 @@ pub use spatial::{
     Aabb, Frustum, InstanceInfo, SpatialCell, INSTANCE_INFO_COLUMN, SPATIAL_COLUMNS,
     TRANSFORM_COLUMN,
 };
-#[cfg(feature = "gpu")]
-pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
+pub use time::GameTime;
 pub use token::{HasTypeToken, TypeToken};
 pub use world::World;
 
