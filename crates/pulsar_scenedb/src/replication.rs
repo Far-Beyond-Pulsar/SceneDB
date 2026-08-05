@@ -2165,6 +2165,62 @@ impl Snapshot {
         Self { frame, entities, cell_rows: Vec::new() }
     }
 
+    /// Restore a snapshot captured by [`Self::capture_full`]/
+    /// [`Self::capture_relevant`] into a `World` — the ECS counterpart to
+    /// [`Self::restore_to_cells`], and the actual recovery mechanism for a
+    /// client that has fallen behind: a `Delta` only carries ONE frame's
+    /// changes, so missing even one in a sequence (a dropped/late packet
+    /// with no reliable-ordered retransmission — see the module's "SceneDB
+    /// does NOT own transport" tenet) leaves no way to reconstruct the
+    /// missing state from later `Delta`s alone. A fresh full or
+    /// relevance-filtered `Snapshot` re-establishes a known-good baseline
+    /// to resume applying `Delta`s from.
+    ///
+    /// Entities are (re)spawned at their exact snapshot `Entity` (index +
+    /// generation) via [`crate::World`]'s replicated-spawn path — see
+    /// [`Delta::apply`]'s doc for why entity handles are assumed shared
+    /// verbatim between peers. A component this `schema` has no local
+    /// registration for is silently skipped (the same handshake limitation
+    /// [`RowOps`] documents); a malformed field's bytes are propagated as
+    /// `Err` rather than silently ignored, since — unlike a `Delta` arriving
+    /// mid-stream — a corrupt snapshot leaves the caller no better fallback
+    /// to keep going with.
+    pub fn restore_to_world(&self, world: &mut crate::World, schema: &ReplicationRegistry) -> Result<(), ErrorCode> {
+        for entity_snap in &self.entities {
+            let cids: Vec<ComponentId> = entity_snap.components.iter().map(|(cid, _)| *cid).collect();
+            let key = ArchetypeKey::new(cids);
+            if world
+                .force_spawn_in_archetype(entity_snap.entity, key, |cid| schema.row_ops(cid).copied())
+                .is_none()
+            {
+                return Err(ErrorCode::InvalidData);
+            }
+
+            for (cid, field_data) in &entity_snap.components {
+                let Some(s) = schema.schema(*cid) else {
+                    continue;
+                };
+                for field in &s.fields {
+                    if matches!(field.encoding, ReplicationEncoding::Event) {
+                        continue;
+                    }
+                    let Some(ops) = &field.ops else {
+                        continue;
+                    };
+                    let idx = field.field_index as usize;
+                    let Some(bytes) = field_data.get(idx) else {
+                        continue;
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    world.write_component_field(entity_snap.entity, *cid, &*ops.decode_into, bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Shared row-capture body for [`Self::capture_full`]/
     /// [`Self::capture_relevant`]: for every component the archetype
     /// carries, encode every schema field via its own
@@ -3686,6 +3742,163 @@ mod tests {
         assert_eq!(snap.frame, 3);
         assert_eq!(snap.entities.len(), 1);
         assert_eq!(snap.entities[0].entity, e1);
+    }
+
+    #[test]
+    fn snapshot_restore_to_world_round_trips_into_a_fresh_world() {
+        let mut source = crate::World::new();
+        let e1 = source.spawn();
+        source.insert(e1, 1.0f32);
+        let e2 = source.spawn();
+        source.insert(e2, 2.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let snap = Snapshot::capture_full(&source, &reg, 7);
+        assert_eq!(snap.entities.len(), 2);
+
+        // A completely fresh World — this is the resync scenario: the
+        // entities don't exist here at all until `restore_to_world`
+        // reconstructs them purely from the snapshot's encoded bytes.
+        let mut target = crate::World::new();
+        assert_eq!(snap.restore_to_world(&mut target, &reg), Ok(()));
+
+        assert!(target.is_alive(e1));
+        assert!(target.is_alive(e2));
+        assert_eq!(*target.get::<f32>(e1).unwrap(), 1.0f32);
+        assert_eq!(*target.get::<f32>(e2).unwrap(), 2.0f32);
+    }
+
+    #[test]
+    fn snapshot_restore_to_world_with_unregistered_component_fails_cleanly() {
+        let mut source = crate::World::new();
+        let e = source.spawn();
+        source.insert(e, 1.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        let snap = Snapshot::capture_full(&source, &reg, 1);
+
+        // A registry that never registered `f32` — the receiving peer has
+        // no local `RowOps` for that component, so restoring must fail
+        // cleanly (matching `Delta::apply`'s identical contract) rather
+        // than silently drop the entity or panic.
+        let empty_reg = ReplicationRegistry::new();
+        let mut target = crate::World::new();
+        assert_eq!(snap.restore_to_world(&mut target, &empty_reg), Err(ErrorCode::InvalidData));
+    }
+
+    #[test]
+    fn resync_via_snapshot_recovers_state_a_delta_gap_cannot() {
+        // Simulates the actual scenario `restore_to_world`'s doc describes:
+        // a client that missed a run of Deltas can't reconstruct the
+        // missing state from a LATER Delta alone (each Delta only carries
+        // that frame's own changes), but a fresh Snapshot recovers fully.
+        let mut server = crate::World::new();
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let e1 = server.spawn();
+        server.insert(e1, 1.0f32);
+        let e2 = server.spawn();
+        server.insert(e2, 2.0f32);
+        // `e3` stands in for everything the client missed while
+        // disconnected (frames the client never received Deltas for).
+        let e3 = server.spawn();
+        server.insert(e3, 3.0f32);
+
+        // The client only ever applied the delta that spawned e1 — frames
+        // covering e2/e3 were lost. Continuing to apply new Deltas from
+        // here on can only ever describe CHANGES, never fill in entities
+        // the client never learned existed.
+        let mut client = crate::World::new();
+        let stale_blob = encode_archetype_key(&[crate::component::component_id::<f32>()]);
+        let mut bytes = Vec::new();
+        1.0f32.replicate_encode(&mut bytes);
+        let catch_up_delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(e1, stale_blob)],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta {
+                entity: e1,
+                component_type: crate::component::component_id::<f32>(),
+                field_data: vec![bytes],
+            }],
+            events: vec![],
+        };
+        assert_eq!(catch_up_delta.apply(&mut client, &reg), Ok(()));
+        assert!(client.is_alive(e1));
+        assert!(!client.is_alive(e2), "e2 was never learned about — a Delta gap can't fabricate it");
+
+        // Resync: request and apply a fresh full snapshot instead of
+        // continuing to apply Deltas the client has no baseline for.
+        let snapshot = Snapshot::capture_full(&server, &reg, 10);
+        assert_eq!(snapshot.restore_to_world(&mut client, &reg), Ok(()));
+
+        assert!(client.is_alive(e1));
+        assert!(client.is_alive(e2));
+        assert!(client.is_alive(e3));
+        assert_eq!(*client.get::<f32>(e1).unwrap(), 1.0f32);
+        assert_eq!(*client.get::<f32>(e2).unwrap(), 2.0f32);
+        assert_eq!(*client.get::<f32>(e3).unwrap(), 3.0f32);
+    }
+
+    #[test]
+    fn delta_apply_does_not_protect_against_out_of_order_frames() {
+        // Documents an intentional, load-bearing contract: `Delta::apply`
+        // unconditionally overwrites field values — it does NOT check
+        // `delta.frame` against anything already applied. Frame ordering
+        // is the transport/engine's job (see the module's "SceneDB does
+        // NOT own transport" tenet), not something this method guards for
+        // you. This test exists so that contract stays true on purpose,
+        // not by accident — if `Delta::apply` ever starts silently
+        // dropping stale frames, this test should be the one that notices.
+        let mut world = crate::World::new();
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let e = world.spawn();
+        world.insert(e, 0.0f32);
+        let cid = crate::component::component_id::<f32>();
+
+        let make_delta = |frame: u64, value: f32| {
+            let mut bytes = Vec::new();
+            value.replicate_encode(&mut bytes);
+            Delta {
+                frame, base_frame: frame.saturating_sub(1),
+                spawned: vec![], despawned: vec![],
+                component_deltas: vec![ComponentDelta { entity: e, component_type: cid, field_data: vec![bytes] }],
+                events: vec![],
+            }
+        };
+
+        // Apply frame 10 (newer), then frame 2 (older, arriving late) —
+        // exactly what an unordered/best-effort channel can deliver.
+        assert_eq!(make_delta(10, 100.0).apply(&mut world, &reg), Ok(()));
+        assert_eq!(*world.get::<f32>(e).unwrap(), 100.0);
+        assert_eq!(make_delta(2, 5.0).apply(&mut world, &reg), Ok(()));
+        assert_eq!(
+            *world.get::<f32>(e).unwrap(), 5.0,
+            "apply() has no ordering guard by design — the caller must track \
+             `delta.frame` itself and skip anything not newer than what it already applied",
+        );
+
+        // The correct pattern: the caller tracks the last-applied frame
+        // and skips anything not strictly newer, exactly the check
+        // `Delta::apply` deliberately doesn't make for you.
+        let mut last_applied_frame = 10u64;
+        let late_delta = make_delta(2, 999.0);
+        if late_delta.frame > last_applied_frame {
+            late_delta.apply(&mut world, &reg).unwrap();
+            last_applied_frame = late_delta.frame;
+        }
+        let _ = last_applied_frame;
+        assert_eq!(*world.get::<f32>(e).unwrap(), 5.0, "the guarded caller pattern correctly ignores the stale frame");
     }
 
     #[test]
