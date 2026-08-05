@@ -1,6 +1,7 @@
 use crate::archetype::{Archetype, ArchetypeId, ArchetypeKey};
 use crate::component::{Column, Component, ComponentId, ErasedColumn};
 use crate::entity::{Entity, EntitySlot};
+use crate::replication::ChangeTracker;
 use ahash::AHashMap;
 
 /// The central ECS store: owns all entities, their component data, and the
@@ -85,6 +86,16 @@ impl World {
     /// vec.  The returned handle includes a generation counter that allows
     /// [`is_alive`](Self::is_alive) to detect stale handles after despawn.
     pub fn spawn(&mut self) -> Entity {
+        self.spawn_inner(None)
+    }
+
+    /// Like [`spawn`](Self::spawn) but also records the spawn in a
+    /// [`ChangeTracker`] for replication.
+    pub fn spawn_tracked(&mut self, tracker: &mut ChangeTracker) -> Entity {
+        self.spawn_inner(Some(tracker))
+    }
+
+    fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
         let (idx, gen) = if let Some(idx) = self.free_slots.pop() {
             let slot = &mut self.entity_slots[idx as usize];
             slot.generation = slot.generation.wrapping_add(1);
@@ -101,6 +112,11 @@ impl World {
         let row = empty.entities.len() as u32;
         empty.entities.push(entity);
         self.entity_slots[idx as usize].row = row;
+
+        if let Some(t) = tracker {
+            t.record_spawn(entity);
+        }
+
         entity
     }
 
@@ -113,6 +129,16 @@ impl World {
     /// index is pushed onto the free list.  The entity's data is
     /// swap-removed from its archetype.
     pub fn despawn(&mut self, entity: Entity) -> bool {
+        self.despawn_inner(entity, None)
+    }
+
+    /// Like [`despawn`](Self::despawn) but also records the despawn in a
+    /// [`ChangeTracker`] for replication.
+    pub fn despawn_tracked(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> bool {
+        self.despawn_inner(entity, Some(tracker))
+    }
+
+    fn despawn_inner(&mut self, entity: Entity, tracker: Option<&mut ChangeTracker>) -> bool {
         if !self.is_alive(entity) {
             return false;
         }
@@ -127,6 +153,11 @@ impl World {
         let slot = &mut self.entity_slots[entity.index() as usize];
         slot.generation = slot.generation.wrapping_add(1);
         self.free_slots.push(entity.index());
+
+        if let Some(t) = tracker {
+            t.record_despawn(entity);
+        }
+
         true
     }
 
@@ -206,6 +237,17 @@ impl World {
     ///
     /// Panics if `entity` is dead.
     pub fn insert<T: Component>(&mut self, entity: Entity, value: T) {
+        self.insert_inner(entity, value, None);
+    }
+
+    /// Like [`insert`](Self::insert) but also records the change in a
+    /// [`ChangeTracker`] for replication.
+    pub fn insert_tracked<T: Component>(&mut self, entity: Entity, value: T, tracker: &mut ChangeTracker) {
+        self.insert_inner(entity, value, Some(tracker));
+    }
+
+    fn insert_inner<T: Component>(&mut self, entity: Entity, value: T, mut tracker: Option<&mut ChangeTracker>) {
+        let cid = crate::component::component_id::<T>();
         assert!(self.is_alive(entity), "insert on dead entity {entity}");
 
         let (old_arch_id, old_row) = {
@@ -214,8 +256,13 @@ impl World {
         };
 
         // In-place update: entity already has this component in this archetype.
-        let cid = crate::component::component_id::<T>();
         if Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid) {
+            if let Some(t) = tracker.as_deref_mut() {
+                // Capture bytes before the value is moved into the column.
+                let len = std::mem::size_of::<T>();
+                let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
+                t.record_component_change(entity, cid, 0, bytes.to_vec());
+            }
             let col = self.archetypes[old_arch_id.0 as usize].column_mut::<T>();
             col.data[old_row] = value;
             return;
@@ -255,6 +302,12 @@ impl World {
             .unwrap()
             .data
             .push(value);
+
+        if let Some(t) = tracker {
+            // The value was moved into the column, so we can't read it anymore.
+            // Record the change without field data — R2 schema encoding will handle it.
+            t.record_component_change(entity, cid, 0, Vec::new());
+        }
     }
 
     /// Remove a component from an entity, returning its value.
@@ -264,6 +317,16 @@ impl World {
     ///
     /// Returns `None` if the entity is dead or does not have component `T`.
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
+        self.remove_inner(entity, None)
+    }
+
+    /// Like [`remove`](Self::remove) but also records the change in a
+    /// [`ChangeTracker`] for replication.
+    pub fn remove_tracked<T: Component>(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> Option<T> {
+        self.remove_inner(entity, Some(tracker))
+    }
+
+    fn remove_inner<T: Component>(&mut self, entity: Entity, tracker: Option<&mut ChangeTracker>) -> Option<T> {
         if !self.is_alive(entity) {
             return None;
         }
@@ -295,6 +358,10 @@ impl World {
         // migrate_row_skip pushes the entity first, migrates all columns
         // except the skipped one, then updates all slots.
         self.migrate_row_skip(entity, old_arch_id, old_row, new_arch_id, cid);
+
+        if let Some(t) = tracker {
+            t.record_component_change(entity, cid, 0, Vec::new());
+        }
 
         Some(removed_val)
     }

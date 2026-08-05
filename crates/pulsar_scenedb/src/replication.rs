@@ -397,14 +397,34 @@ impl ChangeTracker {
         &mut self,
         entity: Entity,
         component_type: ComponentId,
-        _field_index: u32,
-        _field_bytes: Vec<u8>,
+        field_index: u32,
+        field_bytes: Vec<u8>,
     ) {
-        self.component_changes.push(ComponentDelta {
-            entity,
-            component_type,
-            field_data: Vec::new(),
-        });
+        // Find existing ComponentDelta for this entity+component, or create one.
+        if let Some(existing) = self
+            .component_changes
+            .iter_mut()
+            .find(|cd| cd.entity == entity && cd.component_type == component_type)
+        {
+            // Ensure field_data is large enough, then insert at field_index.
+            let idx = field_index as usize;
+            if idx >= existing.field_data.len() {
+                existing.field_data.resize(idx + 1, Vec::new());
+            }
+            existing.field_data[idx] = field_bytes;
+        } else {
+            let mut field_data = Vec::new();
+            let idx = field_index as usize;
+            if idx >= field_data.len() {
+                field_data.resize(idx + 1, Vec::new());
+            }
+            field_data[idx] = field_bytes;
+            self.component_changes.push(ComponentDelta {
+                entity,
+                component_type,
+                field_data,
+            });
+        }
     }
 
     pub fn record_event(&mut self, event: ReplicatedEvent) {
@@ -422,7 +442,7 @@ impl ChangeTracker {
             base_frame: self.frame.wrapping_sub(1),
             spawned: mem::take(&mut self.spawned)
                 .into_iter()
-                .map(|e| (e, Vec::new()))
+                .map(|e| (e, self.frame.to_le_bytes().to_vec()))
                 .collect(),
             despawned: mem::take(&mut self.despawned),
             component_deltas: mem::take(&mut self.component_changes),
@@ -627,3 +647,163 @@ const _: () = assert!(
     cfg!(target_endian = "little"),
     "SceneDB replication requires a little-endian target"
 );
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Entity;
+
+    fn make_entity(index: u32, gen: u32) -> Entity {
+        Entity::new(index, gen)
+    }
+
+    #[test]
+    fn tracker_records_spawns() {
+        let mut t = ChangeTracker::new();
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        t.record_spawn(e1);
+        t.record_spawn(e2);
+        let (delta, events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.spawned.len(), 2);
+        assert!(delta.spawned.iter().any(|(e, _)| *e == e1));
+        assert!(delta.spawned.iter().any(|(e, _)| *e == e2));
+        assert!(delta.despawned.is_empty());
+        assert!(delta.component_deltas.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn tracker_records_despawns() {
+        let mut t = ChangeTracker::new();
+        let e = make_entity(0, 1);
+        t.record_despawn(e);
+        let (delta, events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.despawned.len(), 1);
+        assert_eq!(delta.despawned[0], e);
+    }
+
+    #[test]
+    fn tracker_records_component_changes() {
+        let mut t = ChangeTracker::new();
+        let e = make_entity(0, 1);
+        let cid = ComponentId(3);
+        let data = vec![1u8, 2, 3, 4];
+        t.record_component_change(e, cid, 0, data.clone());
+        let (delta, _) = t.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.component_deltas.len(), 1);
+        assert_eq!(delta.component_deltas[0].entity, e);
+        assert_eq!(delta.component_deltas[0].component_type, cid);
+        assert_eq!(delta.component_deltas[0].field_data[0], data);
+    }
+
+    #[test]
+    fn tracker_accrues_multiple_fields_on_same_component() {
+        let mut t = ChangeTracker::new();
+        let e = make_entity(0, 1);
+        let cid = ComponentId(7);
+        t.record_component_change(e, cid, 1, vec![10u8]);
+        t.record_component_change(e, cid, 0, vec![20u8]);
+        let (delta, _) = t.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.component_deltas.len(), 1);
+        assert_eq!(delta.component_deltas[0].field_data[0], vec![20u8]);
+        assert_eq!(delta.component_deltas[0].field_data[1], vec![10u8]);
+    }
+
+    #[test]
+    fn tracker_records_events() {
+        let mut t = ChangeTracker::new();
+        let e = make_entity(2, 5);
+        let ev = ReplicatedEvent {
+            entity: e,
+            component_type: ComponentId(1),
+            event_field: 0,
+            payload: vec![99u8],
+            channel: EventChannel::ReliableOrdered,
+        };
+        t.record_event(ev.clone());
+        let (_, events) = t.drain(&ReplicationSchema { component_type: ComponentId(1), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity, e);
+        assert_eq!(events[0].payload, vec![99u8]);
+    }
+
+    #[test]
+    fn drain_clears_tracker() {
+        let mut t = ChangeTracker::new();
+        t.record_spawn(make_entity(0, 1));
+        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.spawned.len(), 1);
+        let (delta2, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert!(delta2.spawned.is_empty());
+        assert!(delta2.despawned.is_empty());
+        assert!(delta2.component_deltas.is_empty());
+    }
+
+    #[test]
+    fn end_frame_increments_counter() {
+        let mut t = ChangeTracker::new();
+        assert_eq!(t.frame, 0);
+        t.end_frame();
+        assert_eq!(t.frame, 1);
+        t.end_frame();
+        assert_eq!(t.frame, 2);
+    }
+
+    #[test]
+    fn drain_includes_frame_number() {
+        let mut t = ChangeTracker::new();
+        t.end_frame();
+        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.frame, 1);
+    }
+
+    #[test]
+    fn world_spawn_tracked_records_change() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn_tracked(&mut tracker);
+        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.spawned.len(), 1);
+        assert_eq!(delta.spawned[0].0, e);
+    }
+
+    #[test]
+    fn world_despawn_tracked_records_change() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn();
+        assert!(world.despawn_tracked(e, &mut tracker));
+        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.despawned.len(), 1);
+        assert_eq!(delta.despawned[0], e);
+    }
+
+    #[test]
+    fn world_insert_tracked_records_change() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn();
+        // spawn is untracked here — only insert is tracked
+        let cid = crate::component::component_id::<f32>();
+        world.insert_tracked(e, 42.0f32, &mut tracker);
+        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.component_deltas.len(), 1);
+        assert_eq!(delta.component_deltas[0].entity, e);
+    }
+
+    #[test]
+    fn world_remove_tracked_records_change() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn();
+        world.insert(e, 10.0f32);
+        let removed = world.remove_tracked::<f32>(e, &mut tracker);
+        assert_eq!(removed, Some(10.0f32));
+        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: crate::component::component_id::<f32>(), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.component_deltas.len(), 1);
+        assert_eq!(delta.component_deltas[0].entity, e);
+    }
+}
