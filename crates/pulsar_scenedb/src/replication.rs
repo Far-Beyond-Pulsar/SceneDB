@@ -985,7 +985,7 @@ impl RelevanceSet {
     pub fn from_frustum(
         cells: &[SpatialCell],
         frustum: &crate::spatial::Frustum,
-        liveness: &LivenessSnapshot,
+        _liveness: &LivenessSnapshot,
         scratch: &mut crate::lease::Scratchpad,
         mut resolve: impl FnMut(usize, u32) -> Option<Entity>,
     ) -> Self {
@@ -1290,7 +1290,7 @@ impl AuthorityTable {
     /// deterministic: higher `ClientId` wins. Spawns and despawns from both
     /// deltas are merged (deduplicated by Entity).
     pub fn resolve_conflict(
-        authority: &Self,
+        _authority: &Self,
         a: &Delta,
         client_a: ClientId,
         b: &Delta,
@@ -2548,5 +2548,37 @@ mod tests {
             .iter()
             .any(|(cid, data)| *cid == f32_cid && data.iter().any(|d| !d.is_empty()));
         assert!(has_bytes, "snapshot should contain non-empty field data for f32 component");
+    }
+
+    // ── Replicate derive macro end-to-end ────────────────────────────
+
+    #[test]
+    fn replicate_derive_generates_register_replication() {
+        use pulsar_scenedb_derive::Replicate;
+
+        #[derive(Replicate)]
+        struct TestComp {
+            #[replicate(encoding = Pod, condition = Always)]
+            pos: [f32; 3],
+
+            #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
+            health: f32,
+
+            #[replicate(encoding = Event, condition = Multicast)]
+            on_damage: u32,
+        }
+
+        let mut registry = ReplicationRegistry::new();
+        TestComp::register_replication(&mut registry);
+
+        let cid = crate::component::component_id::<TestComp>();
+        let schema = registry.schema(cid).unwrap();
+        assert_eq!(schema.fields.len(), 3);
+        assert_eq!(schema.fields[0].field_index, 0);
+        assert!(matches!(schema.fields[0].encoding, ReplicationEncoding::Pod));
+        assert_eq!(schema.fields[1].field_index, 1);
+        assert!(matches!(schema.fields[1].encoding, ReplicationEncoding::DeltaCompressed));
+        assert!(matches!(schema.fields[2].encoding, ReplicationEncoding::Event));
+        assert_eq!(schema.fields[2].event_channel, Some(EventChannel::ReliableOrdered));
     }
 }
