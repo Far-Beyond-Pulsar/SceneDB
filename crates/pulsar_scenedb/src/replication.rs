@@ -953,18 +953,16 @@ pub fn encode_field_value(encoding: &ReplicationEncoding, value_bytes: &[u8], bu
             ErrorCode::Ok
         }
         ReplicationEncoding::DeltaCompressed => {
-            // Simple LEB128 encode of the first 8 bytes as a u64.
-            let val = if value_bytes.len() >= 8 {
-                u64::from_le_bytes([
-                    value_bytes[0], value_bytes[1], value_bytes[2], value_bytes[3],
-                    value_bytes[4], value_bytes[5], value_bytes[6], value_bytes[7],
-                ])
-            } else {
-                let mut tmp = [0u8; 8];
-                tmp[..value_bytes.len()].copy_from_slice(value_bytes);
-                u64::from_le_bytes(tmp)
-            };
-            leb128_encode(val, buf);
+            // Stateless path: a compact LEB128 encode of the ABSOLUTE
+            // value, no reference to any previous value. This is NOT the
+            // "XOR-diff from the last acknowledged value" this crate's
+            // module doc describes for `DeltaCompressed` — that requires a
+            // per-connection cache of what the peer last acknowledged,
+            // which a pure `encoding, bytes, buf -> ErrorCode` function has
+            // nowhere to keep. See [`DeltaCompressor`] for the actual
+            // stateful implementation; this stays as the simple, cache-free
+            // fallback for callers that don't need the bandwidth win.
+            leb128_encode(bytes_to_u64_lossy(value_bytes), buf);
             ErrorCode::Ok
         }
         ReplicationEncoding::Event => ErrorCode::Ok,
@@ -1049,6 +1047,128 @@ fn leb128_decode(data: &[u8]) -> Result<(u64, usize), ErrorCode> {
         i += 1;
     }
     Err(ErrorCode::InvalidData)
+}
+
+/// Reinterprets up to the first 8 bytes of `bytes` as a little-endian `u64`,
+/// zero-padding a shorter input and silently truncating a longer one — the
+/// scalar width `DeltaCompressed`'s LEB128 framing actually carries (see its
+/// doc: "Slowly-changing values (health, cooldown, ammo)", i.e. scalars, not
+/// arbitrary-width structs).
+fn bytes_to_u64_lossy(bytes: &[u8]) -> u64 {
+    if bytes.len() >= 8 {
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    } else {
+        let mut tmp = [0u8; 8];
+        tmp[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(tmp)
+    }
+}
+
+/// XOR two byte slices up to their combined length, treating a missing byte
+/// on the shorter side as zero (XOR's identity element) — so diffing a
+/// wider "before" against a narrower "after" (or vice versa) degrades
+/// gracefully instead of panicking or silently dropping the tail.
+fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let len = a.len().max(b.len());
+    (0..len)
+        .map(|i| a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0))
+        .collect()
+}
+
+// ── Stateful delta compression ──────────────────────────────────────────────
+
+/// The actual "XOR-diff from the last acknowledged value" behavior this
+/// module's doc describes for [`ReplicationEncoding::DeltaCompressed`].
+///
+/// [`encode_field_value`]/[`decode_field_value`]'s `DeltaCompressed` arm is
+/// stateless — a plain function has nowhere to keep "what did this
+/// connection last see for this field", so it can only LEB128-compact the
+/// *absolute* value. `DeltaCompressor` is the missing piece: one instance
+/// per connection, caching the last value seen per `(Entity, ComponentId,
+/// field_index)` slot, so a value that hasn't changed much since last time
+/// XORs down to mostly zero bytes before LEB128 encoding — which is what
+/// actually makes "slowly-changing values (health, cooldown, ammo)" cheap
+/// to replicate every frame, the scenario this encoding mode exists for.
+///
+/// # Symmetry requirement
+///
+/// The sender's and receiver's caches must stay in lock-step: every value
+/// the sender encoded (in order) must be decoded by the receiver in the
+/// same order for the XOR history to line up — a dropped/reordered
+/// `DeltaCompressed` update will desync the two caches and corrupt every
+/// subsequent value for that slot until [`Self::acknowledge`] or
+/// [`Self::forget`] re-synchronizes them (e.g. after applying a full
+/// [`Snapshot`] resync). This is exactly why the module doc frames the
+/// encoding as diffing against the last *acknowledged* value, not simply
+/// the last value sent — a real transport should only let `encode` advance
+/// the cache once the peer has actually confirmed receipt, and call
+/// [`Self::acknowledge`] explicitly rather than relying on `encode`'s
+/// (loss-unaware) default of advancing on every call. `Delta`/`Reconciler`
+/// intentionally don't do this bookkeeping for you — see the module's
+/// "SceneDB does NOT own transport" tenet.
+pub struct DeltaCompressor {
+    last: HashMap<(Entity, ComponentId, u32), Vec<u8>>,
+}
+
+impl DeltaCompressor {
+    pub fn new() -> Self {
+        Self { last: HashMap::new() }
+    }
+
+    /// Encode `value_bytes` as an XOR-diff against the cached value for
+    /// `key` (an implicit all-zero baseline if `key` has never been seen),
+    /// then advances the cache to `value_bytes` — see the type-level doc's
+    /// "Symmetry requirement" for why that auto-advance is only correct
+    /// against a reliable, in-order channel.
+    pub fn encode(&mut self, key: (Entity, ComponentId, u32), value_bytes: &[u8], buf: &mut Vec<u8>) {
+        let prev = self.last.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let diff = xor_bytes(value_bytes, prev);
+        leb128_encode(bytes_to_u64_lossy(&diff), buf);
+        self.last.insert(key, value_bytes.to_vec());
+    }
+
+    /// Decode a value `encode` produced, XOR-ing the transmitted diff back
+    /// against this cache's last value for `key`, then advancing the cache
+    /// to the result — the mirror image of `encode`, so a sender/receiver
+    /// pair that call these in the same order for the same key reconstruct
+    /// the same sequence of absolute values.
+    pub fn decode(&mut self, key: (Entity, ComponentId, u32), data: &[u8], value_bytes: &mut [u8]) -> ErrorCode {
+        let (diff_val, _) = match leb128_decode(data) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let diff_bytes = diff_val.to_le_bytes();
+        let prev = self.last.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let result = xor_bytes(&diff_bytes[..value_bytes.len().min(8)], prev);
+        let copy_len = value_bytes.len().min(result.len());
+        value_bytes[..copy_len].copy_from_slice(&result[..copy_len]);
+        self.last.insert(key, value_bytes.to_vec());
+        ErrorCode::Ok
+    }
+
+    /// Explicitly set the cached "last acknowledged" value for `key`
+    /// without going through `encode`/`decode` — e.g. once a full
+    /// [`Snapshot`] resync establishes a fresh baseline both peers now
+    /// agree on, or once a real transport's ack for a specific `encode`
+    /// call actually arrives (see the type-level doc's symmetry caveat).
+    pub fn acknowledge(&mut self, key: (Entity, ComponentId, u32), value_bytes: &[u8]) {
+        self.last.insert(key, value_bytes.to_vec());
+    }
+
+    /// Forget the cached value for `key` (e.g. the entity despawned, or the
+    /// slot is known to have desynced) — the next `encode`/`decode` for a
+    /// reused key starts fresh against an implicit all-zero baseline.
+    pub fn forget(&mut self, key: (Entity, ComponentId, u32)) {
+        self.last.remove(&key);
+    }
+}
+
+impl Default for DeltaCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Serialize a set of component ids as an archetype-key blob (wire format:
