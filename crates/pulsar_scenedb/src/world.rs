@@ -402,6 +402,137 @@ impl World {
 
     // â”€â”€ Archetype graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    /// Spawn `entity` at its EXACT wire index+generation, directly into the
+    /// archetype identified by `key`, using `column_factory` to construct
+    /// any column the archetype doesn't already have.
+    ///
+    /// Used by [`crate::replication::Delta::apply`]: replicated entity
+    /// handles are shared verbatim between peers (see `Entity::bits`/
+    /// `from_bits` and the replication module doc's "Endianness is a
+    /// non-concern" tenet), so a replicated spawn must land at the same
+    /// slot the wire value encodes, not the next locally-available one. If
+    /// that slot is already live under a different occupant, the incoming
+    /// spawn is authoritative and the old occupant is despawned first.
+    ///
+    /// Every column of the destination archetype (not just the ones
+    /// `column_factory` was just asked to create) is grown by one
+    /// all-zero-byte row so lengths stay in sync with `entities.len()` —
+    /// [`crate::replication::Delta::apply`] overwrites the real values
+    /// afterward via `component_deltas`. This is only sound for Pod-like
+    /// component types (all-zero must be a valid bit pattern); see
+    /// `Delta::apply`'s doc for the caller contract.
+    ///
+    /// Returns `None` (leaving the archetype registered but without the
+    /// entity) if `column_factory` can't produce a column for one of
+    /// `key`'s component ids.
+    pub(crate) fn force_spawn_in_archetype(
+        &mut self,
+        entity: Entity,
+        key: ArchetypeKey,
+        mut column_factory: impl FnMut(ComponentId) -> Option<Box<dyn ErasedColumn>>,
+    ) -> Option<Entity> {
+        let idx = entity.index();
+        let gen = entity.generation();
+
+        while (self.entity_slots.len() as u32) <= idx {
+            let new_idx = self.entity_slots.len() as u32;
+            self.entity_slots.push(EntitySlot::empty(0));
+            self.free_slots.push(new_idx);
+        }
+        if !self.free_slots.contains(&idx) {
+            // `idx` is currently live under some other occupant — the
+            // incoming delta is authoritative.
+            let old_gen = self.entity_slots[idx as usize].generation;
+            self.despawn(Entity::new(idx, old_gen));
+        }
+        self.free_slots.retain(|&s| s != idx);
+        self.entity_slots[idx as usize] = EntitySlot {
+            generation: gen,
+            archetype: ArchetypeId::EMPTY,
+            row: 0,
+        };
+
+        let arch_id = self.get_or_create_archetype(key.clone());
+        for &cid in &key.0 {
+            if !Self::has_column_id(&self.archetypes[arch_id.0 as usize], cid) {
+                let col = column_factory(cid)?;
+                Self::set_column(&mut self.archetypes[arch_id.0 as usize], cid, col);
+            }
+        }
+
+        let row = self.archetypes[arch_id.0 as usize].entities.len() as u32;
+        self.archetypes[arch_id.0 as usize].entities.push(entity);
+        self.entity_slots[idx as usize].archetype = arch_id;
+        self.entity_slots[idx as usize].row = row;
+
+        let n = self.archetypes[arch_id.0 as usize].active_cids.len();
+        for i in 0..n {
+            let cid = self.archetypes[arch_id.0 as usize].active_cids[i];
+            let col = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).unwrap();
+            let elem = col.element_size();
+            // SAFETY: see this method's doc — only sound for Pod-like
+            // component types.
+            unsafe { col.push_bytes(&vec![0u8; elem]) };
+        }
+
+        Some(entity)
+    }
+
+    /// Byte width of `entity`'s column for `cid`, if it is alive and has
+    /// that component. Used by [`crate::replication::Delta::apply`] to size
+    /// its per-field decode scratch buffers.
+    pub(crate) fn component_element_size(&self, entity: Entity, cid: ComponentId) -> Option<usize> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+        let s = &self.entity_slots[entity.index() as usize];
+        let arch = &self.archetypes[s.archetype.0 as usize];
+        Self::get_erased(arch, cid).map(|c| c.element_size())
+    }
+
+    /// Write `bytes` into `entity`'s existing column for `cid`, starting at
+    /// byte `offset` within the element, overwriting in place. Returns
+    /// `false` if the entity is dead, has no column for `cid`, or `offset`
+    /// is past the column's element size. A `bytes` slice that would run
+    /// past the element's end is clamped rather than rejected.
+    ///
+    /// # Safety
+    /// `bytes` must be a valid bit pattern for the destination byte range
+    /// of the column's concrete type — sound only for Pod-like component
+    /// types (see [`crate::replication::Delta::apply`]'s doc).
+    pub(crate) unsafe fn write_component_raw(
+        &mut self,
+        entity: Entity,
+        cid: ComponentId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> bool {
+        if !self.is_alive(entity) {
+            return false;
+        }
+        let (arch_id, row) = {
+            let s = &self.entity_slots[entity.index() as usize];
+            (s.archetype, s.row as usize)
+        };
+        let Some(col) = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid) else {
+            return false;
+        };
+        if row >= col.len() {
+            return false;
+        }
+        let elem = col.element_size();
+        if offset >= elem {
+            return false;
+        }
+        let n = bytes.len().min(elem - offset);
+        // SAFETY: row < col.len() (checked above); offset + n <= elem
+        // (clamped above); caller guarantees `bytes` is a valid bit pattern
+        // for this byte range.
+        let dst = (col.get_raw_mut(row) as *mut u8).add(offset);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
+        true
+    }
+
     pub(crate) fn get_or_create_archetype(&mut self, key: ArchetypeKey) -> ArchetypeId {
         if let Some(&id) = self.archetype_index.get(&key) {
             return id;

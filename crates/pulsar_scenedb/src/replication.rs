@@ -202,6 +202,7 @@
 //! - Integration test: client-side prediction with server correction,
 //!   verify rollback converges within 3 frames.
 
+use crate::archetype::ArchetypeKey;
 use crate::component::ComponentId;
 use crate::entity::Entity;
 use crate::snapshot::LivenessSnapshot;
@@ -345,6 +346,14 @@ pub struct FieldDescriptor {
 pub struct ReplicationSchema {
     pub component_type: ComponentId,
     pub fields: Vec<FieldDescriptor>,
+    /// Local-only column constructor, captured generically at
+    /// [`ReplicationRegistry::register`] time (`T` is known there). `None`
+    /// for schemas built by [`ReplicationRegistry::from_handshake`] — a
+    /// remote peer's wire bytes carry field layout, never Rust types, so
+    /// only LOCALLY-registered component types support [`Delta::apply`]'s
+    /// spawn reconstruction (the same limitation `ReplicationEncoding::Opaque`'s
+    /// fn pointers already have — see `u8_from_encoding`'s doc).
+    pub(crate) column_factory: Option<fn() -> Box<dyn crate::component::ErasedColumn>>,
 }
 
 // ── Schema builder ─────────────────────────────────────────────────────────
@@ -355,6 +364,7 @@ pub struct ReplicationSchema {
 pub struct SchemaBuilder<T> {
     component_type: ComponentId,
     fields: Vec<FieldDescriptor>,
+    column_factory: fn() -> Box<dyn crate::component::ErasedColumn>,
     _phantom: PhantomData<T>,
 }
 
@@ -388,6 +398,7 @@ impl<T: crate::Component> SchemaBuilder<T> {
         ReplicationSchema {
             component_type: self.component_type,
             fields: self.fields,
+            column_factory: Some(self.column_factory),
         }
     }
 }
@@ -416,8 +427,16 @@ impl ReplicationRegistry {
         SchemaBuilder {
             component_type: crate::component::component_id::<T>(),
             fields: Vec::new(),
+            column_factory: || Box::new(crate::component::Column::<T>::new()),
             _phantom: PhantomData,
         }
+    }
+
+    /// Local-only column constructor for a registered component type (see
+    /// [`ReplicationSchema::column_factory`]). `None` if `cid` isn't
+    /// registered or was learned only from a remote handshake.
+    pub(crate) fn column_factory(&self, cid: ComponentId) -> Option<Box<dyn crate::component::ErasedColumn>> {
+        self.schemas.get(&cid)?.column_factory.map(|f| f())
     }
 
     /// Finalise a builder and insert the resulting schema. Called internally
@@ -505,6 +524,9 @@ impl ReplicationRegistry {
                 ReplicationSchema {
                     component_type,
                     fields,
+                    // Wire bytes never carry Rust types — see
+                    // `ReplicationSchema::column_factory`'s doc.
+                    column_factory: None,
                 },
             );
         }
@@ -694,6 +716,43 @@ fn leb128_decode(data: &[u8]) -> Result<(u64, usize), ErrorCode> {
     Err(ErrorCode::InvalidData)
 }
 
+/// Serialize a set of component ids as an archetype-key blob (wire format:
+/// `count: u32` then `count` × `component_id: u32`, little-endian). Used to
+/// fill [`Delta::spawned`]'s per-entity blob (see
+/// [`ChangeTracker::drain_with_world`]) so [`Delta::apply`] can reconstruct
+/// the spawning entity's exact archetype on a remote peer.
+pub fn encode_archetype_key(ids: &[ComponentId]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + ids.len() * 4);
+    buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        buf.extend_from_slice(&id.0.to_le_bytes());
+    }
+    buf
+}
+
+/// Inverse of [`encode_archetype_key`]. Returns `None` if `bytes` is
+/// truncated, malformed, or simply isn't an archetype-key blob (e.g. the
+/// placeholder frame-number blob the plain [`ChangeTracker::drain`]
+/// produces) — callers should treat that as "unknown archetype" and fall
+/// back to the empty archetype.
+pub fn decode_archetype_key(bytes: &[u8]) -> Option<Vec<ComponentId>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if 4 + count * 4 != bytes.len() {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let ofs = 4 + i * 4;
+        ids.push(ComponentId(u32::from_le_bytes([
+            bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3],
+        ])));
+    }
+    Some(ids)
+}
+
 // ── Delta ──────────────────────────────────────────────────────────────────
 
 /// Frame-consistent set of state changes for one connection.
@@ -854,6 +913,113 @@ impl Delta {
 
         Some(Delta { frame, base_frame, spawned, despawned, component_deltas, events })
     }
+
+    /// Apply this Delta's changes to a World.
+    ///
+    /// 1. Despawns removed entities.
+    /// 2. Spawns new entities at their EXACT wire `Entity` (index +
+    ///    generation) into the archetype encoded in each spawn's blob —
+    ///    see [`encode_archetype_key`] / [`ChangeTracker::drain_with_world`].
+    ///    A blob that isn't a valid archetype key (truncated, or the plain
+    ///    placeholder [`ChangeTracker::drain`] produces) falls back to the
+    ///    empty archetype.
+    /// 3. Writes component field data back to columns using `schema`, in
+    ///    field-declaration order, packing each component's fields
+    ///    sequentially by byte offset (the schema has no explicit
+    ///    per-field byte width, so declaration order stands in for it —
+    ///    this matches how every field currently in this codebase records
+    ///    the whole component's bytes at field index 0).
+    ///
+    /// Entities are placed at the SAME index+generation as the wire value
+    /// (via `Entity::bits`/`from_bits`) — SceneDB's replication model
+    /// assumes entity handles are shared verbatim between peers (see the
+    /// module doc's "Endianness is a non-concern" design tenet). If that
+    /// slot is already occupied by a different local entity, the incoming
+    /// delta is authoritative and the old occupant is despawned first.
+    ///
+    /// Spawning an entity whose archetype names a component type `schema`
+    /// has no local (non-handshake) registration for fails with
+    /// [`ErrorCode::InvalidData`] — see [`ReplicationSchema::column_factory`].
+    ///
+    /// # Safety
+    ///
+    /// Component data is memcpy'd directly into column slots via raw
+    /// pointer casts. Every replicated component type touched by a
+    /// `Pod`/`Serialized`/`GpuHandle`/`DeltaCompressed`/`Opaque` field must
+    /// tolerate that (i.e. behave like [`crate::page::Pod`]: safely
+    /// constructible from arbitrary or all-zero bytes). Field data must
+    /// have been produced with the same [`ReplicationEncoding`] the local
+    /// `schema` declares for that field.
+    pub fn apply(&self, world: &mut crate::World, schema: &ReplicationRegistry) -> Result<(), ErrorCode> {
+        for &entity in &self.despawned {
+            world.despawn(entity);
+        }
+
+        for (entity, blob) in &self.spawned {
+            let cids = decode_archetype_key(blob).unwrap_or_default();
+            let key = ArchetypeKey::new(cids);
+            if world
+                .force_spawn_in_archetype(*entity, key, |cid| schema.column_factory(cid))
+                .is_none()
+            {
+                return Err(ErrorCode::InvalidData);
+            }
+        }
+
+        for cd in &self.component_deltas {
+            let Some(s) = schema.schema(cd.component_type) else {
+                continue;
+            };
+            let Some(elem_size) = world.component_element_size(cd.entity, cd.component_type) else {
+                continue;
+            };
+            let mut offset = 0usize;
+            for field in &s.fields {
+                if offset >= elem_size {
+                    break;
+                }
+                if matches!(field.encoding, ReplicationEncoding::Event) {
+                    continue;
+                }
+                let idx = field.field_index as usize;
+                let Some(raw) = cd.field_data.get(idx) else {
+                    continue;
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                let remaining = elem_size - offset;
+                let width = match &field.encoding {
+                    ReplicationEncoding::Pod | ReplicationEncoding::Serialized | ReplicationEncoding::GpuHandle => {
+                        raw.len().min(remaining)
+                    }
+                    // No byte-width metadata for a compressed field — a
+                    // decoded LEB128 value is at most 8 bytes wide.
+                    ReplicationEncoding::DeltaCompressed => remaining.min(8),
+                    // Opaque owns its own framing; hand it the whole
+                    // remaining budget and let `decode` write only what it
+                    // needs.
+                    ReplicationEncoding::Opaque { .. } => remaining,
+                    ReplicationEncoding::Event => 0,
+                };
+                if width == 0 {
+                    continue;
+                }
+                let mut decoded = vec![0u8; width];
+                let code = decode_field_value(&field.encoding, raw, &mut decoded);
+                if code != ErrorCode::Ok {
+                    return Err(code);
+                }
+                // SAFETY: see this method's doc.
+                unsafe {
+                    world.write_component_raw(cd.entity, cd.component_type, offset, &decoded);
+                }
+                offset += width;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Sparse component data for one entity within a Delta.
@@ -956,6 +1122,35 @@ impl ChangeTracker {
 
     pub fn end_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// Like [`drain`](Self::drain) but encodes each spawned entity's
+    /// *current* archetype (looked up in `world`) as its blob via
+    /// [`encode_archetype_key`], so the resulting [`Delta`] can be fully
+    /// reconstructed on a remote peer by [`Delta::apply`]. Plain `drain`
+    /// cannot do this — it has no `World` access, so its blob is just a
+    /// placeholder frame marker.
+    pub fn drain_with_world(&mut self, world: &crate::World) -> Delta {
+        let spawned = mem::take(&mut self.spawned)
+            .into_iter()
+            .map(|e| {
+                let blob = if world.is_alive(e) {
+                    let arch_id = world.entity_slots[e.index() as usize].archetype;
+                    encode_archetype_key(&world.archetypes[arch_id.0 as usize].active_cids)
+                } else {
+                    Vec::new()
+                };
+                (e, blob)
+            })
+            .collect();
+        Delta {
+            frame: self.frame,
+            base_frame: self.frame.wrapping_sub(1),
+            spawned,
+            despawned: mem::take(&mut self.despawned),
+            component_deltas: mem::take(&mut self.component_changes),
+            events: mem::take(&mut self.events),
+        }
     }
 }
 
@@ -1599,6 +1794,12 @@ mod tests {
         Entity::new(index, gen)
     }
 
+    /// Empty-fields schema for tests that only exercise `ChangeTracker::drain`
+    /// (which ignores its `_schema` argument entirely).
+    fn test_schema(component_type: ComponentId) -> ReplicationSchema {
+        ReplicationSchema { component_type, fields: vec![], column_factory: None }
+    }
+
     #[test]
     fn tracker_records_spawns() {
         let mut t = ChangeTracker::new();
@@ -1606,7 +1807,7 @@ mod tests {
         let e2 = make_entity(1, 1);
         t.record_spawn(e1);
         t.record_spawn(e2);
-        let (delta, _events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _events) = t.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.spawned.len(), 2);
         assert!(delta.spawned.iter().any(|(e, _)| *e == e1));
         assert!(delta.spawned.iter().any(|(e, _)| *e == e2));
@@ -1620,7 +1821,7 @@ mod tests {
         let mut t = ChangeTracker::new();
         let e = make_entity(0, 1);
         t.record_despawn(e);
-        let (delta, _events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _events) = t.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.despawned.len(), 1);
         assert_eq!(delta.despawned[0], e);
     }
@@ -1632,7 +1833,7 @@ mod tests {
         let cid = ComponentId(3);
         let data = vec![1u8, 2, 3, 4];
         t.record_component_change(e, cid, 0, data.clone());
-        let (delta, _) = t.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = t.drain(&test_schema(cid), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].entity, e);
         assert_eq!(delta.component_deltas[0].component_type, cid);
@@ -1646,7 +1847,7 @@ mod tests {
         let cid = ComponentId(7);
         t.record_component_change(e, cid, 1, vec![10u8]);
         t.record_component_change(e, cid, 0, vec![20u8]);
-        let (delta, _) = t.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = t.drain(&test_schema(cid), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].field_data[0], vec![20u8]);
         assert_eq!(delta.component_deltas[0].field_data[1], vec![10u8]);
@@ -1665,7 +1866,7 @@ mod tests {
             target_client: None,
         };
         t.record_event(ev.clone());
-        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(1), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = t.drain(&test_schema(ComponentId(1)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.events.len(), 1);
         assert_eq!(delta.events[0].entity, e);
         assert_eq!(delta.events[0].payload, vec![99u8]);
@@ -1675,9 +1876,9 @@ mod tests {
     fn drain_clears_tracker() {
         let mut t = ChangeTracker::new();
         t.record_spawn(make_entity(0, 1));
-        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = t.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.spawned.len(), 1);
-        let (delta2, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta2, _) = t.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert!(delta2.spawned.is_empty());
         assert!(delta2.despawned.is_empty());
         assert!(delta2.component_deltas.is_empty());
@@ -1697,7 +1898,7 @@ mod tests {
     fn drain_includes_frame_number() {
         let mut t = ChangeTracker::new();
         t.end_frame();
-        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = t.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.frame, 1);
     }
 
@@ -1706,7 +1907,7 @@ mod tests {
         let mut world = crate::World::new();
         let mut tracker = ChangeTracker::new();
         let e = world.spawn_tracked(&mut tracker);
-        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = tracker.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.spawned.len(), 1);
         assert_eq!(delta.spawned[0].0, e);
     }
@@ -1717,7 +1918,7 @@ mod tests {
         let mut tracker = ChangeTracker::new();
         let e = world.spawn();
         assert!(world.despawn_tracked(e, &mut tracker));
-        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = tracker.drain(&test_schema(ComponentId(0)), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.despawned.len(), 1);
         assert_eq!(delta.despawned[0], e);
     }
@@ -1730,7 +1931,7 @@ mod tests {
         // spawn is untracked here — only insert is tracked
         let cid = crate::component::component_id::<f32>();
         world.insert_tracked(e, 42.0f32, &mut tracker);
-        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = tracker.drain(&test_schema(cid), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].entity, e);
     }
@@ -1743,7 +1944,7 @@ mod tests {
         world.insert(e, 10.0f32);
         let removed = world.remove_tracked::<f32>(e, &mut tracker);
         assert_eq!(removed, Some(10.0f32));
-        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: crate::component::component_id::<f32>(), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = tracker.drain(&test_schema(crate::component::component_id::<f32>()), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].entity, e);
     }
@@ -1756,6 +1957,7 @@ mod tests {
         let schema = SchemaBuilder::<f32> {
             component_type: cid,
             fields: Vec::new(),
+            column_factory: || Box::new(crate::component::Column::<f32>::new()),
             _phantom: PhantomData,
         }
         .field("x", ReplicationEncoding::Pod, ReplicationCondition::Always)
@@ -1774,6 +1976,7 @@ mod tests {
         let schema = SchemaBuilder::<f32> {
             component_type: ComponentId(1),
             fields: Vec::new(),
+            column_factory: || Box::new(crate::component::Column::<f32>::new()),
             _phantom: PhantomData,
         }
         .event("on_foo", ReplicationCondition::Multicast, EventChannel::Unreliable)
@@ -2296,7 +2499,7 @@ mod tests {
             .event("ev4", ReplicationCondition::Multicast, EventChannel::ReliableOrdered);
         reg.insert(builder);
 
-        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _) = tracker.drain(&test_schema(cid), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.events.len(), 5);
         for (i, ev) in delta.events.iter().enumerate() {
             assert_eq!(ev.event_field, i as u32);
@@ -2547,6 +2750,204 @@ mod tests {
             .iter()
             .any(|(cid, data)| *cid == f32_cid && data.iter().any(|d| !d.is_empty()));
         assert!(has_bytes, "snapshot should contain non-empty field data for f32 component");
+    }
+
+    // ── Delta::apply ─────────────────────────────────────────────────
+
+    #[test]
+    fn archetype_key_round_trips() {
+        let ids = vec![ComponentId(3), ComponentId(7), ComponentId(1)];
+        let bytes = encode_archetype_key(&ids);
+        let decoded = decode_archetype_key(&bytes).unwrap();
+        assert_eq!(decoded, ids);
+    }
+
+    #[test]
+    fn archetype_key_decode_rejects_garbage() {
+        assert!(decode_archetype_key(&[]).is_none());
+        assert!(decode_archetype_key(&[1, 0, 0, 0]).is_none()); // claims 1 id, has 0
+        // Plain `drain`'s placeholder blob (a bare frame u64) isn't valid.
+        assert!(decode_archetype_key(&7u64.to_le_bytes()).is_none());
+    }
+
+    #[test]
+    fn apply_writes_component_update_to_existing_entity() {
+        let mut world = crate::World::new();
+        let e = world.spawn();
+        world.insert(e, 1.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta {
+                entity: e,
+                component_type: cid,
+                field_data: vec![9.5f32.to_le_bytes().to_vec()],
+            }],
+            events: vec![],
+        };
+
+        assert_eq!(delta.apply(&mut world, &reg), Ok(()));
+        assert_eq!(*world.get::<f32>(e).unwrap(), 9.5f32);
+    }
+
+    #[test]
+    fn apply_despawns_entities() {
+        let mut world = crate::World::new();
+        let e = world.spawn();
+        assert!(world.is_alive(e));
+
+        let reg = ReplicationRegistry::new();
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![],
+            despawned: vec![e],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        assert_eq!(delta.apply(&mut world, &reg), Ok(()));
+        assert!(!world.is_alive(e));
+    }
+
+    #[test]
+    fn apply_spawns_entity_at_exact_wire_handle_with_archetype() {
+        let mut world = crate::World::new();
+
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let wire_entity = make_entity(41, 3);
+        let blob = encode_archetype_key(&[cid]);
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(wire_entity, blob)],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta {
+                entity: wire_entity,
+                component_type: cid,
+                field_data: vec![3.25f32.to_le_bytes().to_vec()],
+            }],
+            events: vec![],
+        };
+
+        assert_eq!(delta.apply(&mut world, &reg), Ok(()));
+        assert!(world.is_alive(wire_entity), "entity lands at the exact wire index+generation");
+        assert_eq!(*world.get::<f32>(wire_entity).unwrap(), 3.25f32);
+    }
+
+    #[test]
+    fn apply_spawn_with_unknown_component_fails() {
+        let mut world = crate::World::new();
+        // Registry has no locally-registered factory for this component —
+        // only a bare ComponentId with nothing behind it.
+        let reg = ReplicationRegistry::new();
+        let blob = encode_archetype_key(&[ComponentId(999)]);
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(make_entity(0, 0), blob)],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        assert_eq!(delta.apply(&mut world, &reg), Err(ErrorCode::InvalidData));
+    }
+
+    #[test]
+    fn apply_spawn_with_malformed_blob_falls_back_to_empty_archetype() {
+        let mut world = crate::World::new();
+        let reg = ReplicationRegistry::new();
+        let e = make_entity(5, 0);
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(e, vec![1, 2, 3])], // not a valid archetype-key blob
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        assert_eq!(delta.apply(&mut world, &reg), Ok(()));
+        assert!(world.is_alive(e));
+    }
+
+    #[test]
+    fn apply_respawn_evicts_old_occupant_at_same_slot() {
+        let mut world = crate::World::new();
+        let reg = ReplicationRegistry::new();
+
+        let old = world.spawn(); // claims index 0, generation 0
+        assert!(world.is_alive(old));
+
+        // A wire entity at the same index but generation 5 — a later
+        // delta's spawn is authoritative over whatever locally occupies
+        // that slot.
+        let new_wire = make_entity(old.index(), 5);
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(new_wire, Vec::new())],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        assert_eq!(delta.apply(&mut world, &reg), Ok(()));
+        assert!(!world.is_alive(old), "old occupant evicted");
+        assert!(world.is_alive(new_wire), "new wire entity now owns the slot");
+    }
+
+    #[test]
+    fn drain_with_world_encodes_real_archetype_key() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn_tracked(&mut tracker);
+        let cid = crate::component::component_id::<f32>();
+        world.insert(e, 1.0f32); // not tracked — spawn's archetype is looked up at drain time
+
+        let delta = tracker.drain_with_world(&world);
+        assert_eq!(delta.spawned.len(), 1);
+        let (spawned_entity, blob) = &delta.spawned[0];
+        assert_eq!(*spawned_entity, e);
+        let cids = decode_archetype_key(blob).expect("valid archetype-key blob");
+        assert_eq!(cids, vec![cid]);
+    }
+
+    #[test]
+    fn full_round_trip_drain_wire_apply() {
+        // Server-side world: spawn + insert, drain with real archetype info.
+        let mut server = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = server.spawn_tracked(&mut tracker);
+
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        server.insert(e, 7.0f32);
+        let mut server_delta = tracker.drain_with_world(&server);
+        // insert_inner recorded the change with empty field data (the value
+        // had already moved into the column) — patch it in like a real
+        // caller would after reading the value back out.
+        server_delta.component_deltas.push(ComponentDelta {
+            entity: e,
+            component_type: cid,
+            field_data: vec![server.get::<f32>(e).unwrap().to_le_bytes().to_vec()],
+        });
+
+        // Wire round trip.
+        let bytes = server_delta.to_bytes();
+        let wire_delta = Delta::from_bytes(&bytes).unwrap();
+
+        // Client-side world: starts empty, apply reconstructs the entity.
+        let mut client = crate::World::new();
+        assert_eq!(wire_delta.apply(&mut client, &reg), Ok(()));
+        assert!(client.is_alive(e));
+        assert_eq!(*client.get::<f32>(e).unwrap(), 7.0f32);
     }
 
 }
