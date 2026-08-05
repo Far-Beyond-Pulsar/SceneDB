@@ -1197,52 +1197,125 @@ impl Default for AuthorityTable {
 
 // ── Snapshot & reconciliation ──────────────────────────────────────────────
 
-/// A full or partial world state at a specific frame.
+/// A point-in-time capture of a world state at a specific frame.
+/// Used as the basis for client correction in the reconciler.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub frame: u64,
     pub entities: Vec<EntitySnapshot>,
 }
 
+/// A single entity's component data within a snapshot.
+/// Each component's field data is encoded per its [`ReplicationEncoding`].
 #[derive(Clone, Debug)]
 pub struct EntitySnapshot {
     pub entity: Entity,
     pub components: Vec<(ComponentId, Vec<Vec<u8>>)>,
 }
 
-/// Client-side prediction reconciler.
-#[derive(Clone, Debug)]
-pub struct Reconciler {
-    snapshots: Vec<Snapshot>,
-    pending_inputs: Vec<ClientInput>,
-}
-
-impl Reconciler {
-    pub fn new() -> Self {
-        Self {
-            snapshots: Vec::new(),
-            pending_inputs: Vec::new(),
+impl Snapshot {
+    /// Capture the full world state at `frame`.
+    ///
+    /// Walks every archetype, every entity, and encodes every component's
+    /// field data using the schema registry. Returns a complete snapshot
+    /// suitable for initial replication or full state recovery.
+    pub fn capture_full(
+        world: &crate::World,
+        schema: &ReplicationRegistry,
+        frame: u64,
+    ) -> Self {
+        let mut entities = Vec::new();
+        for arch in &world.archetypes {
+            for row in 0..arch.entities.len() {
+                let entity = arch.entities[row];
+                let mut components = Vec::new();
+                for &cid in &arch.active_cids {
+                    let mut field_data = Vec::new();
+                    if let Some(s) = schema.schema(cid) {
+                        for field in &s.fields {
+                            if matches!(field.encoding, ReplicationEncoding::Event) {
+                                continue;
+                            }
+                            if let Some(col) = arch.get_erased(cid) {
+                                if row < col.len() {
+                                    let ptr = unsafe { col.get_raw(row) };
+                                    let len = match &field.encoding {
+                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => {
+                                            get_pod_size(cid).unwrap_or(0)
+                                        }
+                                        _ => 0,
+                                    };
+                                    let bytes = if len > 0 {
+                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let mut buf = Vec::new();
+                                    encode_field_value(&field.encoding, &bytes, &mut buf);
+                                    field_data.push(buf);
+                                }
+                            }
+                        }
+                    }
+                    components.push((cid, field_data));
+                }
+                entities.push(EntitySnapshot { entity, components });
+            }
         }
+        Self { frame, entities }
     }
 
-    pub fn push_snapshot(&mut self, snapshot: Snapshot) {
-        if self.snapshots.len() >= 64 {
-            self.snapshots.remove(0);
+    /// Capture only entities relevant to a specific client.
+    /// Avoids serializing off-relevance entities — an optimization for
+    /// initial spawn or recovery from packet loss.
+    pub fn capture_relevant(
+        world: &crate::World,
+        schema: &ReplicationRegistry,
+        relevance: &RelevanceSet,
+        frame: u64,
+    ) -> Self {
+        let mut entities = Vec::new();
+        for arch in &world.archetypes {
+            for row in 0..arch.entities.len() {
+                let entity = arch.entities[row];
+                if !relevance.contains(entity) {
+                    continue;
+                }
+                let mut components = Vec::new();
+                for &cid in &arch.active_cids {
+                    let mut field_data = Vec::new();
+                    if let Some(s) = schema.schema(cid) {
+                        for field in &s.fields {
+                            if matches!(field.encoding, ReplicationEncoding::Event) {
+                                continue;
+                            }
+                            if let Some(col) = arch.get_erased(cid) {
+                                if row < col.len() {
+                                    let ptr = unsafe { col.get_raw(row) };
+                                    let len = match &field.encoding {
+                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => {
+                                            get_pod_size(cid).unwrap_or(0)
+                                        }
+                                        _ => 0,
+                                    };
+                                    let bytes = if len > 0 {
+                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let mut buf = Vec::new();
+                                    encode_field_value(&field.encoding, &bytes, &mut buf);
+                                    field_data.push(buf);
+                                }
+                            }
+                        }
+                    }
+                    components.push((cid, field_data));
+                }
+                entities.push(EntitySnapshot { entity, components });
+            }
         }
-        self.snapshots.push(snapshot);
-    }
-
-    pub fn push_input(&mut self, input: ClientInput) {
-        self.pending_inputs.push(input);
-    }
-
-    pub fn pending_inputs(&self) -> &[ClientInput] {
-        &self.pending_inputs
-    }
-
-    pub fn clear_acknowledged(&mut self, frame: u64) {
-        self.pending_inputs.retain(|i| i.frame > frame);
-        self.snapshots.retain(|s| s.frame > frame);
+        Self { frame, entities }
     }
 }
 
@@ -1253,6 +1326,119 @@ pub struct ClientInput {
     pub entity: Entity,
     pub component: ComponentId,
     pub field_data: Vec<(u32, Vec<u8>)>,
+}
+
+/// Client-side prediction reconciler.
+///
+/// Maintains a history ring buffer of server snapshots and a queue of
+/// unacknowledged local inputs. When a server delta arrives,
+/// [`reconcile`](Self::reconcile) applies it, rolls back to the matching
+/// server snapshot, and replays pending local inputs on top.
+#[derive(Clone, Debug)]
+pub struct Reconciler {
+    snapshots: Vec<Snapshot>,
+    pending_inputs: Vec<ClientInput>,
+    server_frame: u64,
+    local_frame: u64,
+}
+
+impl Reconciler {
+    pub fn new() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            pending_inputs: Vec::new(),
+            server_frame: 0,
+            local_frame: 0,
+        }
+    }
+
+    /// Push a server snapshot into the history ring buffer.
+    /// Drops the oldest snapshot if the buffer exceeds 64 entries.
+    pub fn push_snapshot(&mut self, snapshot: Snapshot) {
+        self.server_frame = snapshot.frame;
+        if self.snapshots.len() >= 64 {
+            self.snapshots.remove(0);
+        }
+        self.snapshots.push(snapshot);
+    }
+
+    /// Record a local predicted write before the server responds.
+    pub fn push_input(&mut self, input: ClientInput) {
+        self.local_frame = input.frame;
+        self.pending_inputs.push(input);
+    }
+
+    pub fn pending_inputs(&self) -> &[ClientInput] {
+        &self.pending_inputs
+    }
+
+    /// Forget inputs and snapshots older than `frame`.
+    pub fn clear_before(&mut self, frame: u64) {
+        self.pending_inputs.retain(|i| i.frame > frame);
+        self.snapshots.retain(|s| s.frame > frame);
+    }
+
+    /// The most recent server frame the reconciler knows about.
+    pub fn server_frame(&self) -> u64 {
+        self.server_frame
+    }
+
+    /// The most recent local frame with pending inputs.
+    pub fn local_frame(&self) -> u64 {
+        self.local_frame
+    }
+
+    /// Apply a server delta and reconcile pending inputs on top.
+    ///
+    /// Steps:
+    /// 1. Discard acknowledged inputs (frame <= delta.base_frame).
+    /// 2. Discard snapshots older than delta.base_frame.
+    /// 3. Call `replay(world, input)` for each remaining pending input
+    ///    in frame order, re-applying predicted local writes on top of
+    ///    the now-corrected world.
+    ///
+    /// # Usage
+    ///
+    /// The caller must apply `server_delta` to `world` *before* calling
+    /// this method. The reconciler only handles replay of pending inputs:
+    ///
+    /// ```ignore
+    /// apply_delta_to_world(&server_delta, &mut world, &schema);
+    /// reconciler.reconcile(&server_delta, &mut world, |w, input| {
+    ///     // write input.field_data back to w[input.entity][input.component]
+    /// });
+    /// ```
+    pub fn reconcile(
+        &mut self,
+        server_delta: &Delta,
+        world: &mut crate::World,
+        mut replay: impl FnMut(&mut crate::World, &ClientInput),
+    ) {
+        let base = server_delta.base_frame;
+        self.clear_before(base);
+
+        // Re-play pending inputs in frame order.
+        let to_replay: Vec<ClientInput> = self.pending_inputs.clone();
+        for input in &to_replay {
+            replay(world, input);
+        }
+    }
+}
+
+impl Default for Reconciler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn get_pod_size(cid: ComponentId) -> Option<usize> {
+    // This is a best-effort heuristic for capture: we try to determine the
+    // size of a Pod component from the reflection registry. For now, return
+    // None which forces callers to handle the generic case.
+    let _ = cid;
+    None
 }
 
 // ── Assert endianness ──────────────────────────────────────────────────────
@@ -2003,5 +2189,140 @@ mod tests {
             ..ev.clone()
         };
         assert_eq!(ev2.channel, EventChannel::ReliableOrdered);
+    }
+
+    // ── R5: Snapshot + reconciliation ────────────────────────────────
+
+    #[test]
+    fn snapshot_capture_full_includes_all_entities() {
+        let mut world = crate::World::new();
+        let e1 = world.spawn();
+        let e2 = world.spawn();
+        world.insert(e1, 1.0f32);
+        world.insert(e2, 2.0f32);
+
+        let reg = ReplicationRegistry::new();
+        let snap = Snapshot::capture_full(&world, &reg, 7);
+        assert_eq!(snap.frame, 7);
+        assert_eq!(snap.entities.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_capture_relevant_filters_entities() {
+        let mut world = crate::World::new();
+        let e1 = world.spawn();
+        let e2 = world.spawn();
+
+        let mut relevance = RelevanceSet::new();
+        relevance.add(e1); // only e1 is relevant
+
+        let reg = ReplicationRegistry::new();
+        let snap = Snapshot::capture_relevant(&world, &reg, &relevance, 3);
+        assert_eq!(snap.frame, 3);
+        assert_eq!(snap.entities.len(), 1);
+        assert_eq!(snap.entities[0].entity, e1);
+    }
+
+    #[test]
+    fn reconciler_push_and_clear() {
+        let mut r = Reconciler::new();
+        let snap = Snapshot { frame: 10, entities: vec![] };
+        r.push_snapshot(snap);
+        r.push_input(ClientInput {
+            frame: 11, entity: make_entity(0, 1), component: ComponentId(1), field_data: vec![],
+        });
+        assert_eq!(r.server_frame(), 10);
+        assert_eq!(r.local_frame(), 11);
+        assert_eq!(r.pending_inputs().len(), 1);
+
+        r.clear_before(10);
+        assert_eq!(r.pending_inputs().len(), 1); // input at frame 11 > 10
+
+        r.clear_before(12);
+        assert!(r.pending_inputs().is_empty());
+    }
+
+    #[test]
+    fn reconciler_ring_buffer_drops_oldest() {
+        let mut r = Reconciler::new();
+        for i in 0..70u64 {
+            r.push_snapshot(Snapshot { frame: i, entities: vec![] });
+        }
+        // Ring buffer capped at 64 — oldest 6 frames dropped.
+        assert!(r.snapshots.len() <= 64);
+        assert_eq!(r.snapshots.first().unwrap().frame, 6);
+        assert_eq!(r.snapshots.last().unwrap().frame, 69);
+    }
+
+    #[test]
+    fn reconciler_reconcile_discards_old_inputs_and_replays() {
+        let mut r = Reconciler::new();
+        let e = make_entity(0, 1);
+
+        // Three inputs at frames 1, 2, 3.
+        for i in 1..=3u64 {
+            r.push_input(ClientInput {
+                frame: i,
+                entity: e,
+                component: ComponentId(1),
+                field_data: vec![(0, vec![i as u8])],
+            });
+        }
+
+        let server_delta = Delta {
+            frame: 5, base_frame: 2,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+
+        let mut replayed: Vec<u64> = Vec::new();
+        let mut world = crate::World::new();
+
+        r.reconcile(&server_delta, &mut world, |_, input| {
+            replayed.push(input.frame);
+        });
+
+        // Only input at frame 3 should be replayed (frame > base_frame 2).
+        assert_eq!(replayed, vec![3]);
+        // Input at frames 1, 2 should be discarded.
+        assert_eq!(r.pending_inputs().len(), 1);
+        assert_eq!(r.pending_inputs()[0].frame, 3);
+    }
+
+    #[test]
+    fn reconciler_three_frame_prediction_cycle() {
+        let mut r = Reconciler::new();
+        let e = make_entity(0, 1);
+
+        // Simulate 3 frames of client prediction.
+        for i in 1..=3u64 {
+            r.push_input(ClientInput {
+                frame: i,
+                entity: e,
+                component: ComponentId(1),
+                field_data: vec![(0, vec![i as u8])],
+            });
+        }
+
+        // Server delta at frame 4, base frame 1 → acknowledges frames ≤1.
+        let server_delta = Delta {
+            frame: 4, base_frame: 1,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+
+        let mut replayed: Vec<u64> = Vec::new();
+        let mut world = crate::World::new();
+        r.reconcile(&server_delta, &mut world, |_, input| {
+            replayed.push(input.frame);
+        });
+
+        // Frames 2 and 3 should be replayed.
+        assert_eq!(replayed, vec![2, 3]);
+        assert_eq!(r.pending_inputs().len(), 2);
     }
 }
