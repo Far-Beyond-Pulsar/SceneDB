@@ -497,6 +497,56 @@ let handshake = registry.handshake_message();
 let remote_registry = ReplicationRegistry::from_handshake(&handshake).unwrap();
 ```
 
+### Replicating non-`Pod` data — the `Replicable` trait
+
+Every replicated field type must implement `Replicable`:
+
+```rust
+pub trait Replicable: Sized {
+    fn replicate_default() -> Self;
+    fn replicate_encode(&self, buf: &mut Vec<u8>);
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode>;
+}
+```
+
+Any `Pod` type gets this for free via a blanket impl (plain memcpy). `String`, `Vec<T: Replicable>`, `Option<T: Replicable>`, and `[f32; 2/3/4]` are provided out of the box, self-framing so they compose (`Vec<String>`, `Option<Vec<u32>>`, etc. all just work). This is what makes owned/heap data — not just `Pod` scalars — safe to replicate: `replicate_decode` returns a real, safely-constructed `Self`, never a byte-for-byte reinterpretation of network garbage.
+
+> [!CAUTION]
+> **`Box<T>` cannot get a blanket `Replicable` impl — you'll need to write one by hand for your specific boxed type.**
+>
+> You'd expect `impl<T: Replicable> Replicable for Box<T>` to work exactly like the `Vec<T>`/`Option<T>` impls above. It doesn't — it fails to compile *inside this crate*, with:
+>
+> ```
+> error[E0119]: conflicting implementations of trait `Replicable` for type `Box<_>`
+>   = note: downstream crates may implement trait `page::Pod` for type `Box<_>`
+> ```
+>
+> **Why this happens:** `Box<T>`, along with `&T`, `&mut T`, and `Pin<P>`, is marked `#[fundamental]` in the Rust standard library. Fundamental types get special, more permissive treatment under Rust's orphan rule: normally a crate can only `impl ForeignTrait for ForeignType` if it owns *either* the trait or the type, but for a fundamental wrapper, a downstream crate is allowed to `impl ForeignTrait for Box<TheirLocalType>` even though it owns neither `Box` nor the trait — the wrapper is treated as "transparent" for that check.
+>
+> That permissiveness is exactly what breaks a blanket impl here. `Pod` is *our* trait, defined in this crate. Because `Box` is fundamental, some hypothetical downstream crate is allowed to write `unsafe impl Pod for Box<TheirType>`. The compiler can't prove no such impl exists anywhere in the universe of crates that might ever depend on this one — so it conservatively rejects `impl<T: Replicable> Replicable for Box<T>` as potentially overlapping with the existing `impl<T: Pod> Replicable for T` blanket, even though, in reality, nobody has written or ever will write `Pod for Box<_>`. This is a hard limit of the coherence checker, not a bug in SceneDB, and there's no attribute or workaround that suppresses it from our side. (`Pin<P>` has the identical restriction for the identical reason, for what it's worth — it just never comes up in practice, since nobody replicates a `Pin<T>` as network data.)
+>
+> **How to work around it — two options:**
+>
+> **1. Implement `Replicable` for your specific boxed type directly (not a blanket).** A concrete `impl Replicable for Box<YourType>` doesn't hit the fundamental-type rule at all — the conflict only exists for a *generic* `impl<T> ... for Box<T>`:
+>
+> ```rust
+> struct AiPlan { /* ... */ }
+>
+> impl Replicable for Box<AiPlan> {
+>     fn replicate_default() -> Self {
+>         Box::new(AiPlan::replicate_default())
+>     }
+>     fn replicate_encode(&self, buf: &mut Vec<u8>) {
+>         (**self).replicate_encode(buf)
+>     }
+>     fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+>         Ok(Box::new(AiPlan::replicate_decode(bytes)?))
+>     }
+> }
+> ```
+>
+> **2. If you don't actually need `Box`'s unique-ownership semantics, use `Rc<T>` or `Arc<T>` instead.** They are *not* `#[fundamental]`, so nothing stops a generic impl over them — swap `Box` for `Rc`/`Arc` in the snippet above (or in your own field type) and the same pattern applies without ever tripping this restriction. Interior-mutable wrappers (`Cell<T>`, `RefCell<T>`) and `ManuallyDrop<T>` aren't fundamental either, if you need those for other reasons.
+
 ### Change tracking at the frame boundary
 
 Record every mutation during the simulate phase, then drain into a delta at the harvest boundary.

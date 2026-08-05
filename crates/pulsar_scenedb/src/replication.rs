@@ -160,6 +160,24 @@
 //!   - Connection lifecycle, NAT punch, relay
 //! ```
 //!
+//! ## Concurrency model
+//!
+//! `ReplicationRegistry`, `Delta`, `ChangeTracker`, `AuthorityTable`, and
+//! `RelevanceSet` are all `Send + Sync` (asserted at compile time below) —
+//! a `Delta` produced on a simulation thread can be hand off through a
+//! channel to a network thread, and a `ReplicationRegistry` built once at
+//! startup can be shared read-only (`&ReplicationRegistry`) across threads
+//! that each encode/apply their own `Delta`s against their own `World`.
+//!
+//! What this module does **not** provide is safe *concurrent mutation* of
+//! one `ChangeTracker`/`World` from multiple threads — `ChangeTracker`'s
+//! `record_*` methods and `World`'s tracked mutators take `&mut self`, and
+//! there is no internal locking. The intended shape (matching
+//! `crate::gpu::phase`'s own single-threaded-caller design) is: one thread
+//! owns a `World` + `ChangeTracker` pair for the duration of a frame; the
+//! `Delta` that frame produces is the unit that crosses thread/connection
+//! boundaries, not the mutable state itself.
+//!
 //! ## Implementation plan
 //!
 //! ### R1 — Core types and ChangeTracker
@@ -2347,6 +2365,25 @@ const _: () = assert!(
     "SceneDB replication requires a little-endian target"
 );
 
+// ── Assert Send + Sync ───────────────────────────────────────────────────────
+//
+// Compile-time evidence for the "Concurrency model" doc above: if a future
+// change (e.g. swapping `FieldOps`'s `Arc<dyn Fn>` for something with
+// interior mutability, or adding an `Rc`/`RefCell` anywhere in this chain)
+// ever breaks one of these, it fails the BUILD, not a runtime test.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReplicationRegistry>();
+    assert_send_sync::<ReplicationSchema>();
+    assert_send_sync::<FieldDescriptor>();
+    assert_send_sync::<Delta>();
+    assert_send_sync::<ChangeTracker>();
+    assert_send_sync::<AuthorityTable>();
+    assert_send_sync::<RelevanceSet>();
+    assert_send_sync::<Reconciler>();
+    assert_send_sync::<EntityCellMap>();
+};
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3648,6 +3685,51 @@ mod tests {
         let delta2 = witness.run_tracked(&mut world, &mut tracker, |_, _| {});
         assert_eq!(delta2.frame, 1);
         assert!(delta2.spawned.is_empty());
+    }
+
+    // ── Concurrency: the intended hand-off pattern, exercised for real ──
+
+    #[test]
+    fn delta_crosses_a_real_thread_boundary_via_channel() {
+        // Thread A owns a World + ChangeTracker for the frame and produces
+        // a Delta; thread B (a stand-in for a network/send thread) receives
+        // it over a channel and applies it to its OWN, separate World —
+        // exactly the "Delta is the unit that crosses threads, not the
+        // mutable state" shape documented in this module's "Concurrency
+        // model" section.
+        let (tx, rx) = std::sync::mpsc::channel::<Delta>();
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let producer = std::thread::spawn(move || {
+            let mut world = crate::World::new();
+            let mut tracker = ChangeTracker::new();
+            let witness = CpuSimulateWitness::new();
+            let e = world.spawn_tracked(&mut tracker);
+            world.insert(e, 42.0f32);
+            let mut delta = witness.run_tracked(&mut world, &mut tracker, |_, _| {});
+            // `insert`'s in-place-vs-migration split (see `World::insert`'s
+            // doc) means the migration path doesn't capture field bytes by
+            // itself — patch the real value in like a real caller reading
+            // it back, matching every other spawn+insert test in this file.
+            delta.component_deltas.push(ComponentDelta {
+                entity: e,
+                component_type: crate::component::component_id::<f32>(),
+                field_data: vec![42.0f32.to_le_bytes().to_vec()],
+            });
+            tx.send(delta).expect("receiver still alive");
+            e
+        });
+
+        let spawned_entity = producer.join().expect("producer thread panicked");
+        let delta = rx.recv().expect("delta received over the channel");
+
+        let mut consumer_world = crate::World::new();
+        assert_eq!(delta.apply(&mut consumer_world, &reg), Ok(()));
+        assert!(consumer_world.is_alive(spawned_entity));
+        assert_eq!(*consumer_world.get::<f32>(spawned_entity).unwrap(), 42.0f32);
     }
 
     // ── Delta::apply ─────────────────────────────────────────────────

@@ -53,6 +53,10 @@ name = "scenedb_bench"
 harness = false
 
 [[bench]]
+name = "replication_bench"
+harness = false
+
+[[bench]]
 name = "gpu_timing"
 harness = false
 required-features = ["gpu"]

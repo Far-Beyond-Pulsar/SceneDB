@@ -5,8 +5,9 @@
 //!
 //! Run with: `cargo bench -p pulsar_scenedb --bench replication_bench`.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pulsar_scenedb::*;
+use std::hint::black_box;
 
 #[derive(Clone, Copy, Default)]
 struct Position {
