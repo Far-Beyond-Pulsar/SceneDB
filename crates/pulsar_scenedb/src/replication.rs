@@ -801,7 +801,13 @@ impl ReplicationRegistry {
                 bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3],
             ]);
             ofs += 4;
-            let mut fields = Vec::with_capacity(field_count as usize);
+            // See the identical cap in `Delta::from_bytes` — `field_count`
+            // is an attacker-controlled `u32` read straight off the wire;
+            // capping the pre-allocation at the bytes actually remaining
+            // stops a tiny malicious handshake claiming billions of fields
+            // from triggering an oversized allocation before the length
+            // check below ever runs.
+            let mut fields = Vec::with_capacity((field_count as usize).min(bytes.len().saturating_sub(ofs)));
             for _ in 0..field_count {
                 // Each field is exactly 7 bytes on the wire: field_index
                 // (4) + encoding (1) + condition (1) + event_channel (1).
@@ -1186,12 +1192,30 @@ impl Delta {
                 u32::from_le_bytes([s[0], s[1], s[2], s[3]])
             }};
         }
+        // A `count: u32` read straight off the wire is attacker-controlled
+        // and can claim up to ~4 billion elements regardless of how much
+        // data actually follows — pre-allocating `Vec::with_capacity(count)`
+        // directly would let a tiny malicious packet (e.g. a legitimate
+        // header immediately followed by `spawned_count = u32::MAX`) trigger
+        // a multi-gigabyte allocation attempt before a single byte of the
+        // claimed elements is even read. Every element in this format costs
+        // at least 1 byte on the wire, so capping the capacity hint at the
+        // number of bytes actually remaining bounds the allocation to what
+        // the peer actually sent — legitimate large-but-truncated inputs are
+        // unaffected (the loop below still runs `count` times and fails with
+        // `None` the moment `read!` runs out of bytes; this only removes the
+        // upfront over-allocation for a mismatched count).
+        macro_rules! capped {
+            ($count:expr) => {
+                ($count as usize).min(bytes.len().saturating_sub(ofs))
+            };
+        }
 
         let frame = read_u64!();
         let base_frame = read_u64!();
 
         let spawned_count = read_u32!();
-        let mut spawned = Vec::with_capacity(spawned_count as usize);
+        let mut spawned = Vec::with_capacity(capped!(spawned_count));
         for _ in 0..spawned_count {
             let entity_bits = read_u64!();
             let blob_len = read_u32!() as usize;
@@ -1200,18 +1224,18 @@ impl Delta {
         }
 
         let despawned_count = read_u32!();
-        let mut despawned = Vec::with_capacity(despawned_count as usize);
+        let mut despawned = Vec::with_capacity(capped!(despawned_count));
         for _ in 0..despawned_count {
             despawned.push(Entity::from_bits(read_u64!()));
         }
 
         let cd_count = read_u32!();
-        let mut component_deltas = Vec::with_capacity(cd_count as usize);
+        let mut component_deltas = Vec::with_capacity(capped!(cd_count));
         for _ in 0..cd_count {
             let entity = Entity::from_bits(read_u64!());
             let component_type = ComponentId(read_u32!());
             let field_count = read_u32!();
-            let mut field_data = Vec::with_capacity(field_count as usize);
+            let mut field_data = Vec::with_capacity(capped!(field_count));
             for _ in 0..field_count {
                 let field_len = read_u32!() as usize;
                 field_data.push(read!(field_len).to_vec());
@@ -1220,7 +1244,7 @@ impl Delta {
         }
 
         let event_count = read_u32!();
-        let mut events = Vec::with_capacity(event_count as usize);
+        let mut events = Vec::with_capacity(capped!(event_count));
         for _ in 0..event_count {
             let entity = Entity::from_bits(read_u64!());
             let component_type = ComponentId(read_u32!());
@@ -4142,6 +4166,64 @@ mod tests {
             // The untruncated buffer must still decode correctly.
             assert!(Delta::from_bytes(&bytes).is_some());
         }
+    }
+
+    /// Regression test: every `count: u32` field in the wire format is
+    /// attacker-controlled and was, until this check existed, used
+    /// unchecked as a `Vec::with_capacity` hint — a tiny malicious packet
+    /// claiming `spawned_count = u32::MAX` (etc.) could trigger a
+    /// multi-gigabyte allocation attempt before a single element byte was
+    /// even read. Each of these five fields must fail cleanly with `None`
+    /// against a truncated buffer of a fixed few dozen bytes, never
+    /// allocate proportionally to the claimed count.
+    #[test]
+    fn delta_from_bytes_huge_claimed_counts_do_not_over_allocate() {
+        fn header_with_count_at(offset_in_body: usize, count: u32) -> Vec<u8> {
+            // frame(8) + base_frame(8), then the target count field at the
+            // requested position with everything before it zeroed (valid
+            // empty prior sections), and nothing at all after it.
+            let mut bytes = vec![0u8; 16 + offset_in_body];
+            bytes[16 + offset_in_body..16 + offset_in_body + 4].copy_from_slice(&count.to_le_bytes());
+            bytes
+        }
+
+        // spawned_count is the first count field, right after the header.
+        assert!(Delta::from_bytes(&header_with_count_at(0, u32::MAX)).is_none());
+
+        // despawned_count: after an empty spawned section (count=0, 4 bytes).
+        assert!(Delta::from_bytes(&header_with_count_at(4, u32::MAX)).is_none());
+
+        // cd_count: after empty spawned + despawned sections.
+        assert!(Delta::from_bytes(&header_with_count_at(8, u32::MAX)).is_none());
+
+        // event_count: after empty spawned + despawned + component_deltas.
+        assert!(Delta::from_bytes(&header_with_count_at(12, u32::MAX)).is_none());
+    }
+
+    #[test]
+    fn delta_from_bytes_huge_nested_field_count_does_not_over_allocate() {
+        // frame(8) + base_frame(8) + spawned_count(0) + despawned_count(0)
+        // + cd_count(1) + entity(8) + component_type(4) + field_count(u32::MAX),
+        // then nothing — the nested per-component `field_data` capacity hint.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // frame
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // base_frame
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // spawned_count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // despawned_count
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // cd_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // entity
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // component_type
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // field_count
+        assert!(Delta::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn handshake_huge_claimed_field_count_does_not_over_allocate() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // schema_count
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // component_type
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // field_count
+        assert!(ReplicationRegistry::from_handshake(&bytes).is_err());
     }
 
     #[test]
