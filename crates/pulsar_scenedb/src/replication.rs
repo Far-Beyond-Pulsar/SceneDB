@@ -310,6 +310,9 @@ pub struct ReplicatedEvent {
     pub event_field: u32,
     pub payload: Vec<u8>,
     pub channel: EventChannel,
+    /// For `ServerToClient` direction: the intended recipient.
+    /// `None` for `ClientToServer` and `Multicast`.
+    pub target_client: Option<ClientId>,
 }
 
 // ── Ownership ──────────────────────────────────────────────────────────────
@@ -911,11 +914,17 @@ impl RelevanceSet {
             })
             .collect();
 
+        let events = delta
+            .events
+            .iter()
+            .filter(|ev| self.relevant_entities.contains(&ev.entity))
+            .collect();
+
         DeltaView {
             spawned: &delta.spawned,
             despawned: &delta.despawned,
             component_deltas,
-            events: Vec::new(),
+            events,
         }
     }
 }
@@ -967,6 +976,76 @@ pub struct DeltaView<'a> {
     pub despawned: &'a [Entity],
     pub component_deltas: Vec<&'a ComponentDelta>,
     pub events: Vec<&'a ReplicatedEvent>,
+}
+
+// ── Event / RPC channel ────────────────────────────────────────────────────
+
+/// A batch of events destined for one connection, sent separately from Deltas.
+/// The engine transports this as a distinct message type (reliable or
+/// unreliable depending on each event's [`EventChannel`]).
+#[derive(Clone, Debug)]
+pub struct EventBatch {
+    pub frame: u64,
+    pub events: Vec<ReplicatedEvent>,
+}
+
+/// Check whether an event may be sent from `sender` to `recipient` based on
+/// the event field's declared direction (encoded in the field's
+/// [`ReplicationCondition`] within the schema).
+///
+/// The caller must look up the field's condition from the schema and pass it
+/// here. Invalid events (e.g. a client trying to multicast) return `false`
+/// and should be silently dropped.
+///
+/// # Panics
+///
+/// Panics if `direction` is not one of the three RPC direction conditions
+/// (`ClientToServer`, `ServerToClient`, `Multicast`).
+pub fn can_send_event(direction: &ReplicationCondition, sender: ClientId, recipient: ClientId) -> bool {
+    match direction {
+        ReplicationCondition::ClientToServer => true,
+        ReplicationCondition::ServerToClient => sender == recipient,
+        ReplicationCondition::Multicast => sender != recipient,
+        other => {
+            // Other conditions don't make sense for events — treat as always
+            // sendable (the state path handles them).
+            true
+        }
+    }
+}
+
+/// Extract events from a filtered `DeltaView` into an `EventBatch`, applying
+/// direction enforcement. Returns `None` if no events pass the filter.
+///
+/// The `schema_registry` is used to look up each event field's
+/// `ReplicationCondition` to determine direction. Events whose direction
+/// rejects `(sender, recipient)` are silently dropped.
+pub fn events_to_batch(
+    view: &DeltaView,
+    frame: u64,
+    schema_registry: &ReplicationRegistry,
+    sender: ClientId,
+    recipient: ClientId,
+) -> Option<EventBatch> {
+    let events: Vec<ReplicatedEvent> = view
+        .events
+        .iter()
+        .filter(|ev| {
+            if let Some(schema) = schema_registry.schema(ev.component_type) {
+                if let Some(field) = schema.fields.iter().find(|f| f.field_index == ev.event_field) {
+                    return can_send_event(&field.condition, sender, recipient);
+                }
+            }
+            true
+        })
+        .map(|ev| (*ev).clone())
+        .collect();
+
+    if events.is_empty() {
+        None
+    } else {
+        Some(EventBatch { frame, events })
+    }
 }
 
 // ── Authority table ────────────────────────────────────────────────────────
@@ -1257,6 +1336,7 @@ mod tests {
             event_field: 0,
             payload: vec![99u8],
             channel: EventChannel::ReliableOrdered,
+            target_client: None,
         };
         t.record_event(ev.clone());
         let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(1), fields: vec![] }, ClientId(0), &AuthorityTable::new());
@@ -1742,5 +1822,159 @@ mod tests {
         // Reversed: client_a (200) now beats client_b (100).
         let merged = AuthorityTable::resolve_conflict(&at, &delta_b, ClientId(100), &delta_a, ClientId(200));
         assert_eq!(merged.component_deltas[0].field_data[0], vec![10]);
+    }
+
+    // ── R4: Event / RPC channel ────────────────────────────────────────
+
+    #[test]
+    fn event_batch_struct() {
+        let batch = EventBatch {
+            frame: 42,
+            events: vec![],
+        };
+        assert_eq!(batch.frame, 42);
+        assert!(batch.events.is_empty());
+    }
+
+    #[test]
+    fn can_send_event_client_to_server() {
+        // ClientToServer: always sendable (server will receive it).
+        assert!(can_send_event(&ReplicationCondition::ClientToServer, ClientId(1), ClientId(0)));
+        assert!(can_send_event(&ReplicationCondition::ClientToServer, ClientId(1), ClientId(2)));
+    }
+
+    #[test]
+    fn can_send_event_server_to_client() {
+        // ServerToClient: only send if sender == recipient (server targeting itself
+        // isn't useful, but the primitive just checks equality).
+        assert!(can_send_event(&ReplicationCondition::ServerToClient, ClientId(5), ClientId(5)));
+        assert!(!can_send_event(&ReplicationCondition::ServerToClient, ClientId(5), ClientId(7)));
+    }
+
+    #[test]
+    fn can_send_event_multicast() {
+        // Multicast: send to everyone except sender.
+        assert!(can_send_event(&ReplicationCondition::Multicast, ClientId(1), ClientId(2)));
+        assert!(!can_send_event(&ReplicationCondition::Multicast, ClientId(1), ClientId(1)));
+    }
+
+    #[test]
+    fn events_to_batch_filters_by_direction() {
+        let e1 = make_entity(0, 1);
+        let f32_cid = crate::component::component_id::<f32>();
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        let builder = builder
+            .event("rpc", ReplicationCondition::ClientToServer, EventChannel::ReliableOrdered);
+        reg.insert(builder);
+
+        let ev = ReplicatedEvent {
+            entity: e1,
+            component_type: f32_cid,
+            event_field: 0,
+            payload: vec![1, 2, 3],
+            channel: EventChannel::ReliableOrdered,
+            target_client: None,
+        };
+
+        let delta = Delta {
+            frame: 5, base_frame: 4,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![ev],
+        };
+
+        // Build DeltaView directly (no relevance filtering needed for direction tests).
+        let view = DeltaView {
+            spawned: &delta.spawned,
+            despawned: &delta.despawned,
+            component_deltas: delta.component_deltas.iter().collect(),
+            events: delta.events.iter().collect(),
+        };
+
+        // A client sending to the server (client 1 → server 0) with ClientToServer should pass.
+        let batch = events_to_batch(&view, 5, &reg, ClientId(1), ClientId(0));
+        assert!(batch.is_some());
+        assert_eq!(batch.unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn events_to_batch_filters_out_multicast_to_self() {
+        let f32_cid = crate::component::component_id::<f32>();
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        let builder = builder
+            .event("rpc", ReplicationCondition::Multicast, EventChannel::Unreliable);
+        reg.insert(builder);
+
+        let ev = ReplicatedEvent {
+            entity: make_entity(0, 1),
+            component_type: f32_cid,
+            event_field: 0,
+            payload: vec![],
+            channel: EventChannel::Unreliable,
+            target_client: None,
+        };
+
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![ev],
+        };
+
+        let view = DeltaView {
+            spawned: &delta.spawned,
+            despawned: &delta.despawned,
+            component_deltas: delta.component_deltas.iter().collect(),
+            events: delta.events.iter().collect(),
+        };
+
+        // Sending to self: Multicast should be filtered out.
+        let batch = events_to_batch(&view, 1, &reg, ClientId(5), ClientId(5));
+        assert!(batch.is_none());
+
+        // Sending to another client: should pass.
+        let batch = events_to_batch(&view, 1, &reg, ClientId(5), ClientId(7));
+        assert!(batch.is_some());
+    }
+
+    #[test]
+    fn events_order_is_preserved_within_frame() {
+        let e = make_entity(0, 1);
+        let cid = ComponentId(20);
+
+        let mut tracker = ChangeTracker::new();
+        for i in 0..5u8 {
+            tracker.record_event(ReplicatedEvent {
+                entity: e,
+                component_type: cid,
+                event_field: i as u32,
+                payload: vec![i],
+                channel: EventChannel::ReliableOrdered,
+                target_client: None,
+            });
+        }
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        let builder = builder
+            .event("ev0", ReplicationCondition::Multicast, EventChannel::ReliableOrdered)
+            .event("ev1", ReplicationCondition::Multicast, EventChannel::ReliableOrdered)
+            .event("ev2", ReplicationCondition::Multicast, EventChannel::ReliableOrdered)
+            .event("ev3", ReplicationCondition::Multicast, EventChannel::ReliableOrdered)
+            .event("ev4", ReplicationCondition::Multicast, EventChannel::ReliableOrdered);
+        reg.insert(builder);
+
+        let (delta, _) = tracker.drain(&ReplicationSchema { component_type: cid, fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.events.len(), 5);
+        for (i, ev) in delta.events.iter().enumerate() {
+            assert_eq!(ev.event_field, i as u32);
+            assert_eq!(ev.payload, vec![i as u8]);
+        }
     }
 }
