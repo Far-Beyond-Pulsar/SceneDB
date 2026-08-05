@@ -162,15 +162,13 @@ grid.unpin(CellCoord { x: 5, z: 3 });
 
 SceneDB provides a suite of derive macros that generate Pod implementations, GPU column dispatch, and replication schema declarations — turning plain structs into fully wired engine components with zero boilerplate.
 
-### `#[derive(SceneStore)]` — Pod + GPU dispatch
+### `#[derive(SceneStore)]` — Pod + GPU dispatch + storage location
 
-The workhorse macro. Generates `Pod` impl, column descriptors (`ColumnDesc`), GPU column write dispatch (`GpuColumnSet`), and mirror-mode wiring for `SceneGpuStore`. Just mark any `repr(C)` struct:
+The workhorse macro defined in `pulsar_scenedb_derive`. Generates `Pod` impl, `SceneColumnSet` (column layout), `GpuColumnSet` (GPU write dispatch), and `MirrorMode` wiring. Apply to any `repr(C)` struct:
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
 
-/// A simple component with three scalar fields.
-/// SceneStore generates: Pod impl, column layout, GPU write dispatch.
 #[derive(SceneStore)]
 #[repr(C)]
 pub struct Transform {
@@ -180,22 +178,126 @@ pub struct Transform {
 }
 ```
 
-For types that need explicit control over GPU mirroring:
+This expands to:
+
+- `unsafe impl Pod for Transform` — enables direct column memcpy
+- `impl SceneColumnSet for Transform` — column descriptors for `CellType`
+- `impl GpuColumnSet for Transform` — GPU column descriptors + `write_gpu` dispatch
+
+#### Per-field storage location with `#[gpu(mirror = ...)]`
+
+Every field lives in CPU SoA columns by default. Adding `#[gpu]` creates an additional GPU-side mirror (SSBO column in `SceneGpuStore`). The `#[derive(SceneStore)]` macro only looks for `#[gpu]` attributes — any other attribute (`#[replicate]`, `#[serde]`, etc.) passes through unmodified.
+
+| Attribute | CPU column | GPU mirror | Sync mode | Use case |
+|---|---|---|---|---|
+| *(none)* | Yes | No | — | Bounds, metadata, editor-only data |
+| `#[gpu]` | Yes | Yes | `DirtyTracked` | Per-frame transforms, instance data |
+| `#[gpu(mirror = DirtyTracked)]` | Yes | Yes | Per-frame dirty tracking | Explicit form of bare `#[gpu]` |
+| `#[gpu(mirror = Once)]` | Yes | Yes | Upload once, never re-sync | Static geometry, constant buffers |
+
+The actual parser accepts the form `#[gpu(mirror = DirtyTracked)]` and `#[gpu(mirror = Once)]`. Bare `#[gpu]` defaults to `DirtyTracked`. The underlying `MirrorMode` enum (`pulsar_scenedb::gpu::MirrorMode`) has two variants — `DirtyTracked` and `Once`.
+
+Fields **without** `#[gpu]` stay CPU-only — they consume no VRAM, generate no dirty words in `SceneGpuStore`, and never participate in delta-sync. They DO participate in replication (via `#[replicate]`), spatial queries, and everything else on the CPU side.
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
 
-/// A material override component. Only the color field is mirrored to GPU;
-/// the name stays CPU-only.
+/// A material component with mixed storage locations:
+///   - color, roughness, metallic → CPU + GPU (dirty-tracked mirror)
+///   - name → CPU only (no GPU mirror, no VRAM cost)
 #[derive(SceneStore)]
 #[repr(C)]
 pub struct Material {
+    #[gpu]                              // CPU + GPU, DirtyTracked
     pub albedo: [f32; 4],
+
+    #[gpu(mirror = DirtyTracked)]        // CPU + GPU, explicit
     pub roughness: f32,
+
+    #[gpu]                              // CPU + GPU, DirtyTracked
     pub metallic: f32,
-    pub name: [u8; 64],      // CPU-only; no GPU mirror generated
+
+    // No #[gpu] — CPU only. No VRAM, no dirty tracking.
+    pub name: [u8; 64],
 }
 ```
+
+#### GPU-native fields with `#[gpu(mirror = Once)]`
+
+For data that never changes after initial upload:
+
+```rust
+#[derive(SceneStore)]
+#[repr(C)]
+pub struct StaticMeshInstance {
+    #[gpu(mirror = Once)]    // uploaded once, never re-synced
+    pub mesh_id: u32,
+
+    #[gpu(mirror = Once)]    // uploaded once, never re-synced
+    pub material_id: u32,
+
+    #[gpu]                   // per-frame dirty tracked
+    pub transform: [f32; 16],
+}
+```
+
+#### Fully CPU-only component
+
+Omit `#[gpu]` entirely:
+
+```rust
+/// No VRAM usage, no delta-sync. Still replicated via #[replicate].
+#[derive(SceneStore)]
+#[repr(C)]
+pub struct AiState {
+    pub current_behaviour: u32,
+    pub target_entity: u64,
+    pub alertness: f32,
+    pub path_length: u32,
+}
+```
+
+### Combining `#[gpu]` and `#[replicate]` on the same field
+
+`#[derive(SceneStore)]` only processes `#[gpu(...)]` attributes. `#[replicate(...)]` is a separate attribute that would be processed by a different derive macro or consumed manually. They coexist on the same field because each derive only looks at its own attributes:
+
+```rust
+use pulsar_scenedb_derive::SceneStore;
+use pulsar_scenedb::ReplicationEncoding::*;
+use pulsar_scenedb::ReplicationCondition::*;
+
+/// A mesh instance that is both GPU-native AND replicated over the network.
+/// SceneStore generates Pod + GPU dispatch for the #[gpu] fields.
+/// The #[replicate] attributes control network encoding.
+#[derive(SceneStore)]
+#[repr(C)]
+pub struct MeshInstance {
+    /// GPU-mirrored (dirty-tracked every frame) AND network-replicated as a
+    /// GPU handle (only the 8-byte handle index travels, not the vertex data).
+    #[gpu]
+    #[replicate(encoding = GpuHandle, condition = Always)]
+    pub mesh: Handle<Mesh>,
+
+    /// GPU-mirrored (uploaded once) AND network-replicated only at spawn.
+    #[gpu(mirror = Once)]
+    #[replicate(encoding = Pod, condition = InitialOnly)]
+    pub base_transform: [f32; 16],
+
+    /// CPU only (no GPU mirror) AND replicated to simulated proxies.
+    #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
+    pub health: f32,
+}
+```
+
+The `#[gpu]` and `#[replicate]` attributes are orthogonal:
+
+| Storage (via `#[gpu]`) | Replication (via `#[replicate]`) | Result |
+|---|---|---|
+| *(none)* | *(none)* | CPU-only, never replicated |
+| *(none)* | `GpuHandle` | CPU-only on server, handle sent over wire, remote resolves locally |
+| `#[gpu]` | *(none)* | GPU mirror, never replicated |
+| `#[gpu]` | `Always` | GPU mirror + network-replicated every frame |
+| `#[gpu(mirror = Once)]` | `InitialOnly` | GPU mirror (once) + network-replicated once at spawn |
 
 ### `#[replicate(...)]` — Replication schema on fields
 
