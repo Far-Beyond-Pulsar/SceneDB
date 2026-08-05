@@ -156,17 +156,201 @@ grid.unpin(CellCoord { x: 5, z: 3 });
 // Back to concentric rules.
 ```
 
-### Derive macro
+---
+
+## Macro system
+
+SceneDB provides a suite of derive macros that generate Pod implementations, GPU column dispatch, and replication schema declarations — turning plain structs into fully wired engine components with zero boilerplate.
+
+### `#[derive(SceneStore)]` — Pod + GPU dispatch
+
+The workhorse macro. Generates `Pod` impl, column descriptors (`ColumnDesc`), GPU column write dispatch (`GpuColumnSet`), and mirror-mode wiring for `SceneGpuStore`. Just mark any `repr(C)` struct:
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
 
+/// A simple component with three scalar fields.
+/// SceneStore generates: Pod impl, column layout, GPU write dispatch.
 #[derive(SceneStore)]
-pub struct MyComponent {
-    health: f32,
-    position: [f32; 3],
+#[repr(C)]
+pub struct Transform {
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
 }
-// Generates Pod impl, column descriptors, and write dispatch for GPU sync.
+```
+
+For types that need explicit control over GPU mirroring:
+
+```rust
+use pulsar_scenedb_derive::SceneStore;
+
+/// A material override component. Only the color field is mirrored to GPU;
+/// the name stays CPU-only.
+#[derive(SceneStore)]
+#[repr(C)]
+pub struct Material {
+    pub albedo: [f32; 4],
+    pub roughness: f32,
+    pub metallic: f32,
+    pub name: [u8; 64],      // CPU-only; no GPU mirror generated
+}
+```
+
+### `#[replicate(...)]` — Replication schema on fields
+
+Field-level attribute macros that declare replication behaviour. Each field gets an encoding mode and a replication condition. These are consumed by `ReplicationRegistry` to build the per-component-type schema that drives delta encoding and interest management.
+
+```rust
+use pulsar_scenedb::ReplicationEncoding::{self, *};
+use pulsar_scenedb::ReplicationCondition::{self, *};
+
+/// A player state component with per-field replication control.
+struct PlayerState {
+    /// Full transform: replicated every frame to everyone as raw Pod bytes.
+    #[replicate(encoding = Pod, condition = Always)]
+    position: [f32; 3],
+
+    /// Health: only sent to non-owning simulated proxies, delta-compressed.
+    #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
+    health: f32,
+
+    /// Ammo: only relevant to the owning client.
+    #[replicate(encoding = Pod, condition = AutonomousOnly)]
+    ammo: u32,
+
+    /// Inventory: sent once at spawn, never again.
+    #[replicate(encoding = Serialized, condition = InitialOnly)]
+    inventory: Vec<Item>,
+
+    /// GPU resource handle: only the 8-byte index travels, not the mesh data.
+    #[replicate(encoding = GpuHandle, condition = Always)]
+    mesh: Handle<Mesh>,
+
+    /// One-shot event: never in state deltas, delivered via RPC channel.
+    #[replicate(encoding = Event, condition = Multicast)]
+    on_damage_taken: DamageEvent,
+}
+```
+
+### Combined: full component definition
+
+A component can use both `SceneStore` and `replicate` together — the macros compose:
+
+```rust
+use pulsar_scenedb_derive::SceneStore;
+use pulsar_scenedb::ReplicationEncoding::*;
+use pulsar_scenedb::ReplicationCondition::*;
+
+/// A fully wired engine component: SceneStore generates Pod + GPU dispatch,
+/// replicate generates the replication schema for the delta encoder.
+#[derive(SceneStore)]
+#[repr(C)]
+struct Character {
+    /// Server-authoritative position, plain memcpy on the wire.
+    #[replicate(encoding = Pod, condition = ServerAuthority)]
+    position: [f32; 3],
+
+    /// Owned by the client that controls this character.
+    /// The server validates bounds and re-broadcasts.
+    #[replicate(encoding = Pod, condition = ClientAuthority)]
+    look_direction: [f32; 2],
+
+    /// Only sent to simulated (non-owning) clients.
+    #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
+    health: f32,
+
+    /// Always relevant, GPU handle only.
+    #[replicate(encoding = GpuHandle, condition = Always)]
+    skinned_mesh: Handle<SkinnedMesh>,
+
+    /// One-shot RPC: play an animation on all clients.
+    #[replicate(encoding = Event, condition = Multicast)]
+    on_play_animation: AnimationEvent,
+}
+```
+
+### How it works
+
+At compile time, `#[derive(SceneStore)]` expands to:
+
+- `unsafe impl Pod for Character` — enables direct memcpy of column data
+- `impl GpuColumnSet for Character` — column descriptors and GPU write dispatch
+- `const COLUMN_DESCS: &[ColumnDesc]` — column layout for `CellStorage::new`
+- `fn write_gpu_columns(&self, store: &SceneGpuStore, handle: Handle, witness: &SimulateWitness)` — per-field GPU mirror writes
+
+The `#[replicate(...)]` attributes are read by a companion derive (`#[derive(Replicate)]` planned) or consumed manually via `SchemaBuilder`:
+
+```rust
+// Manual equivalent of what the macro generates:
+registry.register::<Character>()
+    .field("position",       Pod,              ServerAuthority)
+    .field("look_direction", Pod,              ClientAuthority)
+    .field("health",         DeltaCompressed,  SimulatedOnly)
+    .field("skinned_mesh",   GpuHandle,        Always)
+    .event("on_play_animation", Multicast,     EventChannel::ReliableOrdered);
+```
+
+### Pattern library
+
+Here are the common replication patterns expressed as component definitions:
+
+**Server-authoritative projectile:**
+
+```rust
+#[derive(SceneStore)]
+#[repr(C)]
+struct Projectile {
+    #[replicate(encoding = Pod, condition = Always)]
+    position: [f32; 3],
+    #[replicate(encoding = Pod, condition = Always)]
+    velocity: [f32; 3],
+    #[replicate(encoding = Event, condition = Multicast)]
+    on_impact: ImpactEvent,
+}
+```
+
+**Client-authoritative player input:**
+
+```rust
+#[derive(SceneStore)]
+#[repr(C)]
+struct PlayerInput {
+    #[replicate(encoding = DeltaCompressed, condition = ClientAuthority)]
+    move_direction: [f32; 2],
+    #[replicate(encoding = Event, condition = ClientToServer)]
+    on_jump: JumpEvent,
+}
+```
+
+**Editor-only metadata (multi-user):**
+
+```rust
+#[derive(SceneStore)]
+#[repr(C)]
+struct EditorMetadata {
+    #[replicate(encoding = Pod, condition = Shared)]
+    selected: u32,
+    #[replicate(encoding = Serialized, condition = Shared)]
+    custom_properties: Vec<Property>,
+}
+```
+
+**Visibility-gated game state:**
+
+```rust
+#[derive(SceneStore)]
+#[repr(C)]
+struct FactionVisibility {
+    #[replicate(encoding = Pod, condition = Always)]
+    world_position: [f32; 3],
+    #[replicate(encoding = Pod, condition = OwnerOnly)]
+    minimap_blips: u32,
+    #[replicate(encoding = Pod, condition = SkipOwner)]
+    fog_of_war_reveal: [f32; 3],
+    #[replicate(encoding = GpuHandle, condition = SimulatedOnly)]
+    proxy_mesh: Handle<ProxyMesh>,
+}
 ```
 
 ---
