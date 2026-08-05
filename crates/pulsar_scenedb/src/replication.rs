@@ -41,7 +41,7 @@
 //! | `Pod` | `sizeof(T)` bytes, direct memcpy | Simple value types — transforms, stats, enums. Default for anything implementing `Pod`. Schema negotiated once at handshake. |
 //! | `Serialized` | Variable | Reflection-based via `EngineClass`. For blueprint/visual-scripting components. |
 //! | `GpuHandle` | `sizeof(Handle)` = 8 B | Mesh references, texture handles, buffer bindings. Only the registry index travels; the GPU resource is loaded independently by the asset system. |
-//! | `DeltaCompressed` | Small, variable | Slowly-changing values (health, cooldown, ammo). XOR-diff from the last acknowledged value, then LEB128 or run-length encoded. |
+//! | `DeltaCompressed` | Small, variable | Slowly-changing values (health, cooldown, ammo). XOR-diff from the last acknowledged value, then LEB128 encoded — the stateful [`DeltaCompressor`] implements this; the standalone [`encode_field_value`]/[`decode_field_value`] helpers only do the stateless LEB128-of-the-absolute-value half (no cache to diff against). |
 //! | `Event` | 0 in state deltas | One-shot RPC-style delivery. Never appears in frame snapshots or reconciliation state. Delivered on a separate channel. |
 //! | `Opaque` | Custom | Escape hatch. The component provides `encode`/`decode` fn pointers at registration time. |
 //!
@@ -267,7 +267,10 @@ pub enum ReplicationEncoding {
     Serialized,
     /// Only the registry handle/index (8 bytes). Asset payload is out-of-band.
     GpuHandle,
-    /// XOR-diff from last acknowledged value, LEB128/RLE compressed.
+    /// XOR-diff from last acknowledged value, LEB128 compressed — the
+    /// diffing itself needs a per-connection cache (see [`DeltaCompressor`]);
+    /// [`encode_field_value`]/[`decode_field_value`]'s handling of this
+    /// variant is a stateless fallback (absolute value only, no diffing).
     DeltaCompressed,
     /// One-shot RPC. Never included in state deltas.
     Event,
@@ -2526,6 +2529,7 @@ const _: fn() = || {
     assert_send_sync::<RelevanceSet>();
     assert_send_sync::<Reconciler>();
     assert_send_sync::<EntityCellMap>();
+    assert_send_sync::<DeltaCompressor>();
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -2982,6 +2986,121 @@ mod tests {
         let mut decoded = vec![0u8; 8];
         assert_eq!(decode_field_value(&ReplicationEncoding::DeltaCompressed, &buf, &mut decoded), ErrorCode::Ok);
         assert_eq!(original, decoded);
+    }
+
+    // ── DeltaCompressor: real stateful XOR-diff-from-last-acked-value ──
+
+    #[test]
+    fn delta_compressor_first_encode_matches_stateless_absolute_encoding() {
+        // With no prior value cached, diffing against the implicit all-zero
+        // baseline is the identity — first-ever encode for a slot must
+        // produce exactly what the stateless path produces for the
+        // absolute value.
+        let key = (make_entity(0, 1), ComponentId(1), 0u32);
+        let value = 500u32.to_le_bytes().to_vec();
+
+        let mut compressor = DeltaCompressor::new();
+        let mut stateful_buf = Vec::new();
+        compressor.encode(key, &value, &mut stateful_buf);
+
+        let mut stateless_buf = Vec::new();
+        encode_field_value(&ReplicationEncoding::DeltaCompressed, &value, &mut stateless_buf);
+
+        assert_eq!(stateful_buf, stateless_buf);
+    }
+
+    #[test]
+    fn delta_compressor_repeated_value_compresses_to_one_byte() {
+        // A value that hasn't changed since last time XORs to all zero,
+        // regardless of magnitude — LEB128 of 0 is always exactly one byte.
+        // This is the entire point of the encoding mode: a large, unchanging
+        // health/ammo/cooldown value costs 1 byte per frame, not 4-8.
+        let key = (make_entity(0, 1), ComponentId(1), 0u32);
+        let value = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+
+        let mut compressor = DeltaCompressor::new();
+        let mut first = Vec::new();
+        compressor.encode(key, &value, &mut first);
+        assert!(first.len() > 1, "first encode (diff from zero) is the full value, not compressed");
+
+        let mut second = Vec::new();
+        compressor.encode(key, &value, &mut second);
+        assert_eq!(second, vec![0u8], "unchanged value must compress to exactly one zero byte");
+    }
+
+    #[test]
+    fn delta_compressor_round_trips_a_sequence_across_independent_instances() {
+        // Sender and receiver each keep their OWN cache; as long as both
+        // process the same sequence of values in the same order, decode
+        // must reconstruct exactly what encode was given at each step.
+        let key = (make_entity(3, 2), ComponentId(9), 1u32);
+        let sequence: [u32; 5] = [100, 100, 95, 95, 200];
+
+        let mut sender = DeltaCompressor::new();
+        let mut receiver = DeltaCompressor::new();
+
+        for &value in &sequence {
+            let value_bytes = value.to_le_bytes();
+            let mut buf = Vec::new();
+            sender.encode(key, &value_bytes, &mut buf);
+
+            let mut decoded = [0u8; 4];
+            assert_eq!(receiver.decode(key, &buf, &mut decoded), ErrorCode::Ok);
+            assert_eq!(u32::from_le_bytes(decoded), value);
+        }
+    }
+
+    #[test]
+    fn delta_compressor_acknowledge_sets_the_diff_baseline() {
+        let key = (make_entity(0, 1), ComponentId(1), 0u32);
+        let value = 42u32.to_le_bytes().to_vec();
+
+        let mut compressor = DeltaCompressor::new();
+        compressor.acknowledge(key, &value);
+
+        // Encoding the SAME value right after acknowledging it must diff to
+        // zero, exactly as if `encode` itself had just been called with it.
+        let mut buf = Vec::new();
+        compressor.encode(key, &value, &mut buf);
+        assert_eq!(buf, vec![0u8]);
+    }
+
+    #[test]
+    fn delta_compressor_forget_resets_to_zero_baseline() {
+        let key = (make_entity(0, 1), ComponentId(1), 0u32);
+        let value = 42u32.to_le_bytes().to_vec();
+
+        let mut compressor = DeltaCompressor::new();
+        let mut first = Vec::new();
+        compressor.encode(key, &value, &mut first);
+
+        compressor.forget(key);
+
+        // After forgetting, encoding the SAME value again must reproduce
+        // the first-ever (diff-from-zero) encoding, not the one-byte
+        // "unchanged" encoding a still-cached value would produce.
+        let mut after_forget = Vec::new();
+        compressor.encode(key, &value, &mut after_forget);
+        assert_eq!(first, after_forget);
+    }
+
+    #[test]
+    fn delta_compressor_different_keys_do_not_share_a_cache() {
+        let key_a = (make_entity(0, 1), ComponentId(1), 0u32);
+        let key_b = (make_entity(1, 1), ComponentId(1), 0u32);
+        let value = 7u32.to_le_bytes().to_vec();
+
+        let mut compressor = DeltaCompressor::new();
+        compressor.acknowledge(key_a, &value);
+
+        // key_b has never been seen — encoding the same value there must
+        // still be a first-time (diff-from-zero) encode, unaffected by
+        // key_a's cached state.
+        let mut buf_b = Vec::new();
+        compressor.encode(key_b, &value, &mut buf_b);
+        let mut stateless_buf = Vec::new();
+        encode_field_value(&ReplicationEncoding::DeltaCompressed, &value, &mut stateless_buf);
+        assert_eq!(buf_b, stateless_buf);
     }
 
     #[test]
