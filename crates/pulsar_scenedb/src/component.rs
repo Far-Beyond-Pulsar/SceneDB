@@ -162,6 +162,9 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
     unsafe fn get_raw_mut(&mut self, row: usize) -> *mut ();
 
     fn new_empty(&self) -> Box<dyn ErasedColumn>;
+
+    /// Size in bytes of a single element in this column.
+    fn element_size(&self) -> usize;
 }
 
 pub(crate) struct Column<T: Component> {
@@ -232,5 +235,9 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     fn new_empty(&self) -> Box<dyn ErasedColumn> {
         Box::new(Column::<T>::new())
+    }
+
+    fn element_size(&self) -> usize {
+        std::mem::size_of::<T>()
     }
 }

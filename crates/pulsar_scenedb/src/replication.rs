@@ -543,6 +543,10 @@ fn u8_from_encoding(v: u8) -> Result<ReplicationEncoding, ErrorCode> {
         2 => Ok(ReplicationEncoding::GpuHandle),
         3 => Ok(ReplicationEncoding::DeltaCompressed),
         4 => Ok(ReplicationEncoding::Event),
+        // Opaque fn pointers cannot be serialized over the wire.
+        // The handshake only communicates *that* a field is Opaque;
+        // the actual encode/decode closures must be configured locally
+        // on each peer via the schema registration API.
         5 => Ok(ReplicationEncoding::Opaque {
             encode_size: |_| 0,
             encode: |_, _| ErrorCode::InvalidData,
@@ -702,6 +706,155 @@ pub struct Delta {
     pub despawned: Vec<Entity>,
     pub component_deltas: Vec<ComponentDelta>,
     pub events: Vec<ReplicatedEvent>,
+}
+
+impl Delta {
+    /// Serialize this Delta into a byte buffer for network transport.
+    ///
+    /// Wire format (all values little-endian):
+    ///
+    /// `frame: u64`, `base_frame: u64`
+    /// `spawned_count: u32`
+    ///   for each: `entity: u64`, `blob_len: u32`, `blob[blob_len]: u8`
+    /// `despawned_count: u32`
+    ///   for each: `entity: u64`
+    /// `cd_count: u32`
+    ///   for each: `entity: u64`, `component_type: u32`, `field_count: u32`
+    ///     for each field: `field_len: u32`, `field_data[field_len]: u8`
+    /// `event_count: u32`
+    ///   for each: `entity: u64`, `component_type: u32`, `event_field: u32`,
+    ///   `payload_len: u32`, `payload[payload_len]: u8`, `channel: u8`,
+    ///   `has_target: u8`, `target_client: u64` (only if has_target != 0)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.frame.to_le_bytes());
+        buf.extend_from_slice(&self.base_frame.to_le_bytes());
+
+        buf.extend_from_slice(&(self.spawned.len() as u32).to_le_bytes());
+        for (entity, blob) in &self.spawned {
+            buf.extend_from_slice(&entity.bits().to_le_bytes());
+            buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            buf.extend_from_slice(blob);
+        }
+
+        buf.extend_from_slice(&(self.despawned.len() as u32).to_le_bytes());
+        for entity in &self.despawned {
+            buf.extend_from_slice(&entity.bits().to_le_bytes());
+        }
+
+        buf.extend_from_slice(&(self.component_deltas.len() as u32).to_le_bytes());
+        for cd in &self.component_deltas {
+            buf.extend_from_slice(&cd.entity.bits().to_le_bytes());
+            buf.extend_from_slice(&cd.component_type.0.to_le_bytes());
+            buf.extend_from_slice(&(cd.field_data.len() as u32).to_le_bytes());
+            for field in &cd.field_data {
+                buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                buf.extend_from_slice(field);
+            }
+        }
+
+        buf.extend_from_slice(&(self.events.len() as u32).to_le_bytes());
+        for ev in &self.events {
+            buf.extend_from_slice(&ev.entity.bits().to_le_bytes());
+            buf.extend_from_slice(&ev.component_type.0.to_le_bytes());
+            buf.extend_from_slice(&ev.event_field.to_le_bytes());
+            buf.extend_from_slice(&(ev.payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&ev.payload);
+            buf.push(match ev.channel {
+                EventChannel::ReliableOrdered => 0,
+                EventChannel::Unreliable => 1,
+            });
+            match ev.target_client {
+                Some(id) => {
+                    buf.push(1u8);
+                    buf.extend_from_slice(&id.0.to_le_bytes());
+                }
+                None => buf.push(0u8),
+            }
+        }
+        buf
+    }
+
+    /// Deserialize a Delta from bytes produced by [`to_bytes`](Self::to_bytes).
+    /// Returns `None` if the input is truncated or malformed.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut ofs = 0;
+        macro_rules! read {
+            ($n:expr) => {{
+                if ofs + $n > bytes.len() { return None; }
+                let slice = &bytes[ofs..ofs + $n];
+                ofs += $n;
+                slice
+            }};
+        }
+        macro_rules! read_u64 {
+            () => {{
+                let s = read!(8);
+                u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+            }};
+        }
+        macro_rules! read_u32 {
+            () => {{
+                let s = read!(4);
+                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+            }};
+        }
+
+        let frame = read_u64!();
+        let base_frame = read_u64!();
+
+        let spawned_count = read_u32!();
+        let mut spawned = Vec::with_capacity(spawned_count as usize);
+        for _ in 0..spawned_count {
+            let entity_bits = read_u64!();
+            let blob_len = read_u32!() as usize;
+            let blob = read!(blob_len).to_vec();
+            spawned.push((Entity::from_bits(entity_bits), blob));
+        }
+
+        let despawned_count = read_u32!();
+        let mut despawned = Vec::with_capacity(despawned_count as usize);
+        for _ in 0..despawned_count {
+            despawned.push(Entity::from_bits(read_u64!()));
+        }
+
+        let cd_count = read_u32!();
+        let mut component_deltas = Vec::with_capacity(cd_count as usize);
+        for _ in 0..cd_count {
+            let entity = Entity::from_bits(read_u64!());
+            let component_type = ComponentId(read_u32!());
+            let field_count = read_u32!();
+            let mut field_data = Vec::with_capacity(field_count as usize);
+            for _ in 0..field_count {
+                let field_len = read_u32!() as usize;
+                field_data.push(read!(field_len).to_vec());
+            }
+            component_deltas.push(ComponentDelta { entity, component_type, field_data });
+        }
+
+        let event_count = read_u32!();
+        let mut events = Vec::with_capacity(event_count as usize);
+        for _ in 0..event_count {
+            let entity = Entity::from_bits(read_u64!());
+            let component_type = ComponentId(read_u32!());
+            let event_field = read_u32!();
+            let payload_len = read_u32!() as usize;
+            let payload = read!(payload_len).to_vec();
+            let channel = match read!(1)[0] {
+                0 => EventChannel::ReliableOrdered,
+                _ => EventChannel::Unreliable,
+            };
+            let has_target = read!(1)[0];
+            let target_client = if has_target != 0 {
+                Some(ClientId(read_u64!()))
+            } else {
+                None
+            };
+            events.push(ReplicatedEvent { entity, component_type, event_field, payload, channel, target_client });
+        }
+
+        Some(Delta { frame, base_frame, spawned, despawned, component_deltas, events })
+    }
 }
 
 /// Sparse component data for one entity within a Delta.
@@ -1239,10 +1392,9 @@ impl Snapshot {
                             if let Some(col) = arch.get_erased(cid) {
                                 if row < col.len() {
                                     let ptr = unsafe { col.get_raw(row) };
+                                    let elem_size = col.element_size();
                                     let len = match &field.encoding {
-                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => {
-                                            get_pod_size(cid).unwrap_or(0)
-                                        }
+                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => elem_size,
                                         _ => 0,
                                     };
                                     let bytes = if len > 0 {
@@ -1292,10 +1444,9 @@ impl Snapshot {
                             if let Some(col) = arch.get_erased(cid) {
                                 if row < col.len() {
                                     let ptr = unsafe { col.get_raw(row) };
+                                    let elem_size = col.element_size();
                                     let len = match &field.encoding {
-                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => {
-                                            get_pod_size(cid).unwrap_or(0)
-                                        }
+                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => elem_size,
                                         _ => 0,
                                     };
                                     let bytes = if len > 0 {
@@ -1429,16 +1580,6 @@ impl Default for Reconciler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-fn get_pod_size(cid: ComponentId) -> Option<usize> {
-    // This is a best-effort heuristic for capture: we try to determine the
-    // size of a Pod component from the reflection registry. For now, return
-    // None which forces callers to handle the generic case.
-    let _ = cid;
-    None
 }
 
 // ── Assert endianness ──────────────────────────────────────────────────────
@@ -2324,5 +2465,88 @@ mod tests {
         // Frames 2 and 3 should be replayed.
         assert_eq!(replayed, vec![2, 3]);
         assert_eq!(r.pending_inputs().len(), 2);
+    }
+
+    // ── Delta serialization ──────────────────────────────────────────
+
+    #[test]
+    fn delta_to_bytes_round_trip_empty() {
+        let d = Delta {
+            frame: 0, base_frame: 0,
+            spawned: vec![], despawned: vec![],
+            component_deltas: vec![], events: vec![],
+        };
+        let bytes = d.to_bytes();
+        let d2 = Delta::from_bytes(&bytes).unwrap();
+        assert_eq!(d2.frame, 0);
+        assert!(d2.spawned.is_empty());
+        assert!(d2.despawned.is_empty());
+    }
+
+    #[test]
+    fn delta_to_bytes_round_trip_full() {
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        let cid = ComponentId(5);
+
+        let d = Delta {
+            frame: 42, base_frame: 40,
+            spawned: vec![(e1, vec![1, 2, 3])],
+            despawned: vec![e2],
+            component_deltas: vec![ComponentDelta {
+                entity: e1, component_type: cid,
+                field_data: vec![vec![10], vec![20, 30]],
+            }],
+            events: vec![ReplicatedEvent {
+                entity: e1, component_type: cid,
+                event_field: 0, payload: vec![99],
+                channel: EventChannel::Unreliable,
+                target_client: None,
+            }],
+        };
+        let bytes = d.to_bytes();
+        let d2 = Delta::from_bytes(&bytes).unwrap();
+
+        assert_eq!(d2.frame, 42);
+        assert_eq!(d2.base_frame, 40);
+        assert_eq!(d2.spawned.len(), 1);
+        assert_eq!(d2.spawned[0].0, e1);
+        assert_eq!(d2.spawned[0].1, vec![1, 2, 3]);
+        assert_eq!(d2.despawned, vec![e2]);
+        assert_eq!(d2.component_deltas.len(), 1);
+        assert_eq!(d2.component_deltas[0].field_data[0], vec![10]);
+        assert_eq!(d2.component_deltas[0].field_data[1], vec![20, 30]);
+        assert_eq!(d2.events.len(), 1);
+        assert_eq!(d2.events[0].payload, vec![99]);
+    }
+
+    #[test]
+    fn delta_from_bytes_truncated_returns_none() {
+        assert!(Delta::from_bytes(&[]).is_none());
+        assert!(Delta::from_bytes(&[0u8; 7]).is_none());
+    }
+
+    // ── Snapshot field bytes ──────────────────────────────────────────
+
+    #[test]
+    fn snapshot_capture_reads_field_bytes() {
+        let mut world = crate::World::new();
+        let e = world.spawn();
+        world.insert(e, 42.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let f32_cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let snap = Snapshot::capture_full(&world, &reg, 1);
+        assert_eq!(snap.entities.len(), 1);
+        assert_eq!(snap.entities[0].entity, e);
+
+        let has_bytes = snap.entities[0]
+            .components
+            .iter()
+            .any(|(cid, data)| *cid == f32_cid && data.iter().any(|d| !d.is_empty()));
+        assert!(has_bytes, "snapshot should contain non-empty field data for f32 component");
     }
 }

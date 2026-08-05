@@ -40,6 +40,18 @@ impl Entity {
     /// entity indices are bounded by the slot-vec length.  Useful as an
     /// initialiser for option-like patterns without heap allocation.
     pub const DANGLING: Entity = Entity(u64::MAX);
+
+    /// Raw packed u64 representation (for serialization).
+    #[inline]
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Construct an Entity from its raw packed u64 representation.
+    #[inline]
+    pub fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
 }
 
 impl fmt::Debug for Entity {
