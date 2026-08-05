@@ -4182,7 +4182,7 @@ mod tests {
             // frame(8) + base_frame(8), then the target count field at the
             // requested position with everything before it zeroed (valid
             // empty prior sections), and nothing at all after it.
-            let mut bytes = vec![0u8; 16 + offset_in_body];
+            let mut bytes = vec![0u8; 16 + offset_in_body + 4];
             bytes[16 + offset_in_body..16 + offset_in_body + 4].copy_from_slice(&count.to_le_bytes());
             bytes
         }
