@@ -8,6 +8,8 @@ GPU-native ECS and spatial database for game engines, built in Rust.
 
 SceneDB is what you get when you decide your entity storage should be a database, not a bag of loose objects. Everything lives in cache-friendly SoA pages on the CPU side — paged storage, spatial bounds, SIMD queries, the streaming grid, and the phase machine all run on the CPU. Only the GPU-mirrored fields (transform columns, instance info, generation buffers, slot mirrors) use delta-sync — the CPU-side fields like bounds columns stay on the CPU and never touch VRAM, and handles are stable u64s with generation counters so compaction never leaves you with a dangling pointer. SIMD spatial queries (AVX2, NEON), a streaming grid that decides what's resident based on where players are standing, persistent region pinning, and a compile-time frame phase machine that makes invalid state transitions unrepresentable.
 
+SceneDB also provides a complete replication primitive suite — change tracking, delta encoding, interest management, authority, events/RPCs, snapshots, and client-side prediction reconciliation — so multiplayer and multi-user-editor support is built into the data layer rather than bolted on as an afterthought.
+
 ```mermaid
 flowchart LR
     subgraph CPU[CPU — Layer 1]
@@ -24,6 +26,14 @@ flowchart LR
         D[Delta-sync dirty tracking]
         H[HarvestPipeline<br/>Per-view output]
     end
+    subgraph REP[Replication]
+        CT[ChangeTracker<br/>per-frame diff]
+        SCHEMA[SchemaRegistry<br/>field encodings]
+        RS[RelevanceSet<br/>per-client filter]
+        AT[AuthorityTable<br/>ownership + conditions]
+        EV[Event/RPC channel]
+        SNAP[Snapshot + Reconciler]
+    end
     subgraph PHASE[Frame Phase Machine]
         SIM[Simulate<br/>&mut write]
         HAR[Harvest<br/>& read]
@@ -34,7 +44,11 @@ flowchart LR
     P --> M
     G --> M
     PERS --> G
+    SIM --> CT --> HAR
     SIM --> HAR --> B --> SIM
+    CT --> SCHEMA --> RS --> EV
+    AT --> RS
+    SNAP --> AT
 ```
 
 ## Architecture
@@ -49,6 +63,8 @@ On the GPU side, a `SceneGpuStore` manages region-partitioned SSBOs shared acros
 
 A compile-time frame phase machine enforces the ordering: you hold a `SimulateWitness` to write, a `HarvestPhase` to read back, and a `RetiredPhase` to compact. Pass the wrong witness to a function and it won't compile. No runtime checks, no phase-order bugs.
 
+On top of the storage and phase machine, the **replication layer** provides the primitives needed for server-authoritative multiplayer and multi-user-editor sessions. It records every mutation during Simulate (change tracking), encodes field deltas per a component schema (delta encoding), filters which client sees what (interest management + conditions), resolves who is allowed to write what (authority table), handles one-shot RPCs (event channel), and supports client-side prediction with server reconciliation (snapshots + reconciler). All primitives are graphics-free (C0) and work with `--no-default-features`.
+
 ```mermaid
 flowchart LR
     H[Handle u64] -->|generation check| R[HandleRegistry<br/>slot → row]
@@ -56,9 +72,24 @@ flowchart LR
     C -->|token-keyed column| Q[SIMD Query<br/>AABB / Frustum]
     Q -->|row tokens| HS[HarvestStaging<br/>per-class token arrays]
     HS -->|upload| SS[SceneGpuStore<br/>GPU SSBOs]
+
+    subgraph REP[Replication pipeline]
+        CT[ChangeTracker] -->|raw Delta| RS[RelevanceSet]
+        SCHEMA[SchemaRegistry]
+        AT[AuthorityTable]
+        RS -->|filtered DeltaView| EV[EventBatch]
+        SNAP[Snapshot] --> REC[Reconciler]
+    end
+
+    CT -.->|records| C
+    SCHEMA -.->|encodes| CT
+    AT -.->|conditions| RS
+    REC -.->|corrects| H
 ```
 
 ## Usage
+
+### Spatial cell
 
 Create a spatial cell, spawn elements with bounding boxes, and query.
 
@@ -79,6 +110,8 @@ let hit_count = cell.query_aabb(
 );
 // results[0] == 0 (the handle's row passed the query)
 ```
+
+### Streaming grid
 
 Set up a streaming grid and let it classify cells against players.
 
@@ -123,7 +156,7 @@ grid.unpin(CellCoord { x: 5, z: 3 });
 // Back to concentric rules.
 ```
 
-The derive macro generates Pod implementations and GPU column dispatch.
+### Derive macro
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
@@ -135,6 +168,244 @@ pub struct MyComponent {
 }
 // Generates Pod impl, column descriptors, and write dispatch for GPU sync.
 ```
+
+---
+
+## Replication primitives
+
+### Schema registration
+
+Declare which fields on each component type replicate, how they are encoded, and under what conditions.
+
+```rust
+use pulsar_scenedb::{ReplicationRegistry, ReplicationEncoding, ReplicationCondition,
+    EventChannel, SchemaBuilder, Component};
+
+struct Transform {
+    matrix: [[f32; 4]; 4],
+}
+impl Component for Transform {}
+
+struct Health {
+    value: f32,
+}
+impl Component for Health {}
+
+let mut registry = ReplicationRegistry::new();
+
+let builder = registry.register::<Transform>();
+registry.insert(
+    builder
+        .field("matrix", ReplicationEncoding::Pod, ReplicationCondition::Always)
+);
+
+let builder = registry.register::<Health>();
+registry.insert(
+    builder
+        .field("value", ReplicationEncoding::DeltaCompressed,
+               ReplicationCondition::SimulatedOnly)
+);
+
+// Serialize schemas for the connection handshake.
+let handshake = registry.handshake_message();
+let remote_registry = ReplicationRegistry::from_handshake(&handshake).unwrap();
+```
+
+### Change tracking at the frame boundary
+
+Record every mutation during the simulate phase, then drain into a delta at the harvest boundary.
+
+```rust
+use pulsar_scenedb::{World, ChangeTracker, Delta, AuthorityTable, ClientId};
+
+let mut world = World::new();
+let mut authority = AuthorityTable::new();
+let mut tracker = ChangeTracker::new();
+
+// Simulate — systems write to the world and optionally track changes.
+let entity = world.spawn_tracked(&mut tracker);
+world.insert_tracked(entity, 100.0f32, &mut tracker);
+
+// At the frame boundary, drain the tracker into a Delta.
+let (delta, _) = tracker.drain(&schema, ClientId(0), &authority);
+tracker.end_frame();
+
+// delta contains: spawned entities, despawned entities, component changes.
+```
+
+### Interest management and condition filtering
+
+Filter a delta per client using spatial relevance and per-field replication conditions.
+
+```rust
+use pulsar_scenedb::{RelevanceSet, AuthorityTable, Ownership, ClientId, DeltaView};
+use pulsar_scenedb::Entity;
+
+let mut relevance = RelevanceSet::new();
+relevance.add_always_relevant(entity);
+
+// Filter the frame's delta for a specific client.
+let view: DeltaView = relevance.filter(
+    &delta, &authority, &registry, ClientId(42),
+);
+// view.component_deltas only contains entities that are both relevant
+// AND whose field conditions pass for Client 42.
+```
+
+### Authority and ownership
+
+Control which client owns which entity or field.
+
+```rust
+let mut authority = AuthorityTable::new();
+
+authority.set_entity_owner(entity, Ownership::Client(ClientId(42)));
+// Client 42 can write this entity's ServerAuthority fields.
+
+assert!(authority.can_write(entity, component_id, 0, ClientId(42)));
+assert!(!authority.can_write(entity, component_id, 0, ClientId(7)));
+
+// Per-field overrides take precedence.
+authority.set_field_owner(entity, component_id, 0, Ownership::Shared);
+assert!(authority.can_write(entity, component_id, 0, ClientId(99)));
+```
+
+### Conflict resolution (multi-user editor)
+
+When two clients both modify the same entity in the same frame, resolve deterministically:
+
+```rust
+let merged = AuthorityTable::resolve_conflict(
+    &authority, &delta_a, ClientId(1), &delta_b, ClientId(2),
+);
+// Higher ClientId wins. Spawns/despawns from both sides are merged.
+```
+
+### Event / RPC channel
+
+Declare an event field on a component and fire one-shot RPCs that travel separately from state deltas.
+
+```rust
+// In schema registration:
+let builder = registry.register::<DamageReceiver>();
+registry.insert(
+    builder.event("on_explode", ReplicationCondition::Multicast, EventChannel::Unreliable)
+);
+
+// During simulate, enqueue an event:
+tracker.record_event(pulsar_scenedb::ReplicatedEvent {
+    entity,
+    component_type: component_id::<DamageReceiver>(),
+    event_field: 0,
+    payload: vec![1, 2, 3],   // serialized arguments
+    channel: EventChannel::Unreliable,
+    target_client: None,
+});
+
+// At the output stage, filter events per client by direction:
+use pulsar_scenedb::{events_to_batch, can_send_event};
+
+let batch = events_to_batch(&view, frame, &registry, sender, recipient);
+if let Some(batch) = batch {
+    // Engine sends batch.events as a separate message type.
+}
+```
+
+Direction enforcement:
+
+```rust
+// ClientToServer — any client can send to server.
+can_send_event(&ReplicationCondition::ClientToServer, client, server);
+
+// ServerToClient — server targets a specific client.
+can_send_event(&ReplicationCondition::ServerToClient, server, target_client);
+
+// Multicast — everyone except the sender.
+can_send_event(&ReplicationCondition::Multicast, sender, recipient);
+```
+
+### Snapshots
+
+Capture a full or filtered world state for initial replication or recovery.
+
+```rust
+use pulsar_scenedb::{Snapshot, RelevanceSet};
+
+// Full world state.
+let full = Snapshot::capture_full(&world, &registry, current_frame);
+
+// Only entities relevant to a specific client.
+let relevant = Snapshot::capture_relevant(&world, &registry, &relevance, current_frame);
+```
+
+### Client-side prediction reconciliation
+
+The reconciler maintains a history ring buffer of server snapshots and a queue of unacknowledged local inputs. When a server delta arrives, it discards acknowledged inputs and replays the remaining predicted inputs on top of the corrected world.
+
+```rust
+use pulsar_scenedb::{Reconciler, ClientInput};
+
+let mut reconciler = Reconciler::new();
+
+// Each local tick, push the player's input.
+reconciler.push_input(ClientInput {
+    frame: local_frame,
+    entity: player_entity,
+    component: component_id::<Movement>(),
+    field_data: vec![(0, serialize_movement(&input))],
+});
+
+// When a server delta arrives, apply it to the world first, then reconcile.
+apply_delta_to_world(&server_delta, &mut world, &registry);
+reconciler.reconcile(&server_delta, &mut world, |world, input| {
+    // Re-apply this input to the corrected world.
+    apply_input_to_world(world, input);
+});
+```
+
+### Full integration example
+
+Putting it all together in a server tick loop:
+
+```rust
+fn server_tick(
+    world: &mut World,
+    registry: &ReplicationRegistry,
+    authority: &AuthorityTable,
+    clients: &[ClientId],
+    spatial_cells: &[SpatialCell],
+    scratch: &mut Scratchpad,
+) -> Vec<(Delta, Vec<EventBatch>)> {
+    // 1. Track all changes this frame.
+    let mut tracker = ChangeTracker::new();
+    run_systems(world, &mut tracker);
+
+    // 2. Drain into a raw delta.
+    let (delta, _) = tracker.drain(schema, ClientId(0), authority);
+    tracker.end_frame();
+
+    // 3. Build per-client outputs.
+    let mut outputs = Vec::new();
+    for &client in clients {
+        // Spatial relevance.
+        let relevance = RelevanceSet::from_frustum(
+            spatial_cells, &client_frustum(client),
+            &liveness_snapshot, scratch, |_, token| resolve_entity(token),
+        );
+
+        // Filter by relevance + conditions.
+        let view = relevance.filter(&delta, authority, registry, client);
+
+        // Build event batch with direction enforcement.
+        let batch = events_to_batch(&view, delta.frame, registry, ClientId(0), client);
+
+        outputs.push((delta.clone(), batch.into_iter().collect()));
+    }
+    outputs
+}
+```
+
+---
 
 ## Layer reference
 
@@ -148,10 +419,11 @@ pub struct MyComponent {
 | Phase machine | CPU | `SimulateWitness`, `HarvestPhase`, `RetiredPhase` | Compile-time frame phase guards |
 | Assets | GPU | `GeometryArena`, `MeshRegistry`, `ClusterBuffer`, `TextureStore`, `MeshletBuffer` | GPU-side asset storage with suballocation |
 | Lease | CPU | `Lease`, `LeaseMask`, `Scratchpad` | RAII read leases, decaying per-frame scratch buffers |
+| **Replication** | CPU | `ChangeTracker`, `Delta`, `ReplicationRegistry`, `SchemaBuilder`, `RelevanceSet`, `AuthorityTable`, `EventBatch`, `Snapshot`, `Reconciler` | Per-frame change tracking, delta encoding, interest management, ownership, condition filtering, RPC channel, world snapshots, client prediction reconciliation |
 
 ## Crates
 
-- **pulsar_scenedb** — the core library.
+- **pulsar_scenedb** — the core library (ECS + spatial + GPU + replication). `replication` is always available (no feature gate, C0-compatible).
 - **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for Pod impls and GPU dispatch boilerplate.
 - **scenedb_dashboard** — runtime TUI monitoring dashboard.
 
@@ -172,6 +444,26 @@ The frame phase machine is the synchronization backbone. Within Simulate, system
 **What synchronization exists between phases?**
 
 Compile-time witnesses. `SimulateWitness`, `HarvestPhase`, and `RetiredPhase` are zero-sized types that functions require as arguments. You can't call `write_transform` without a `SimulateWitness`, can't call `snapshot_liveness` without a `HarvestPhase`, and can't call `compact` or `execute_transitions` without a `RetiredPhase`. The driver in `gpu::phase` produces and consumes these in order — acquire, simulate, harvest, boundary, repeat. No runtime checks, no lock contention, no phase-order bugs.
+
+**How do the replication primitives relate to the frame phase machine?**
+
+The `ChangeTracker` is populated during the Simulate phase alongside normal system execution. At the Simulate→Harvest boundary, `tracker.drain()` is called to produce a coherent `Delta` — this is the same fence that guarantees liveness-mask consistency. Relevance filtering, delta encoding, and event batching happen during or just after Harvest (read-only on storage). The reconciler runs on the client side when a server delta arrives, which is independent of the local phase machine.
+
+**Does SceneDB handle network transport?**
+
+No. SceneDB produces `Delta` (state) and `EventBatch` (RPC) byte payloads and specifies the encoding for each field via `ReplicationEncoding`. The engine is responsible for transport — TCP, UDP, WebSocket, Steam, EOS, or any other medium. SceneDB does not do encryption, authentication, connection management, NAT punch, or relay.
+
+**Does SceneDB handle asset streaming?**
+
+No. A `GpuHandle`-mode field replicates only the handle index (8 bytes). The actual GPU resource (mesh, texture, buffer) is loaded independently by the engine's asset streaming system. SceneDB says "entity 42's mesh changed to handle 17 at frame 128" — the assembly and delivery of the vertex data is a separate pipeline.
+
+**Can I use SceneDB replication for a multi-user editor?**
+
+Yes. The `Ownership::Shared` mode enables optimistic concurrent writes from multiple peers. Conflicts are resolved deterministically at the frame boundary — the peer with the higher `ClientId` wins. No locks, no operational transform, no CRDT. The editor builds collaboration semantics (OT, undo history, lock server) on top of this primitive. SceneDB provides the deterministic conflict resolution; the editor provides the user-facing collaboration model.
+
+**What is the wire format for schema handshake?**
+
+All values are little-endian. The handshake message is: `schema_count: u32`, then for each schema: `component_type: u32`, `field_count: u32`, then for each field: `field_index: u32`, `encoding: u8`, `condition: u8`, `event_channel: u8`. Encoding values: 0=Pod, 1=Serialized, 2=GpuHandle, 3=DeltaCompressed, 4=Event, 5=Opaque. Condition values: 0-10 mapping the 11 `ReplicationCondition` variants. Event channel: 0=None, 1=ReliableOrdered, 2=Unreliable.
 
 ## License
 
