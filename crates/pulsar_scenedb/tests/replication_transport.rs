@@ -438,25 +438,28 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
 
 fn decode_snapshot(bytes: &[u8]) -> Snapshot {
     let mut ofs = 0usize;
-    let mut read_u32 = || {
-        let v = u32::from_le_bytes(bytes[ofs..ofs + 4].try_into().unwrap());
-        ofs += 4;
-        v
-    };
-    let entity_count = read_u32();
+    macro_rules! read_u32 {
+        () => {{
+            let v = u32::from_le_bytes(bytes[ofs..ofs + 4].try_into().unwrap());
+            ofs += 4;
+            v
+        }};
+    }
+
+    let entity_count = read_u32!();
     let mut entities = Vec::new();
     for _ in 0..entity_count {
         let bits = u64::from_le_bytes(bytes[ofs..ofs + 8].try_into().unwrap());
         ofs += 8;
         let entity = Entity::from_bits(bits);
-        let component_count = read_u32();
+        let component_count = read_u32!();
         let mut components = Vec::new();
         for _ in 0..component_count {
-            let cid = ComponentId(read_u32());
-            let field_count = read_u32();
+            let cid = ComponentId(read_u32!());
+            let field_count = read_u32!();
             let mut field_data = Vec::new();
             for _ in 0..field_count {
-                let field_len = read_u32() as usize;
+                let field_len = read_u32!() as usize;
                 field_data.push(bytes[ofs..ofs + field_len].to_vec());
                 ofs += field_len;
             }
