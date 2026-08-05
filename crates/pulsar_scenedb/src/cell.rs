@@ -187,6 +187,22 @@ impl CellStorage {
         Some(self.page.column_raw_bytes(idx + 1, rows))
     }
 
+    /// Mutable counterpart to [`Self::column_raw_bytes`] — raw byte access to
+    /// a Pod column identified by `ComponentId`, for restoring replicated
+    /// state directly into column memory
+    /// (`crate::replication::Snapshot::restore_to_cells`). Only Pod columns
+    /// support raw-byte access; returns `None` for generic columns or
+    /// unknown ids.
+    pub fn column_raw_bytes_mut(&mut self, id: ComponentId) -> Option<&mut [u8]> {
+        let idx = self
+            .token_index
+            .iter()
+            .find(|(tid, _)| *tid == id)
+            .map(|(_, i)| *i)?;
+        let rows = self.page.len();
+        Some(self.page.column_raw_bytes_mut(idx + 1, rows))
+    }
+
     /// Physical column 0 — the slot-ID column (one owning slot per row).
     /// Read by the GPU layer to maintain the row-indexed global-slot mirror
     /// (design Rev 2 §2; C6 GPU handle validation).

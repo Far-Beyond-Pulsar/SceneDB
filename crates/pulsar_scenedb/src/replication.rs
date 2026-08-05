@@ -206,7 +206,7 @@ use crate::archetype::ArchetypeKey;
 use crate::component::ComponentId;
 use crate::entity::Entity;
 use crate::snapshot::LivenessSnapshot;
-use crate::spatial::SpatialCell;
+use crate::spatial::{Aabb, SpatialCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
@@ -499,7 +499,13 @@ impl ReplicationRegistry {
             ofs += 4;
             let mut fields = Vec::with_capacity(field_count as usize);
             for _ in 0..field_count {
-                if ofs + 10 > bytes.len() {
+                // Each field is exactly 7 bytes on the wire: field_index
+                // (4) + encoding (1) + condition (1) + event_channel (1).
+                // This used to check for 10, which rejected otherwise
+                // well-formed handshakes whenever the last field landed
+                // exactly at the buffer's end (found by
+                // `handshake_round_trip_random_schemas`'s fuzzing).
+                if ofs + 7 > bytes.len() {
                     return Err(ErrorCode::InvalidData);
                 }
                 let field_index = u32::from_le_bytes([
@@ -658,6 +664,23 @@ pub fn encode_field_value(encoding: &ReplicationEncoding, value_bytes: &[u8], bu
             encode(ptr, &mut buf[start..])
         }
     }
+}
+
+/// Encode a Pod field directly into a byte slice — the zero-copy
+/// counterpart to [`encode_field_value`]'s `Pod`/`Serialized`/`GpuHandle`
+/// branch, which allocates into (and may reallocate/grow) a `Vec<u8>`. For
+/// hot paths that already own a destination buffer — e.g. assembling a
+/// network packet, or [`ChangeTracker`]'s per-field scratch — this memcpy's
+/// straight in with no intermediate allocation.
+///
+/// Returns the number of bytes written (always `value_bytes.len()`).
+///
+/// # Safety
+/// `buf` must be at least `value_bytes.len()` bytes.
+pub unsafe fn encode_pod_raw(value_bytes: &[u8], buf: &mut [u8]) -> usize {
+    debug_assert!(buf.len() >= value_bytes.len(), "encode_pod_raw: buf too small");
+    std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), buf.as_mut_ptr(), value_bytes.len());
+    value_bytes.len()
 }
 
 /// Decode a field value from `data` according to its encoding mode into `value_bytes`.
@@ -951,6 +974,22 @@ impl Delta {
     /// have been produced with the same [`ReplicationEncoding`] the local
     /// `schema` declares for that field.
     pub fn apply(&self, world: &mut crate::World, schema: &ReplicationRegistry) -> Result<(), ErrorCode> {
+        let mut scratch = Vec::new();
+        self.apply_with_scratch(world, schema, &mut scratch)
+    }
+
+    /// Like [`Self::apply`], but decodes each field into a caller-owned
+    /// `scratch` buffer instead of allocating a fresh `Vec<u8>` per field.
+    /// Pass the SAME `scratch` buffer across many `apply_with_scratch` calls
+    /// (e.g. once per connected client per frame) to amortize its
+    /// allocation to zero after the first call grows it to the largest
+    /// field width seen. `scratch`'s contents on return are unspecified.
+    pub fn apply_with_scratch(
+        &self,
+        world: &mut crate::World,
+        schema: &ReplicationRegistry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(), ErrorCode> {
         for &entity in &self.despawned {
             world.despawn(entity);
         }
@@ -1005,14 +1044,18 @@ impl Delta {
                 if width == 0 {
                     continue;
                 }
-                let mut decoded = vec![0u8; width];
-                let code = decode_field_value(&field.encoding, raw, &mut decoded);
+                // Reuse `scratch` instead of allocating a fresh Vec for
+                // every field: grow once, then just resize (no realloc)
+                // once `scratch`'s capacity covers the widest field seen.
+                scratch.clear();
+                scratch.resize(width, 0);
+                let code = decode_field_value(&field.encoding, raw, scratch);
                 if code != ErrorCode::Ok {
                     return Err(code);
                 }
                 // SAFETY: see this method's doc.
                 unsafe {
-                    world.write_component_raw(cd.entity, cd.component_type, offset, &decoded);
+                    world.write_component_raw(cd.entity, cd.component_type, offset, scratch);
                 }
                 offset += width;
             }
@@ -1154,6 +1197,74 @@ impl ChangeTracker {
     }
 }
 
+// ── Entity ↔ spatial-cell mapping ───────────────────────────────────────────
+
+/// Bi-directional mapping between ECS [`Entity`] handles and `(cell_index,
+/// row_token)` pairs in a set of [`SpatialCell`]s.
+///
+/// [`RelevanceSet::from_frustum`] resolves each hit `(cell_idx, row_token)`
+/// to an `Entity` via a caller-supplied closure; this map is the obvious
+/// off-the-shelf resolver for the common case where spatial rows and ECS
+/// entities are kept in a stable 1:1 correspondence (see
+/// [`RelevanceSet::from_frustum_mapped`]).
+#[derive(Clone, Debug, Default)]
+pub struct EntityCellMap {
+    entity_to_cell: HashMap<Entity, (usize, u32)>,
+    cell_to_entity: HashMap<(usize, u32), Entity>,
+}
+
+impl EntityCellMap {
+    pub fn new() -> Self {
+        Self {
+            entity_to_cell: HashMap::new(),
+            cell_to_entity: HashMap::new(),
+        }
+    }
+
+    /// Record that `entity` lives at `(cell_idx, row)`. Overwrites any prior
+    /// mapping for `entity` and for the `(cell_idx, row)` slot, keeping both
+    /// directions consistent.
+    pub fn insert(&mut self, entity: Entity, cell_idx: usize, row: u32) {
+        if let Some(old_key) = self.entity_to_cell.insert(entity, (cell_idx, row)) {
+            if old_key != (cell_idx, row) {
+                self.cell_to_entity.remove(&old_key);
+            }
+        }
+        if let Some(old_entity) = self.cell_to_entity.insert((cell_idx, row), entity) {
+            if old_entity != entity {
+                self.entity_to_cell.remove(&old_entity);
+            }
+        }
+    }
+
+    /// Remove `entity` from the map, if present.
+    pub fn remove(&mut self, entity: Entity) {
+        if let Some(key) = self.entity_to_cell.remove(&entity) {
+            self.cell_to_entity.remove(&key);
+        }
+    }
+
+    /// Resolve a `(cell_idx, row_token)` pair to its mapped entity.
+    pub fn entity_at(&self, cell_idx: usize, row: u32) -> Option<Entity> {
+        self.cell_to_entity.get(&(cell_idx, row)).copied()
+    }
+
+    /// Resolve an entity to its `(cell_idx, row_token)` pair.
+    pub fn cell_of(&self, entity: Entity) -> Option<(usize, u32)> {
+        self.entity_to_cell.get(&entity).copied()
+    }
+
+    /// Number of entities currently mapped.
+    pub fn len(&self) -> usize {
+        self.entity_to_cell.len()
+    }
+
+    /// Returns true if the map has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entity_to_cell.is_empty()
+    }
+}
+
 // ── Interest management ────────────────────────────────────────────────────
 
 /// Per-connection filter, built each frame from spatial queries + conditions.
@@ -1202,6 +1313,22 @@ impl RelevanceSet {
             }
         }
         set
+    }
+
+    /// Convenience wrapper over [`Self::from_frustum`] that resolves each
+    /// hit `(cell_idx, row_token)` through an [`EntityCellMap`] instead of a
+    /// caller-supplied closure — the common case where spatial rows and ECS
+    /// entities are kept in a stable 1:1 correspondence via `map`.
+    pub fn from_frustum_mapped(
+        cells: &[SpatialCell],
+        frustum: &crate::spatial::Frustum,
+        liveness: &LivenessSnapshot,
+        scratch: &mut crate::lease::Scratchpad,
+        map: &EntityCellMap,
+    ) -> Self {
+        Self::from_frustum(cells, frustum, liveness, scratch, |cell_idx, row| {
+            map.entity_at(cell_idx, row)
+        })
     }
 
     /// Add an entity that should always be relevant (local player, HUD, etc.).
@@ -1550,6 +1677,12 @@ impl Default for AuthorityTable {
 pub struct Snapshot {
     pub frame: u64,
     pub entities: Vec<EntitySnapshot>,
+    /// Rows captured from [`SpatialCell`]s via [`Snapshot::capture_cells`].
+    /// Empty for an archetype-`World` snapshot ([`Snapshot::capture_full`]/
+    /// [`Snapshot::capture_relevant`]) — the two capture paths are
+    /// independent and can be combined on one `Snapshot` when a scene mixes
+    /// ECS entities and standalone spatial cells.
+    pub cell_rows: Vec<CellRowSnapshot>,
 }
 
 /// A single entity's component data within a snapshot.
@@ -1557,6 +1690,17 @@ pub struct Snapshot {
 #[derive(Clone, Debug)]
 pub struct EntitySnapshot {
     pub entity: Entity,
+    pub components: Vec<(ComponentId, Vec<Vec<u8>>)>,
+}
+
+/// A single [`SpatialCell`] row's component data within a snapshot, captured
+/// by [`Snapshot::capture_cells`]. Rows aren't ECS entities, so — unlike
+/// [`EntitySnapshot`] — identity is just positional: `cell_index` plus this
+/// entry's position among the cell's other captured rows (live-row order at
+/// capture time).
+#[derive(Clone, Debug)]
+pub struct CellRowSnapshot {
+    pub cell_index: usize,
     pub components: Vec<(ComponentId, Vec<Vec<u8>>)>,
 }
 
@@ -1608,7 +1752,7 @@ impl Snapshot {
                 entities.push(EntitySnapshot { entity, components });
             }
         }
-        Self { frame, entities }
+        Self { frame, entities, cell_rows: Vec::new() }
     }
 
     /// Capture only entities relevant to a specific client.
@@ -1660,7 +1804,153 @@ impl Snapshot {
                 entities.push(EntitySnapshot { entity, components });
             }
         }
-        Self { frame, entities }
+        Self { frame, entities, cell_rows: Vec::new() }
+    }
+
+    /// Capture all live rows from a set of [`SpatialCell`]s.
+    ///
+    /// For each cell, for each of `schema`'s registered component types that
+    /// the cell exposes as a raw Pod column (`CellStorage::column_raw_bytes`
+    /// — i.e. columns registered via `register_token_column`/`from_cell_type`,
+    /// such as `SpatialCell::with_transform`'s transform/instance-info
+    /// columns), encodes that row's bytes per schema field, indexed by
+    /// `field.field_index` (matching [`Delta::apply`]'s convention so
+    /// [`Self::restore_to_cells`] can invert this losslessly for Pod-style
+    /// fields). Dead rows are skipped.
+    pub fn capture_cells(cells: &[SpatialCell], schema: &ReplicationRegistry, frame: u64) -> Self {
+        let mut cell_rows = Vec::new();
+        for (cell_index, cell) in cells.iter().enumerate() {
+            let storage = cell.storage();
+            let rows = storage.rows_in_use();
+            if rows == 0 {
+                continue;
+            }
+            let liveness = LivenessSnapshot::capture(storage.liveness(), rows);
+            for row in 0..rows {
+                if !liveness.is_live(row) {
+                    continue;
+                }
+                let mut components = Vec::new();
+                for s in schema.schemas.values() {
+                    let Some(col_bytes) = storage.column_raw_bytes(s.component_type) else {
+                        continue;
+                    };
+                    let elem_size = col_bytes.len() / rows as usize;
+                    if elem_size == 0 {
+                        continue;
+                    }
+                    let start = row as usize * elem_size;
+                    let value = &col_bytes[start..start + elem_size];
+
+                    let mut field_data: Vec<Vec<u8>> = Vec::new();
+                    let mut any = false;
+                    for field in &s.fields {
+                        let idx = field.field_index as usize;
+                        if idx >= field_data.len() {
+                            field_data.resize(idx + 1, Vec::new());
+                        }
+                        if matches!(field.encoding, ReplicationEncoding::Event) {
+                            continue;
+                        }
+                        let mut buf = Vec::new();
+                        encode_field_value(&field.encoding, value, &mut buf);
+                        field_data[idx] = buf;
+                        any = true;
+                    }
+                    if any {
+                        components.push((s.component_type, field_data));
+                    }
+                }
+                cell_rows.push(CellRowSnapshot { cell_index, components });
+            }
+        }
+        Self { frame, entities: Vec::new(), cell_rows }
+    }
+
+    /// Restore a snapshot captured by [`Self::capture_cells`] into a set of
+    /// [`SpatialCell`]s. Allocates one fresh handle per captured row (in
+    /// capture order — the snapshot doesn't carry original handle bits,
+    /// since a row's identity is transient across cell compaction anyway)
+    /// and writes each component's bytes back, packing fields sequentially
+    /// by byte offset like [`Delta::apply`].
+    ///
+    /// Returns [`ErrorCode::InvalidData`] if a row names a `cell_index`
+    /// outside `cells`, or if a cell is full and can't allocate.
+    ///
+    /// # Safety-adjacent caveat
+    ///
+    /// Like `Delta::apply`, this writes raw bytes into Pod columns — sound
+    /// only for the Pod-like column types `SpatialCell`'s token-registered
+    /// columns actually hold (`[f32; 16]`, `InstanceInfo`, plain `f32`
+    /// bounds, etc.).
+    pub fn restore_to_cells(&self, cells: &mut [SpatialCell], schema: &ReplicationRegistry) -> Result<(), ErrorCode> {
+        // Reused across every field of every row instead of a fresh `Vec`
+        // per field — same rationale as `Delta::apply_with_scratch`.
+        let mut scratch: Vec<u8> = Vec::new();
+        for row_snap in &self.cell_rows {
+            let Some(cell) = cells.get_mut(row_snap.cell_index) else {
+                return Err(ErrorCode::InvalidData);
+            };
+            let handle = cell
+                .alloc(Aabb { min: [0.0; 3], max: [0.0; 3] })
+                .ok_or(ErrorCode::InvalidData)?;
+            let row = cell.row_of(handle).ok_or(ErrorCode::InvalidData)?;
+
+            for (cid, field_data) in &row_snap.components {
+                let Some(s) = schema.schema(*cid) else {
+                    continue;
+                };
+                let storage = cell.storage_mut();
+                let rows_now = storage.rows_in_use();
+                let Some(col_bytes) = storage.column_raw_bytes_mut(*cid) else {
+                    continue;
+                };
+                let elem_size = col_bytes.len() / rows_now as usize;
+                if elem_size == 0 {
+                    continue;
+                }
+                let start = row as usize * elem_size;
+                let dst = &mut col_bytes[start..start + elem_size];
+
+                let mut offset = 0usize;
+                for field in &s.fields {
+                    if offset >= elem_size {
+                        break;
+                    }
+                    if matches!(field.encoding, ReplicationEncoding::Event) {
+                        continue;
+                    }
+                    let idx = field.field_index as usize;
+                    let Some(raw) = field_data.get(idx) else {
+                        continue;
+                    };
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let remaining = elem_size - offset;
+                    let width = match &field.encoding {
+                        ReplicationEncoding::Pod | ReplicationEncoding::Serialized | ReplicationEncoding::GpuHandle => {
+                            raw.len().min(remaining)
+                        }
+                        ReplicationEncoding::DeltaCompressed => remaining.min(8),
+                        ReplicationEncoding::Opaque { .. } => remaining,
+                        ReplicationEncoding::Event => 0,
+                    };
+                    if width == 0 {
+                        continue;
+                    }
+                    scratch.clear();
+                    scratch.resize(width, 0);
+                    let code = decode_field_value(&field.encoding, raw, &mut scratch);
+                    if code != ErrorCode::Ok {
+                        return Err(code);
+                    }
+                    dst[offset..offset + width].copy_from_slice(&scratch);
+                    offset += width;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1776,6 +2066,48 @@ impl Default for Reconciler {
     }
 }
 
+// ── Frame phase machine integration ────────────────────────────────────────
+
+/// Non-GPU witness for the simulate phase. Always available (no `gpu`
+/// feature required) — the C0 counterpart to `gpu::phase::SimulateWitness`,
+/// for callers that drive their own frame loop without the GPU-resident
+/// scene store and its compile-time phase machine.
+///
+/// Holding this witness carries no compile-time ordering guarantee (unlike
+/// `gpu::phase`'s sealed, consuming witness chain) — it exists purely to
+/// give [`ChangeTracker::drain_with_world`] + [`ChangeTracker::end_frame`]
+/// a named call site that mirrors the GPU path's `SimulateWitness::run_tracked`.
+pub struct CpuSimulateWitness;
+
+impl CpuSimulateWitness {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Run a simulate phase with change tracking.
+    ///
+    /// Runs `systems` (which mutates `world` and records changes into
+    /// `tracker`), then drains the tracker at the Simulate→Harvest boundary
+    /// via [`ChangeTracker::drain_with_world`] (so spawns carry a real
+    /// archetype-key blob — see [`encode_archetype_key`]) and advances the
+    /// tracker's frame counter. Returns the resulting [`Delta`].
+    pub fn run_tracked<F>(&self, world: &mut crate::World, tracker: &mut ChangeTracker, systems: F) -> Delta
+    where
+        F: FnOnce(&mut crate::World, &mut ChangeTracker),
+    {
+        systems(world, tracker);
+        let delta = tracker.drain_with_world(world);
+        tracker.end_frame();
+        delta
+    }
+}
+
+impl Default for CpuSimulateWitness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Assert endianness ──────────────────────────────────────────────────────
 
 const _: () = assert!(
@@ -1789,6 +2121,8 @@ const _: () = assert!(
 mod tests {
     use super::*;
     use crate::Entity;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
 
     fn make_entity(index: u32, gen: u32) -> Entity {
         Entity::new(index, gen)
@@ -1798,6 +2132,102 @@ mod tests {
     /// (which ignores its `_schema` argument entirely).
     fn test_schema(component_type: ComponentId) -> ReplicationSchema {
         ReplicationSchema { component_type, fields: vec![], column_factory: None }
+    }
+
+    // ── Fuzz / property-test helpers ─────────────────────────────────
+
+    /// Random `ReplicationEncoding`, excluding `Opaque` — its fn pointers
+    /// don't round-trip through the wire handshake format (see
+    /// `u8_from_encoding`'s doc), so a generator feeding handshake/wire
+    /// round-trip tests must not produce it.
+    fn random_encoding(rng: &mut impl Rng) -> ReplicationEncoding {
+        match rng.gen_range(0..5) {
+            0 => ReplicationEncoding::Pod,
+            1 => ReplicationEncoding::Serialized,
+            2 => ReplicationEncoding::GpuHandle,
+            3 => ReplicationEncoding::DeltaCompressed,
+            _ => ReplicationEncoding::Event,
+        }
+    }
+
+    fn random_condition(rng: &mut impl Rng) -> ReplicationCondition {
+        match rng.gen_range(0..11) {
+            0 => ReplicationCondition::Always,
+            1 => ReplicationCondition::OwnerOnly,
+            2 => ReplicationCondition::SkipOwner,
+            3 => ReplicationCondition::SimulatedOnly,
+            4 => ReplicationCondition::AutonomousOnly,
+            5 => ReplicationCondition::InitialOnly,
+            6 => ReplicationCondition::ServerAuthority,
+            7 => ReplicationCondition::ClientAuthority,
+            8 => ReplicationCondition::ServerToClient,
+            9 => ReplicationCondition::ClientToServer,
+            _ => ReplicationCondition::Multicast,
+        }
+    }
+
+    fn random_bytes(rng: &mut impl Rng, max_len: usize) -> Vec<u8> {
+        let len = rng.gen_range(0..=max_len);
+        (0..len).map(|_| rng.gen()).collect()
+    }
+
+    fn random_entity(rng: &mut impl Rng) -> Entity {
+        make_entity(rng.gen_range(0..1000), rng.gen_range(0..10))
+    }
+
+    fn random_delta(rng: &mut impl Rng) -> Delta {
+        let spawned = (0..rng.gen_range(0..5))
+            .map(|_| (random_entity(rng), random_bytes(rng, 20)))
+            .collect();
+        let despawned = (0..rng.gen_range(0..5)).map(|_| random_entity(rng)).collect();
+        let component_deltas = (0..rng.gen_range(0..5))
+            .map(|_| ComponentDelta {
+                entity: random_entity(rng),
+                component_type: ComponentId(rng.gen_range(0..50)),
+                field_data: (0..rng.gen_range(0..4)).map(|_| random_bytes(rng, 16)).collect(),
+            })
+            .collect();
+        let events = (0..rng.gen_range(0..5))
+            .map(|_| ReplicatedEvent {
+                entity: random_entity(rng),
+                component_type: ComponentId(rng.gen_range(0..50)),
+                event_field: rng.gen_range(0..10),
+                payload: random_bytes(rng, 20),
+                channel: if rng.gen_bool(0.5) { EventChannel::ReliableOrdered } else { EventChannel::Unreliable },
+                target_client: if rng.gen_bool(0.5) { Some(ClientId(rng.gen_range(0..20))) } else { None },
+            })
+            .collect();
+
+        Delta {
+            frame: rng.gen(),
+            base_frame: rng.gen(),
+            spawned,
+            despawned,
+            component_deltas,
+            events,
+        }
+    }
+
+    fn assert_deltas_equal(a: &Delta, b: &Delta) {
+        assert_eq!(a.frame, b.frame);
+        assert_eq!(a.base_frame, b.base_frame);
+        assert_eq!(a.spawned, b.spawned);
+        assert_eq!(a.despawned, b.despawned);
+        assert_eq!(a.component_deltas.len(), b.component_deltas.len());
+        for (x, y) in a.component_deltas.iter().zip(b.component_deltas.iter()) {
+            assert_eq!(x.entity, y.entity);
+            assert_eq!(x.component_type, y.component_type);
+            assert_eq!(x.field_data, y.field_data);
+        }
+        assert_eq!(a.events.len(), b.events.len());
+        for (x, y) in a.events.iter().zip(b.events.iter()) {
+            assert_eq!(x.entity, y.entity);
+            assert_eq!(x.component_type, y.component_type);
+            assert_eq!(x.event_field, y.event_field);
+            assert_eq!(x.payload, y.payload);
+            assert_eq!(x.channel, y.channel);
+            assert_eq!(x.target_client, y.target_client);
+        }
     }
 
     #[test]
@@ -2032,6 +2462,24 @@ mod tests {
         assert_eq!(result.unwrap_err(), ErrorCode::InvalidData);
     }
 
+    /// Regression test for a fuzz-discovered off-by-3 in `from_handshake`'s
+    /// per-field truncation check: it required 10 bytes remaining per field
+    /// but only ever consumes 7 (field_index:4 + encoding:1 + condition:1 +
+    /// event_channel:1), so a well-formed handshake whose LAST field landed
+    /// exactly at the buffer's end was rejected as truncated.
+    #[test]
+    fn registry_handshake_last_field_at_exact_buffer_end() {
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let msg = reg.handshake_message();
+        // The single field here is the last bytes of the buffer — exactly
+        // the shape that used to trip the bug.
+        let reg2 = ReplicationRegistry::from_handshake(&msg).expect("well-formed handshake must parse");
+        assert_eq!(reg2.schemas.len(), 1);
+    }
+
     #[test]
     fn encode_decode_pod_round_trip() {
         let original = vec![1u8, 2, 3, 4, 5];
@@ -2040,6 +2488,52 @@ mod tests {
         let mut decoded = vec![0u8; 5];
         assert_eq!(decode_field_value(&ReplicationEncoding::Pod, &buf, &mut decoded), ErrorCode::Ok);
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn encode_pod_raw_writes_bytes_directly() {
+        let value = 0xDEAD_BEEFu32.to_le_bytes();
+        let mut buf = [0u8; 8];
+        let n = unsafe { encode_pod_raw(&value, &mut buf) };
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..4], &value);
+        assert_eq!(&buf[4..], &[0u8; 4]);
+    }
+
+    #[test]
+    fn encode_pod_raw_into_exact_size_buffer() {
+        let value = [1u8, 2, 3];
+        let mut buf = [0u8; 3];
+        let n = unsafe { encode_pod_raw(&value, &mut buf) };
+        assert_eq!(n, 3);
+        assert_eq!(buf, value);
+    }
+
+    #[test]
+    fn apply_with_scratch_reuses_buffer_across_calls() {
+        let mut world = crate::World::new();
+        let e = world.spawn();
+        world.insert(e, 1.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let mut scratch = Vec::new();
+        for v in [1.0f32, 2.0, 3.0] {
+            let delta = Delta {
+                frame: 0, base_frame: 0,
+                spawned: vec![], despawned: vec![],
+                component_deltas: vec![ComponentDelta {
+                    entity: e, component_type: cid,
+                    field_data: vec![v.to_le_bytes().to_vec()],
+                }],
+                events: vec![],
+            };
+            assert_eq!(delta.apply_with_scratch(&mut world, &reg, &mut scratch), Ok(()));
+            assert_eq!(*world.get::<f32>(e).unwrap(), v);
+        }
     }
 
     #[test]
@@ -2353,6 +2847,79 @@ mod tests {
         assert_eq!(merged.component_deltas[0].field_data[0], vec![10]);
     }
 
+    // ── EntityCellMap ───────────────────────────────────────────────
+
+    #[test]
+    fn entity_cell_map_round_trips() {
+        let mut map = EntityCellMap::new();
+        let e = make_entity(3, 1);
+        map.insert(e, 2, 5);
+        assert_eq!(map.entity_at(2, 5), Some(e));
+        assert_eq!(map.cell_of(e), Some((2, 5)));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entity_cell_map_remove_clears_both_directions() {
+        let mut map = EntityCellMap::new();
+        let e = make_entity(0, 1);
+        map.insert(e, 1, 1);
+        map.remove(e);
+        assert_eq!(map.entity_at(1, 1), None);
+        assert_eq!(map.cell_of(e), None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn entity_cell_map_reinsert_moves_entity_and_frees_old_slot() {
+        let mut map = EntityCellMap::new();
+        let e = make_entity(0, 1);
+        map.insert(e, 0, 0);
+        map.insert(e, 3, 7); // entity moved to a new cell/row
+        assert_eq!(map.entity_at(0, 0), None, "old slot vacated");
+        assert_eq!(map.entity_at(3, 7), Some(e));
+        assert_eq!(map.cell_of(e), Some((3, 7)));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entity_cell_map_reinsert_slot_evicts_old_entity() {
+        let mut map = EntityCellMap::new();
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        map.insert(e1, 0, 0);
+        map.insert(e2, 0, 0); // e2 takes over e1's slot
+        assert_eq!(map.entity_at(0, 0), Some(e2));
+        assert_eq!(map.cell_of(e1), None, "e1 evicted from the map entirely");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn from_frustum_mapped_resolves_entities_via_map() {
+        let mut cell = SpatialCell::new(64).unwrap();
+        let h = cell
+            .alloc(crate::spatial::Aabb { min: [0.0; 3], max: [1.0; 3] })
+            .unwrap();
+        let row = cell.row_of(h).unwrap();
+
+        let mut map = EntityCellMap::new();
+        let e = make_entity(9, 1);
+        map.insert(e, 0, row);
+
+        let liveness = LivenessSnapshot::capture(cell.liveness(), cell.rows_in_use());
+        let frustum = crate::spatial::Frustum {
+            planes: [
+                [1.0, 0.0, 0.0, 10.0], [-1.0, 0.0, 0.0, 10.0],
+                [0.0, 1.0, 0.0, 10.0], [0.0, -1.0, 0.0, 10.0],
+                [0.0, 0.0, 1.0, 10.0], [0.0, 0.0, -1.0, 10.0],
+            ],
+        };
+        let mut scratch = crate::lease::Scratchpad::new();
+        let set = RelevanceSet::from_frustum_mapped(&[cell], &frustum, &liveness, &mut scratch, &map);
+        assert!(set.contains(e));
+        assert_eq!(set.len(), 1);
+    }
+
     // ── R4: Event / RPC channel ────────────────────────────────────────
 
     #[test]
@@ -2569,7 +3136,7 @@ mod tests {
     #[test]
     fn reconciler_push_and_clear() {
         let mut r = Reconciler::new();
-        let snap = Snapshot { frame: 10, entities: vec![] };
+        let snap = Snapshot { frame: 10, entities: vec![], cell_rows: vec![] };
         r.push_snapshot(snap);
         r.push_input(ClientInput {
             frame: 11, entity: make_entity(0, 1), component: ComponentId(1), field_data: vec![],
@@ -2589,7 +3156,7 @@ mod tests {
     fn reconciler_ring_buffer_drops_oldest() {
         let mut r = Reconciler::new();
         for i in 0..70u64 {
-            r.push_snapshot(Snapshot { frame: i, entities: vec![] });
+            r.push_snapshot(Snapshot { frame: i, entities: vec![], cell_rows: vec![] });
         }
         // Ring buffer capped at 64 — oldest 6 frames dropped.
         assert!(r.snapshots.len() <= 64);
@@ -2750,6 +3317,82 @@ mod tests {
             .iter()
             .any(|(cid, data)| *cid == f32_cid && data.iter().any(|d| !d.is_empty()));
         assert!(has_bytes, "snapshot should contain non-empty field data for f32 component");
+    }
+
+    // ── Snapshot capture/restore for SpatialCell ────────────────────
+
+    #[test]
+    fn capture_and_restore_cells_round_trip() {
+        let mut cell = crate::spatial::SpatialCell::with_transform(64).unwrap();
+        let h = cell.alloc(Aabb { min: [0.0; 3], max: [1.0; 3] }).unwrap();
+        let row = cell.row_of(h).unwrap() as usize;
+        cell.storage_mut().column_for_mut::<crate::spatial::InstanceInfo>().unwrap()[row] =
+            crate::spatial::InstanceInfo { mesh_index: 42, flags: 1 };
+
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<crate::spatial::InstanceInfo>();
+        let builder = reg.register::<crate::spatial::InstanceInfo>();
+        reg.insert(builder.field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let snap = Snapshot::capture_cells(&[cell], &reg, 1);
+        assert_eq!(snap.frame, 1);
+        assert_eq!(snap.cell_rows.len(), 1);
+        assert_eq!(snap.cell_rows[0].cell_index, 0);
+        assert!(snap.cell_rows[0].components.iter().any(|(c, _)| *c == cid));
+
+        let mut restored = vec![crate::spatial::SpatialCell::with_transform(64).unwrap()];
+        assert_eq!(snap.restore_to_cells(&mut restored, &reg), Ok(()));
+        assert_eq!(restored[0].rows_in_use(), 1);
+        let info = restored[0].storage().column_for::<crate::spatial::InstanceInfo>().unwrap()[0];
+        assert_eq!(info, crate::spatial::InstanceInfo { mesh_index: 42, flags: 1 });
+    }
+
+    #[test]
+    fn capture_cells_skips_dead_rows() {
+        let mut cell = crate::spatial::SpatialCell::with_transform(64).unwrap();
+        let ha = cell.alloc(Aabb { min: [0.0; 3], max: [1.0; 3] }).unwrap();
+        let _hb = cell.alloc(Aabb { min: [0.0; 3], max: [1.0; 3] }).unwrap();
+        cell.free(ha);
+
+        let mut reg = ReplicationRegistry::new();
+        let builder = reg.register::<crate::spatial::InstanceInfo>();
+        reg.insert(builder.field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
+
+        let snap = Snapshot::capture_cells(&[cell], &reg, 1);
+        assert_eq!(snap.cell_rows.len(), 1, "dead row excluded");
+    }
+
+    #[test]
+    fn restore_to_cells_rejects_out_of_range_cell_index() {
+        let snap = Snapshot {
+            frame: 0,
+            entities: vec![],
+            cell_rows: vec![CellRowSnapshot { cell_index: 5, components: vec![] }],
+        };
+        let reg = ReplicationRegistry::new();
+        let mut cells: Vec<crate::spatial::SpatialCell> = vec![];
+        assert_eq!(snap.restore_to_cells(&mut cells, &reg), Err(ErrorCode::InvalidData));
+    }
+
+    // ── Frame phase machine integration ─────────────────────────────
+
+    #[test]
+    fn cpu_simulate_witness_runs_tracked_and_advances_frame() {
+        let witness = CpuSimulateWitness::new();
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+
+        let delta = witness.run_tracked(&mut world, &mut tracker, |w, t| {
+            w.spawn_tracked(t);
+        });
+
+        assert_eq!(delta.frame, 0);
+        assert_eq!(delta.spawned.len(), 1);
+        // A second run_tracked call should observe the advanced frame
+        // counter and an emptied tracker.
+        let delta2 = witness.run_tracked(&mut world, &mut tracker, |_, _| {});
+        assert_eq!(delta2.frame, 1);
+        assert!(delta2.spawned.is_empty());
     }
 
     // ── Delta::apply ─────────────────────────────────────────────────
@@ -2950,4 +3593,190 @@ mod tests {
         assert_eq!(*client.get::<f32>(e).unwrap(), 7.0f32);
     }
 
+    // ── Fuzz / property tests ────────────────────────────────────────
+
+    #[test]
+    fn delta_round_trip_random() {
+        let mut rng = StdRng::seed_from_u64(0xD317A);
+        for _ in 0..100 {
+            let d = random_delta(&mut rng);
+            let bytes = d.to_bytes();
+            let d2 = Delta::from_bytes(&bytes).expect("round trip should decode");
+            assert_deltas_equal(&d, &d2);
+        }
+    }
+
+    #[test]
+    fn handshake_round_trip_random_schemas() {
+        // component_id() can't mint an arbitrary ComponentId out of thin
+        // air, so schemas are built directly (registry internals are
+        // visible within this module) with random ComponentIds and random
+        // field descriptors — the actual variability this test wants to
+        // exercise is the field-level encode/decode, not the id allocator.
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        for _ in 0..30 {
+            let mut reg = ReplicationRegistry::new();
+            let n_schemas = rng.gen_range(1..6);
+            let mut expected: Vec<ReplicationSchema> = Vec::new();
+            for _ in 0..n_schemas {
+                let component_type = ComponentId(rng.gen_range(1..1000));
+                let n_fields = rng.gen_range(0..8);
+                let fields = (0..n_fields)
+                    .map(|field_index| {
+                        let encoding = random_encoding(&mut rng);
+                        let condition = random_condition(&mut rng);
+                        let event_channel = if matches!(encoding, ReplicationEncoding::Event) {
+                            Some(if rng.gen_bool(0.5) { EventChannel::ReliableOrdered } else { EventChannel::Unreliable })
+                        } else {
+                            None
+                        };
+                        FieldDescriptor { field_index, encoding, condition, event_channel }
+                    })
+                    .collect();
+                let schema = ReplicationSchema { component_type, fields, column_factory: None };
+                reg.schemas.insert(component_type, schema.clone());
+                expected.push(schema);
+            }
+
+            let msg = reg.handshake_message();
+            let reg2 = ReplicationRegistry::from_handshake(&msg).expect("valid handshake");
+
+            assert_eq!(reg2.schemas.len(), expected.len());
+            for schema in &expected {
+                let s2 = reg2.schema(schema.component_type).expect("schema present after round trip");
+                assert_eq!(s2.fields.len(), schema.fields.len());
+                for (f1, f2) in schema.fields.iter().zip(s2.fields.iter()) {
+                    assert_eq!(f1.field_index, f2.field_index);
+                    assert_eq!(encoding_to_u8(&f1.encoding), encoding_to_u8(&f2.encoding));
+                    assert_eq!(f1.condition, f2.condition);
+                    assert_eq!(f1.event_channel, f2.event_channel);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trip_random_bytes() {
+        let mut rng = StdRng::seed_from_u64(0xFEED);
+        for _ in 0..200 {
+            let len = rng.gen_range(1..=16);
+            let original: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+
+            for encoding in [ReplicationEncoding::Pod, ReplicationEncoding::Serialized, ReplicationEncoding::GpuHandle] {
+                let mut buf = Vec::new();
+                assert_eq!(encode_field_value(&encoding, &original, &mut buf), ErrorCode::Ok);
+                let mut decoded = vec![0u8; original.len()];
+                assert_eq!(decode_field_value(&encoding, &buf, &mut decoded), ErrorCode::Ok);
+                assert_eq!(decoded, original, "encoding {encoding:?} round trip");
+            }
+
+            // DeltaCompressed only preserves the first 8 bytes (see
+            // `encode_field_value`'s doc) — compare against that window.
+            let mut buf = Vec::new();
+            assert_eq!(
+                encode_field_value(&ReplicationEncoding::DeltaCompressed, &original, &mut buf),
+                ErrorCode::Ok
+            );
+            let width = original.len().min(8);
+            let mut decoded = vec![0u8; width];
+            assert_eq!(decode_field_value(&ReplicationEncoding::DeltaCompressed, &buf, &mut decoded), ErrorCode::Ok);
+            if original.len() >= 8 {
+                assert_eq!(decoded, original[..8]);
+            } else {
+                assert_eq!(decoded, original);
+            }
+
+            // Opaque: `decode` here is a raw memcpy from `data`, so it
+            // round-trips any random payload regardless of length —
+            // `encode`/`encode_size` aren't exercised on this path since
+            // `decode_field_value` only calls `decode`.
+            let opaque = ReplicationEncoding::Opaque {
+                encode_size: |_| 0,
+                encode: |_, _| ErrorCode::Ok,
+                decode: |data, dst| unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
+                    ErrorCode::Ok
+                },
+            };
+            let mut decoded_opaque = vec![0u8; original.len()];
+            let code = decode_field_value(&opaque, &original, &mut decoded_opaque);
+            assert_eq!(code, ErrorCode::Ok);
+            assert_eq!(decoded_opaque, original, "Opaque decode is a raw memcpy from `data`");
+        }
+    }
+
+    #[test]
+    fn relevance_set_filter_matches_manual_condition_evaluation_random() {
+        let mut rng = StdRng::seed_from_u64(0xABCD);
+        for _ in 0..200 {
+            let entity = random_entity(&mut rng);
+            let in_set = rng.gen_bool(0.5);
+            let mut set = RelevanceSet::new();
+            if in_set {
+                set.add(entity);
+            }
+
+            let owner = match rng.gen_range(0..3) {
+                0 => Ownership::Server,
+                1 => Ownership::Client(ClientId(rng.gen_range(0..5))),
+                _ => Ownership::Shared,
+            };
+            let mut authority = AuthorityTable::new();
+            authority.set_entity_owner(entity, owner);
+
+            let client = ClientId(rng.gen_range(0..5));
+
+            let cid = ComponentId(1);
+            let n_fields = rng.gen_range(0..5);
+            let conditions: Vec<ReplicationCondition> = (0..n_fields).map(|_| random_condition(&mut rng)).collect();
+            let schema_fields = conditions
+                .iter()
+                .enumerate()
+                .map(|(i, &condition)| FieldDescriptor {
+                    field_index: i as u32,
+                    encoding: ReplicationEncoding::Pod,
+                    condition,
+                    event_channel: None,
+                })
+                .collect();
+
+            let mut reg = ReplicationRegistry::new();
+            reg.schemas.insert(cid, ReplicationSchema { component_type: cid, fields: schema_fields, column_factory: None });
+
+            let delta = Delta {
+                frame: 0, base_frame: 0,
+                spawned: vec![], despawned: vec![],
+                component_deltas: vec![ComponentDelta {
+                    entity,
+                    component_type: cid,
+                    field_data: vec![vec![1]; n_fields],
+                }],
+                events: vec![],
+            };
+
+            let view = set.filter(&delta, &authority, &reg, client);
+            let expected = in_set && conditions.iter().all(|c| condition_passes(c, &owner, &client));
+            assert_eq!(
+                !view.component_deltas.is_empty(),
+                expected,
+                "in_set={in_set} owner={owner:?} client={client:?} conditions={conditions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_conflict_is_deterministic_random() {
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let at = AuthorityTable::new();
+        for _ in 0..50 {
+            let a = random_delta(&mut rng);
+            let b = random_delta(&mut rng);
+            let ca = ClientId(rng.gen_range(0..10));
+            let cb = ClientId(rng.gen_range(0..10));
+
+            let r1 = AuthorityTable::resolve_conflict(&at, &a, ca, &b, cb);
+            let r2 = AuthorityTable::resolve_conflict(&at, &a, ca, &b, cb);
+            assert_deltas_equal(&r1, &r2);
+        }
+    }
 }

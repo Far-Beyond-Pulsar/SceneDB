@@ -29,3 +29,48 @@ fn replicate_derive_registers_schema() {
     assert!(matches!(schema.fields[2].encoding, ReplicationEncoding::Event));
     assert_eq!(schema.fields[2].event_channel, Some(EventChannel::ReliableOrdered));
 }
+
+#[derive(Replicate)]
+struct EventChannelOverride {
+    #[replicate(encoding = Event, condition = Multicast, event_channel = Unreliable)]
+    on_ping: u32,
+}
+
+#[test]
+fn replicate_derive_event_channel_override() {
+    let mut registry = ReplicationRegistry::new();
+    EventChannelOverride::register_replication(&mut registry);
+
+    let cid = component_id::<EventChannelOverride>();
+    let schema = registry.schema(cid).unwrap();
+    assert_eq!(schema.fields.len(), 1);
+    assert!(matches!(schema.fields[0].encoding, ReplicationEncoding::Event));
+    assert_eq!(schema.fields[0].condition, ReplicationCondition::Multicast);
+    assert_eq!(schema.fields[0].event_channel, Some(EventChannel::Unreliable));
+}
+
+#[derive(Replicate)]
+struct GenericComp<T: pulsar_scenedb::Component> {
+    #[replicate(encoding = Pod, condition = Always)]
+    tag: u32,
+    _marker: std::marker::PhantomData<T>,
+}
+
+#[test]
+fn replicate_derive_supports_type_generics() {
+    let mut registry = ReplicationRegistry::new();
+    GenericComp::<u64>::register_replication(&mut registry);
+
+    let cid = component_id::<GenericComp<u64>>();
+    let schema = registry.schema(cid).unwrap();
+    assert_eq!(schema.fields.len(), 1);
+    assert!(matches!(schema.fields[0].encoding, ReplicationEncoding::Pod));
+
+    // A different instantiation of the same generic struct is a distinct
+    // component type with its own schema slot.
+    let mut registry2 = ReplicationRegistry::new();
+    GenericComp::<i8>::register_replication(&mut registry2);
+    let cid2 = component_id::<GenericComp<i8>>();
+    assert_ne!(cid, cid2);
+    assert!(registry2.schema(cid2).is_some());
+}

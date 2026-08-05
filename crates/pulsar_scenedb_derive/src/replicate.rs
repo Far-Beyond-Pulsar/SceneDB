@@ -5,18 +5,45 @@ use syn::{
     DeriveInput, Ident, Token,
 };
 
+/// Known `ReplicationEncoding` variant names the derive can emit directly.
+/// `Opaque` is deliberately excluded — see [`ReplicateAttr::parse`]'s check.
+const VALID_ENCODINGS: &[&str] = &["Pod", "Serialized", "GpuHandle", "DeltaCompressed", "Event"];
+
+/// Known `ReplicationCondition` variant names.
+const VALID_CONDITIONS: &[&str] = &[
+    "Always", "OwnerOnly", "SkipOwner", "SimulatedOnly", "AutonomousOnly", "InitialOnly",
+    "ServerAuthority", "ClientAuthority", "ServerToClient", "ClientToServer", "Multicast",
+];
+
+/// Known `EventChannel` variant names.
+const VALID_EVENT_CHANNELS: &[&str] = &["ReliableOrdered", "Unreliable"];
+
+fn unknown_value_error(span: proc_macro2::Span, kind: &str, value: &Ident, valid: &[&str]) -> syn::Error {
+    syn::Error::new(
+        span,
+        format!(
+            "unknown replication {kind} `{value}` — expected one of: {}",
+            valid.join(", "),
+        ),
+    )
+}
+
 /// Parsed `#[replicate(encoding = Pod, condition = Always)]` on a field.
 struct ReplicateAttr {
-    encoding: String,
-    condition: String,
+    encoding: Ident,
+    condition: Ident,
     is_event: bool,
+    /// `#[replicate(event_channel = Unreliable)]` — only meaningful (and
+    /// only accepted) alongside `encoding = Event`; overrides the default
+    /// `ReliableOrdered`.
+    event_channel: Option<Ident>,
 }
 
 impl Parse for ReplicateAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut encoding = String::from("Pod");
-        let mut condition = String::from("Always");
-        let mut is_event = false;
+        let mut encoding: Option<Ident> = None;
+        let mut condition: Option<Ident> = None;
+        let mut event_channel: Option<Ident> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -26,14 +53,41 @@ impl Parse for ReplicateAttr {
 
             match key.to_string().as_str() {
                 "encoding" => {
-                    if val_str == "Event" {
-                        is_event = true;
+                    if val_str == "Opaque" {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            "`Opaque` encoding cannot be derived — it requires custom encode/decode \
+                             fn pointers supplied at registration time. Register this field manually \
+                             via `ReplicationRegistry::register::<T>()` and `SchemaBuilder::field(..., \
+                             ReplicationEncoding::Opaque { encode_size, encode, decode }, ...)` instead \
+                             of `#[derive(Replicate)]`.",
+                        ));
                     }
-                    encoding = val_str;
+                    if !VALID_ENCODINGS.contains(&val_str.as_str()) {
+                        return Err(unknown_value_error(value.span(), "encoding", &value, VALID_ENCODINGS));
+                    }
+                    encoding = Some(value);
                 }
-                "condition" => condition = val_str,
-                _ => {
-                    return Err(syn::Error::new(key.span(), "expected encoding or condition"));
+                "condition" => {
+                    if !VALID_CONDITIONS.contains(&val_str.as_str()) {
+                        return Err(unknown_value_error(value.span(), "condition", &value, VALID_CONDITIONS));
+                    }
+                    condition = Some(value);
+                }
+                "event_channel" => {
+                    if !VALID_EVENT_CHANNELS.contains(&val_str.as_str()) {
+                        return Err(unknown_value_error(value.span(), "event channel", &value, VALID_EVENT_CHANNELS));
+                    }
+                    event_channel = Some(value);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `#[replicate(...)]` key `{other}` — expected `encoding`, \
+                             `condition`, or `event_channel`",
+                        ),
+                    ));
                 }
             }
 
@@ -42,15 +96,29 @@ impl Parse for ReplicateAttr {
             }
         }
 
-        Ok(ReplicateAttr { encoding, condition, is_event })
+        let encoding = encoding.unwrap_or_else(|| Ident::new("Pod", proc_macro2::Span::call_site()));
+        let condition = condition.unwrap_or_else(|| Ident::new("Always", proc_macro2::Span::call_site()));
+        let is_event = encoding == "Event";
+
+        if !is_event {
+            if let Some(ch) = &event_channel {
+                return Err(syn::Error::new(
+                    ch.span(),
+                    "`event_channel` is only valid alongside `encoding = Event`",
+                ));
+            }
+        }
+
+        Ok(ReplicateAttr { encoding, condition, is_event, event_channel })
     }
 }
 
 struct FieldInfo {
     ident: Ident,
-    encoding: String,
-    condition: String,
+    encoding: Ident,
+    condition: Ident,
     is_event: bool,
+    event_channel: Option<Ident>,
 }
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -71,20 +139,26 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             Some(i) => i.clone(),
             None => continue,
         };
-        let mut encoding = String::from("Pod");
-        let mut condition = String::from("Always");
-        let mut is_event = false;
 
+        // Fields without an explicit `#[replicate(...)]` attribute are not
+        // replicated — annotation is opt-in, so e.g. a `PhantomData<T>`
+        // marker field or a purely-local cache field doesn't silently pick
+        // up `Pod`/`Always` defaults just for existing on the struct.
+        let mut parsed: Option<ReplicateAttr> = None;
         for attr in &field.attrs {
             if attr.path().is_ident("replicate") {
-                let parsed: ReplicateAttr = attr.parse_args()?;
-                encoding = parsed.encoding;
-                condition = parsed.condition;
-                is_event = parsed.is_event;
+                parsed = Some(attr.parse_args()?);
             }
         }
+        let Some(parsed) = parsed else { continue };
 
-        field_infos.push(FieldInfo { ident, encoding, condition, is_event });
+        field_infos.push(FieldInfo {
+            ident,
+            encoding: parsed.encoding,
+            condition: parsed.condition,
+            is_event: parsed.is_event,
+            event_channel: parsed.event_channel,
+        });
     }
 
     if field_infos.is_empty() {
@@ -95,12 +169,16 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
-            let encoding_ident = Ident::new(&f.encoding, f.ident.span());
-            let condition_ident = Ident::new(&f.condition, f.ident.span());
+            let encoding_ident = &f.encoding;
+            let condition_ident = &f.condition;
 
             if f.is_event {
+                let channel_ident = f
+                    .event_channel
+                    .clone()
+                    .unwrap_or_else(|| Ident::new("ReliableOrdered", f.ident.span()));
                 quote! {
-                    .event(#field_name, ::pulsar_scenedb::ReplicationCondition::#condition_ident, ::pulsar_scenedb::EventChannel::ReliableOrdered)
+                    .event(#field_name, ::pulsar_scenedb::ReplicationCondition::#condition_ident, ::pulsar_scenedb::EventChannel::#channel_ident)
                 }
             } else {
                 quote! {

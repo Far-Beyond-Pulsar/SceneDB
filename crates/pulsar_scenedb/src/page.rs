@@ -471,6 +471,15 @@ impl Page {
         unsafe { std::slice::from_raw_parts(self.column_ptr(col), byte_len) }
     }
 
+    /// Mutable counterpart to [`Self::column_raw_bytes`] — for restoring a
+    /// replicated snapshot's bytes directly into column memory
+    /// (`crate::replication::Snapshot::restore_to_cells`).
+    pub(crate) fn column_raw_bytes_mut(&mut self, col: usize, rows: u32) -> &mut [u8] {
+        let desc = self.layout.column_descs[col];
+        let byte_len = desc.size as usize * rows as usize;
+        unsafe { std::slice::from_raw_parts_mut(self.column_ptr_mut(col), byte_len) }
+    }
+
     /// Validates the column's element size matches `T` and returns the slice length.
     #[inline]
     fn assert_column<T>(&self, col: usize) -> usize {

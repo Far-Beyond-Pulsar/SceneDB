@@ -245,7 +245,34 @@ impl CompactedPhase {
 ///     store.write_transform(id, cell, h, &[0.0; 16], sim); // SimulateA is a SimulateWitness
 /// }
 /// ```
-pub trait SimulateWitness: private::Sealed {}
+pub trait SimulateWitness: private::Sealed {
+    /// Run a simulate phase with change tracking, gated on holding this
+    /// witness. Returns the [`crate::replication::Delta`] captured at the
+    /// Simulate→Harvest boundary via
+    /// [`crate::replication::ChangeTracker::drain_with_world`].
+    ///
+    /// The GPU-phase-machine counterpart to
+    /// [`crate::replication::CpuSimulateWitness::run_tracked`] — same
+    /// contract, gated on `SimulateA`/`SimulateB` instead of being always
+    /// available. Sealed like the rest of this trait: only this crate's two
+    /// simulate sub-phases can call it, so replication draining is tied to
+    /// the same compile-time-ordered mutation window as `write_transform`/
+    /// `free_deferred`.
+    fn run_tracked<F>(
+        &self,
+        world: &mut crate::World,
+        tracker: &mut crate::replication::ChangeTracker,
+        systems: F,
+    ) -> crate::replication::Delta
+    where
+        F: FnOnce(&mut crate::World, &mut crate::replication::ChangeTracker),
+    {
+        systems(world, tracker);
+        let delta = tracker.drain_with_world(world);
+        tracker.end_frame();
+        delta
+    }
+}
 impl SimulateWitness for SimulateA {}
 impl SimulateWitness for SimulateB {}
 
@@ -253,4 +280,23 @@ mod private {
     pub trait Sealed {}
     impl Sealed for super::SimulateA {}
     impl Sealed for super::SimulateB {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulate_witness_run_tracked_drains_at_boundary() {
+        let mut driver = FrameDriver::new();
+        let sim_a = driver.begin();
+        let mut world = crate::World::new();
+        let mut tracker = crate::replication::ChangeTracker::new();
+
+        let delta = sim_a.run_tracked(&mut world, &mut tracker, |w, t| {
+            w.spawn_tracked(t);
+        });
+        assert_eq!(delta.spawned.len(), 1);
+        assert_eq!(delta.frame, 0);
+    }
 }
