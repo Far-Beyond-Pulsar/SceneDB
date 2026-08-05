@@ -1,0 +1,188 @@
+//! Real-socket transport integration tests (HARDENING plan Phase C).
+//!
+//! Every other replication test exchanges bytes in-process — this file is
+//! the one place that actually puts `Delta`/handshake bytes through a real
+//! `std::net::TcpStream` loopback connection across two threads, subject to
+//! TCP's genuine partial-read/partial-write and connection-teardown
+//! behavior, which an in-process `Vec<u8>` round trip cannot exercise.
+//!
+//! Run with: `cargo test -p pulsar_scenedb --test replication_transport`.
+
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+use pulsar_scenedb::*;
+use pulsar_scenedb_derive::Replicate;
+
+#[derive(Replicate, Default)]
+struct Position {
+    #[replicate(encoding = Pod, condition = Always)]
+    xyz: [f32; 3],
+}
+
+// ── Length-prefixed framing over a raw stream ───────────────────────────
+//
+// TCP is a byte stream, not a message stream — a real transport has to
+// impose its own framing. This is the simplest possible one (u32 LE
+// length prefix + payload), used here purely to exercise partial reads.
+
+fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    stream.write_all(bytes)?;
+    stream.flush()
+}
+
+/// Like `Read::read_exact`, but distinguishes a clean EOF *before* any byte
+/// of the read is available (`Ok(false)` — the peer hung up between
+/// frames, expected) from an EOF *partway through* (`Err` — a truncated
+/// frame, never silently accepted as a short read).
+fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<bool> {
+    let mut read = 0;
+    while read < buf.len() {
+        match stream.read(&mut buf[read..]) {
+            Ok(0) if read == 0 => return Ok(false),
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame")),
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    if !read_exact_or_eof(stream, &mut len_buf)? {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    // A real transport would cap this against a max-frame-size constant to
+    // avoid a hostile length prefix triggering a multi-GB allocation; kept
+    // simple here since the hostile-peer test below targets truncation, not
+    // an oversized length claim.
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
+// ── Happy path: handshake + Delta round trip over a real socket ────────
+
+#[test]
+fn handshake_and_delta_round_trip_over_real_tcp_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+
+        let mut registry = ReplicationRegistry::new();
+        Position::register_replication(&mut registry);
+        write_frame(&mut stream, &registry.handshake_message())?;
+
+        // Build one real Delta the way an actual server would: spawn an
+        // entity, insert a component, drain with real archetype info.
+        let mut world = World::new();
+        let mut tracker = ChangeTracker::new();
+        let e = world.spawn_tracked(&mut tracker);
+        world.insert(e, Position { xyz: [1.0, 2.0, 3.0] });
+        let mut delta = tracker.drain_with_world(&world);
+        // `insert` (untracked-value capture path) doesn't record field
+        // bytes for a freshly-migrated column — see `World::insert`'s doc —
+        // so patch the real value in exactly like a real caller would after
+        // reading it back, mirroring `full_round_trip_drain_wire_apply` in
+        // replication.rs's own test suite.
+        let cid = component_id::<Position>();
+        let mut xyz_bytes = Vec::new();
+        world.get::<Position>(e).unwrap().xyz.replicate_encode(&mut xyz_bytes);
+        delta.component_deltas.push(ComponentDelta {
+            entity: e,
+            component_type: cid,
+            field_data: vec![xyz_bytes],
+        });
+
+        write_frame(&mut stream, &delta.to_bytes())?;
+        Ok(())
+    });
+
+    let mut client_stream = TcpStream::connect(addr).expect("connect to loopback listener");
+
+    // The handshake bytes only carry field *layout* (encoding/condition),
+    // never Rust types or closures — see `RowOps`'s doc — so a real peer
+    // uses them to check protocol compatibility, not to reconstruct a
+    // working registry. The client registers `Position` locally too (both
+    // peers compile the same component types); that local registration is
+    // what actually applies the incoming delta below.
+    let handshake_bytes = read_frame(&mut client_stream)
+        .expect("read handshake frame")
+        .expect("server sent a handshake");
+    let handshake_registry = ReplicationRegistry::from_handshake(&handshake_bytes).expect("valid handshake");
+    let mut registry = ReplicationRegistry::new();
+    Position::register_replication(&mut registry);
+    assert_eq!(
+        handshake_registry.schema(component_id::<Position>()).unwrap().fields.len(),
+        registry.schema(component_id::<Position>()).unwrap().fields.len(),
+        "handshake and local schema must agree on field layout",
+    );
+
+    let delta_bytes = read_frame(&mut client_stream)
+        .expect("read delta frame")
+        .expect("server sent a delta");
+    let delta = Delta::from_bytes(&delta_bytes).expect("valid delta");
+
+    let mut client_world = World::new();
+    assert_eq!(delta.apply(&mut client_world, &registry), Ok(()));
+
+    assert_eq!(delta.spawned.len(), 1);
+    let e = delta.spawned[0].0;
+    assert!(client_world.is_alive(e));
+    assert_eq!(client_world.get::<Position>(e).unwrap().xyz, [1.0, 2.0, 3.0]);
+
+    server.join().expect("server thread panicked").expect("server I/O failed");
+}
+
+// ── Hostile peer: truncated frames must error cleanly, never hang/panic ─
+
+#[test]
+fn truncated_frame_over_real_socket_errors_cleanly_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Claim a 1000-byte frame, then send only 10 bytes and disconnect —
+        // a corrupted/hostile or simply crashed peer's traffic shape.
+        stream.write_all(&1000u32.to_le_bytes()).unwrap();
+        stream.write_all(&[0u8; 10]).unwrap();
+        stream.flush().unwrap();
+        // Dropping `stream` here closes the connection, delivering EOF to
+        // the client mid-frame.
+    });
+
+    let mut client_stream = TcpStream::connect(addr).expect("connect to loopback listener");
+    let result = read_frame(&mut client_stream);
+    assert!(result.is_err(), "a truncated frame must be a clean I/O error, not a hang or a short read accepted as valid");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn garbage_handshake_bytes_over_real_socket_are_rejected_not_panicked() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // A well-formed frame, but its payload is NOT a valid handshake
+        // message (random bytes) — the framing layer succeeds; the
+        // application-level parser must be the one to reject it.
+        write_frame(&mut stream, &[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]).unwrap();
+    });
+
+    let mut client_stream = TcpStream::connect(addr).expect("connect to loopback listener");
+    let bytes = read_frame(&mut client_stream).unwrap().expect("frame delivered");
+    let result = ReplicationRegistry::from_handshake(&bytes);
+    assert!(result.is_err(), "garbage handshake bytes must be rejected, not panic or produce a bogus registry");
+
+    server.join().expect("server thread panicked");
+}
