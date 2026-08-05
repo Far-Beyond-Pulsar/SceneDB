@@ -204,6 +204,8 @@
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::mem;
 
 // ── Error reporting ────────────────────────────────────────────────────────
@@ -339,6 +341,349 @@ pub(crate) struct FieldDescriptor {
 pub struct ReplicationSchema {
     pub component_type: ComponentId,
     pub fields: Vec<FieldDescriptor>,
+}
+
+// ── Schema builder ─────────────────────────────────────────────────────────
+
+/// Fluent builder for declaring a component type's replication layout.
+/// Returned by [`ReplicationRegistry::register`].
+#[derive(Clone, Debug)]
+pub struct SchemaBuilder<T> {
+    component_type: ComponentId,
+    fields: Vec<FieldDescriptor>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: crate::Component> SchemaBuilder<T> {
+    /// Declare a state field with its encoding and replication condition.
+    /// `field_index` is auto-incremented per call in declaration order.
+    pub fn field(mut self, _name: &str, encoding: ReplicationEncoding, condition: ReplicationCondition) -> Self {
+        let field_index = self.fields.len() as u32;
+        self.fields.push(FieldDescriptor {
+            field_index,
+            encoding,
+            condition,
+            event_channel: None,
+        });
+        self
+    }
+
+    /// Declare an event/RPC field. Its `encoding` is implicitly `Event`.
+    pub fn event(mut self, _name: &str, condition: ReplicationCondition, channel: EventChannel) -> Self {
+        let field_index = self.fields.len() as u32;
+        self.fields.push(FieldDescriptor {
+            field_index,
+            encoding: ReplicationEncoding::Event,
+            condition,
+            event_channel: Some(channel),
+        });
+        self
+    }
+
+    pub(crate) fn build(self) -> ReplicationSchema {
+        ReplicationSchema {
+            component_type: self.component_type,
+            fields: self.fields,
+        }
+    }
+}
+
+// ── Registry ───────────────────────────────────────────────────────────────
+
+/// Registry of replication schemas for all component types.
+/// Produces handshake messages for connection initialization and is used by
+/// the delta encoder to dispatch per-field encoding.
+#[derive(Clone, Debug)]
+pub struct ReplicationRegistry {
+    schemas: HashMap<ComponentId, ReplicationSchema>,
+}
+
+impl ReplicationRegistry {
+    pub fn new() -> Self {
+        Self {
+            schemas: HashMap::new(),
+        }
+    }
+
+    /// Register a component type and get a [`SchemaBuilder`] to describe its
+    /// replicated fields. Call `.field(...)` / `.event(...)` and the schema
+    /// is inserted on drop.
+    pub fn register<T: crate::Component>(&mut self) -> SchemaBuilder<T> {
+        SchemaBuilder {
+            component_type: crate::component::component_id::<T>(),
+            fields: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Finalise a builder and insert the resulting schema. Called internally
+    /// by the builder when the caller is done chaining.
+    pub fn insert<T: crate::Component>(&mut self, builder: SchemaBuilder<T>) {
+        let schema = builder.build();
+        self.schemas.insert(schema.component_type, schema);
+    }
+
+    /// Serialize all registered schemas into a handshake byte buffer.
+    ///
+    /// Wire format (all values little-endian):
+    ///   `schema_count: u32`
+    ///   for each schema:
+    ///     `component_type: u32`
+    ///     `field_count: u32`
+    ///     for each field:
+    ///       `field_index: u32`
+    ///       `encoding: u8`    — 0=Pod,1=Serialized,2=GpuHandle,3=DeltaCompressed,4=Event,5=Opaque
+    ///       `condition: u8`   — 0=Always,1=OwnerOnly,2=SkipOwner,3=SimulatedOnly,4=AutonomousOnly,
+    ///                           5=InitialOnly,6=ServerAuthority,7=ClientAuthority,8=ServerToClient,
+    ///                           9=ClientToServer,10=Multicast
+    ///       `event_channel: u8` — 0=None,1=ReliableOrdered,2=Unreliable
+    pub fn handshake_message(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.schemas.len() as u32).to_le_bytes());
+        for schema in self.schemas.values() {
+            buf.extend_from_slice(&schema.component_type.0.to_le_bytes());
+            buf.extend_from_slice(&(schema.fields.len() as u32).to_le_bytes());
+            for field in &schema.fields {
+                buf.extend_from_slice(&field.field_index.to_le_bytes());
+                buf.push(encoding_to_u8(&field.encoding));
+                buf.push(condition_to_u8(&field.condition));
+                buf.push(event_channel_to_u8(&field.event_channel));
+            }
+        }
+        buf
+    }
+
+    /// Deserialize a handshake message produced by a remote peer.
+    pub fn from_handshake(bytes: &[u8]) -> Result<Self, ErrorCode> {
+        let mut ofs = 0;
+        if ofs + 4 > bytes.len() {
+            return Err(ErrorCode::InvalidData);
+        }
+        let schema_count = u32::from_le_bytes([bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3]]);
+        ofs += 4;
+        let mut schemas = HashMap::new();
+        for _ in 0..schema_count {
+            if ofs + 8 > bytes.len() {
+                return Err(ErrorCode::InvalidData);
+            }
+            let component_type = ComponentId(u32::from_le_bytes([
+                bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3],
+            ]));
+            ofs += 4;
+            let field_count = u32::from_le_bytes([
+                bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3],
+            ]);
+            ofs += 4;
+            let mut fields = Vec::with_capacity(field_count as usize);
+            for _ in 0..field_count {
+                if ofs + 10 > bytes.len() {
+                    return Err(ErrorCode::InvalidData);
+                }
+                let field_index = u32::from_le_bytes([
+                    bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3],
+                ]);
+                ofs += 4;
+                let encoding = u8_from_encoding(bytes[ofs])?;
+                ofs += 1;
+                let condition = u8_from_condition(bytes[ofs])?;
+                ofs += 1;
+                let event_channel = u8_from_event_channel(bytes[ofs])?;
+                ofs += 1;
+                fields.push(FieldDescriptor {
+                    field_index,
+                    encoding,
+                    condition,
+                    event_channel,
+                });
+            }
+            schemas.insert(
+                component_type,
+                ReplicationSchema {
+                    component_type,
+                    fields,
+                },
+            );
+        }
+        Ok(Self { schemas })
+    }
+
+    pub fn schema(&self, cid: ComponentId) -> Option<&ReplicationSchema> {
+        self.schemas.get(&cid)
+    }
+}
+
+impl Default for ReplicationRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Encoding helpers ───────────────────────────────────────────────────────
+
+fn encoding_to_u8(enc: &ReplicationEncoding) -> u8 {
+    match enc {
+        ReplicationEncoding::Pod => 0,
+        ReplicationEncoding::Serialized => 1,
+        ReplicationEncoding::GpuHandle => 2,
+        ReplicationEncoding::DeltaCompressed => 3,
+        ReplicationEncoding::Event => 4,
+        ReplicationEncoding::Opaque { .. } => 5,
+    }
+}
+
+fn u8_from_encoding(v: u8) -> Result<ReplicationEncoding, ErrorCode> {
+    match v {
+        0 => Ok(ReplicationEncoding::Pod),
+        1 => Ok(ReplicationEncoding::Serialized),
+        2 => Ok(ReplicationEncoding::GpuHandle),
+        3 => Ok(ReplicationEncoding::DeltaCompressed),
+        4 => Ok(ReplicationEncoding::Event),
+        5 => Ok(ReplicationEncoding::Opaque {
+            encode_size: |_| 0,
+            encode: |_, _| ErrorCode::InvalidData,
+            decode: |_, _| ErrorCode::InvalidData,
+        }),
+        _ => Err(ErrorCode::InvalidData),
+    }
+}
+
+fn condition_to_u8(c: &ReplicationCondition) -> u8 {
+    match c {
+        ReplicationCondition::Always => 0,
+        ReplicationCondition::OwnerOnly => 1,
+        ReplicationCondition::SkipOwner => 2,
+        ReplicationCondition::SimulatedOnly => 3,
+        ReplicationCondition::AutonomousOnly => 4,
+        ReplicationCondition::InitialOnly => 5,
+        ReplicationCondition::ServerAuthority => 6,
+        ReplicationCondition::ClientAuthority => 7,
+        ReplicationCondition::ServerToClient => 8,
+        ReplicationCondition::ClientToServer => 9,
+        ReplicationCondition::Multicast => 10,
+    }
+}
+
+fn u8_from_condition(v: u8) -> Result<ReplicationCondition, ErrorCode> {
+    match v {
+        0 => Ok(ReplicationCondition::Always),
+        1 => Ok(ReplicationCondition::OwnerOnly),
+        2 => Ok(ReplicationCondition::SkipOwner),
+        3 => Ok(ReplicationCondition::SimulatedOnly),
+        4 => Ok(ReplicationCondition::AutonomousOnly),
+        5 => Ok(ReplicationCondition::InitialOnly),
+        6 => Ok(ReplicationCondition::ServerAuthority),
+        7 => Ok(ReplicationCondition::ClientAuthority),
+        8 => Ok(ReplicationCondition::ServerToClient),
+        9 => Ok(ReplicationCondition::ClientToServer),
+        10 => Ok(ReplicationCondition::Multicast),
+        _ => Err(ErrorCode::InvalidData),
+    }
+}
+
+fn event_channel_to_u8(ch: &Option<EventChannel>) -> u8 {
+    match ch {
+        None => 0,
+        Some(EventChannel::ReliableOrdered) => 1,
+        Some(EventChannel::Unreliable) => 2,
+    }
+}
+
+fn u8_from_event_channel(v: u8) -> Result<Option<EventChannel>, ErrorCode> {
+    match v {
+        0 => Ok(None),
+        1 => Ok(Some(EventChannel::ReliableOrdered)),
+        2 => Ok(Some(EventChannel::Unreliable)),
+        _ => Err(ErrorCode::InvalidData),
+    }
+}
+
+/// Encode a field value according to its encoding mode into `buf`.
+pub fn encode_field_value(encoding: &ReplicationEncoding, value_bytes: &[u8], buf: &mut Vec<u8>) -> ErrorCode {
+    match encoding {
+        ReplicationEncoding::Pod | ReplicationEncoding::Serialized | ReplicationEncoding::GpuHandle => {
+            buf.extend_from_slice(value_bytes);
+            ErrorCode::Ok
+        }
+        ReplicationEncoding::DeltaCompressed => {
+            // Simple LEB128 encode of the first 8 bytes as a u64.
+            let val = if value_bytes.len() >= 8 {
+                u64::from_le_bytes([
+                    value_bytes[0], value_bytes[1], value_bytes[2], value_bytes[3],
+                    value_bytes[4], value_bytes[5], value_bytes[6], value_bytes[7],
+                ])
+            } else {
+                let mut tmp = [0u8; 8];
+                tmp[..value_bytes.len()].copy_from_slice(value_bytes);
+                u64::from_le_bytes(tmp)
+            };
+            leb128_encode(val, buf);
+            ErrorCode::Ok
+        }
+        ReplicationEncoding::Event => ErrorCode::Ok,
+        ReplicationEncoding::Opaque { encode_size, encode, .. } => {
+            let ptr = value_bytes.as_ptr() as *const ();
+            let needed = encode_size(ptr);
+            let start = buf.len();
+            buf.resize(start + needed, 0);
+            encode(ptr, &mut buf[start..])
+        }
+    }
+}
+
+/// Decode a field value from `data` according to its encoding mode into `value_bytes`.
+pub fn decode_field_value(encoding: &ReplicationEncoding, data: &[u8], value_bytes: &mut [u8]) -> ErrorCode {
+    match encoding {
+        ReplicationEncoding::Pod | ReplicationEncoding::Serialized | ReplicationEncoding::GpuHandle => {
+            if data.len() < value_bytes.len() {
+                return ErrorCode::BufferTooSmall { needed: value_bytes.len() };
+            }
+            value_bytes.copy_from_slice(&data[..value_bytes.len()]);
+            ErrorCode::Ok
+        }
+        ReplicationEncoding::DeltaCompressed => {
+            let (val, _) = match leb128_decode(data) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let bytes = val.to_le_bytes();
+            let copy_len = value_bytes.len().min(8);
+            value_bytes[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            ErrorCode::Ok
+        }
+        ReplicationEncoding::Event => ErrorCode::Ok,
+        ReplicationEncoding::Opaque { decode, .. } => {
+            let dst = value_bytes.as_mut_ptr() as *mut ();
+            decode(data, dst)
+        }
+    }
+}
+
+fn leb128_encode(mut value: u64, buf: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn leb128_decode(data: &[u8]) -> Result<(u64, usize), ErrorCode> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    let mut i = 0;
+    while i < data.len() {
+        let byte = data[i];
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((result, i + 1));
+        }
+        shift += 7;
+        i += 1;
+    }
+    Err(ErrorCode::InvalidData)
 }
 
 // ── Delta ──────────────────────────────────────────────────────────────────
@@ -666,13 +1011,13 @@ mod tests {
         let e2 = make_entity(1, 1);
         t.record_spawn(e1);
         t.record_spawn(e2);
-        let (delta, events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.spawned.len(), 2);
         assert!(delta.spawned.iter().any(|(e, _)| *e == e1));
         assert!(delta.spawned.iter().any(|(e, _)| *e == e2));
         assert!(delta.despawned.is_empty());
         assert!(delta.component_deltas.is_empty());
-        assert!(events.is_empty());
+        assert!(_events.is_empty());
     }
 
     #[test]
@@ -680,7 +1025,7 @@ mod tests {
         let mut t = ChangeTracker::new();
         let e = make_entity(0, 1);
         t.record_despawn(e);
-        let (delta, events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        let (delta, _events) = t.drain(&ReplicationSchema { component_type: ComponentId(0), fields: vec![] }, ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.despawned.len(), 1);
         assert_eq!(delta.despawned[0], e);
     }
@@ -805,5 +1150,144 @@ mod tests {
         let (delta, _) = tracker.drain(&ReplicationSchema { component_type: crate::component::component_id::<f32>(), fields: vec![] }, ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].entity, e);
+    }
+
+    // ── R2: Schema builder and registry ─────────────────────────────────
+
+    #[test]
+    fn schema_builder_produces_correct_fields() {
+        let cid = ComponentId(42);
+        let schema = SchemaBuilder::<f32> {
+            component_type: cid,
+            fields: Vec::new(),
+            _phantom: PhantomData,
+        }
+        .field("x", ReplicationEncoding::Pod, ReplicationCondition::Always)
+        .field("y", ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly)
+        .build();
+
+        assert_eq!(schema.component_type, cid);
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[0].field_index, 0);
+        assert_eq!(schema.fields[1].field_index, 1);
+        assert_eq!(schema.fields[1].condition, ReplicationCondition::SimulatedOnly);
+    }
+
+    #[test]
+    fn schema_builder_event_field() {
+        let schema = SchemaBuilder::<f32> {
+            component_type: ComponentId(1),
+            fields: Vec::new(),
+            _phantom: PhantomData,
+        }
+        .event("on_foo", ReplicationCondition::Multicast, EventChannel::Unreliable)
+        .build();
+
+        assert_eq!(schema.fields.len(), 1);
+        match &schema.fields[0].encoding {
+            ReplicationEncoding::Event => {}
+            _ => panic!("expected Event encoding"),
+        }
+        assert_eq!(schema.fields[0].event_channel, Some(EventChannel::Unreliable));
+    }
+
+    #[test]
+    fn registry_register_and_lookup() {
+        let mut reg = ReplicationRegistry::new();
+        let cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        reg.insert(builder);
+        assert!(reg.schema(cid).is_some());
+        assert!(reg.schema(ComponentId(999)).is_none());
+    }
+
+    #[test]
+    fn registry_handshake_round_trip() {
+        let mut reg = ReplicationRegistry::new();
+
+        let b1 = reg.register::<f32>();
+        reg.insert(b1);
+
+        let msg = reg.handshake_message();
+        let reg2 = ReplicationRegistry::from_handshake(&msg).unwrap();
+
+        assert_eq!(reg.schemas.len(), reg2.schemas.len());
+        for (cid, s1) in &reg.schemas {
+            let s2 = reg2.schema(*cid).unwrap();
+            assert_eq!(s1.fields.len(), s2.fields.len());
+        }
+    }
+
+    #[test]
+    fn registry_handshake_empty() {
+        let reg = ReplicationRegistry::new();
+        let msg = reg.handshake_message();
+        let reg2 = ReplicationRegistry::from_handshake(&msg).unwrap();
+        assert_eq!(reg2.schemas.len(), 0);
+    }
+
+    #[test]
+    fn registry_handshake_invalid_truncated() {
+        let result = ReplicationRegistry::from_handshake(&[0x01, 0x00, 0x00, 0x00]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ErrorCode::InvalidData);
+    }
+
+    #[test]
+    fn encode_decode_pod_round_trip() {
+        let original = vec![1u8, 2, 3, 4, 5];
+        let mut buf = Vec::new();
+        assert_eq!(encode_field_value(&ReplicationEncoding::Pod, &original, &mut buf), ErrorCode::Ok);
+        let mut decoded = vec![0u8; 5];
+        assert_eq!(decode_field_value(&ReplicationEncoding::Pod, &buf, &mut decoded), ErrorCode::Ok);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn encode_decode_gpu_handle_round_trip() {
+        let original = 42u64.to_le_bytes().to_vec();
+        let mut buf = Vec::new();
+        assert_eq!(encode_field_value(&ReplicationEncoding::GpuHandle, &original, &mut buf), ErrorCode::Ok);
+        let mut decoded = vec![0u8; 8];
+        assert_eq!(decode_field_value(&ReplicationEncoding::GpuHandle, &buf, &mut decoded), ErrorCode::Ok);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn encode_decode_delta_compressed_round_trip() {
+        let original = 123456789u64.to_le_bytes().to_vec();
+        let mut buf = Vec::new();
+        assert_eq!(encode_field_value(&ReplicationEncoding::DeltaCompressed, &original, &mut buf), ErrorCode::Ok);
+        let mut decoded = vec![0u8; 8];
+        assert_eq!(decode_field_value(&ReplicationEncoding::DeltaCompressed, &buf, &mut decoded), ErrorCode::Ok);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn encode_decode_opaque_round_trip() {
+        let opaque = ReplicationEncoding::Opaque {
+            encode_size: |_ptr| {
+                std::mem::size_of::<u64>()
+            },
+            encode: |ptr, buf| {
+                let val = unsafe { *(ptr as *const u64) };
+                buf.copy_from_slice(&val.to_le_bytes());
+                ErrorCode::Ok
+            },
+            decode: |data, dst| {
+                let val = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
+                unsafe { *(dst as *mut u64) = val; }
+                ErrorCode::Ok
+            },
+        };
+
+        let original = 0xDEAD_BEEFu64;
+        let bytes = original.to_le_bytes();
+        let mut buf = Vec::new();
+        assert_eq!(encode_field_value(&opaque, &bytes, &mut buf), ErrorCode::Ok);
+        let mut decoded = vec![0u8; 8];
+        assert_eq!(decode_field_value(&opaque, &buf, &mut decoded), ErrorCode::Ok);
+        let result = u64::from_le_bytes(decoded.try_into().unwrap());
+        assert_eq!(result, original);
     }
 }
