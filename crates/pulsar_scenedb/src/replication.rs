@@ -2810,13 +2810,21 @@ mod tests {
                 std::mem::size_of::<u64>()
             },
             encode: |ptr, buf| {
-                let val = unsafe { *(ptr as *const u64) };
+                // `ptr` comes from a `&[u8]`'s `.as_ptr()` (see
+                // `encode_field_value`'s Opaque arm) — only byte-aligned,
+                // not necessarily `u64`-aligned. A plain `*(ptr as *const
+                // u64)` read is undefined behavior on a misaligned pointer
+                // (caught by Miri); `read_unaligned` is the correct,
+                // portable way to read a differently-typed value through a
+                // pointer with weaker alignment.
+                let val = unsafe { (ptr as *const u64).read_unaligned() };
                 buf.copy_from_slice(&val.to_le_bytes());
                 ErrorCode::Ok
             },
             decode: |data, dst| {
                 let val = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
-                unsafe { *(dst as *mut u64) = val; }
+                // Same alignment caveat as `encode` above, for `dst`.
+                unsafe { (dst as *mut u64).write_unaligned(val) };
                 ErrorCode::Ok
             },
         };
