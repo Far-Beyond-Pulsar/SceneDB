@@ -803,7 +803,7 @@ fn server_tick(
 | Phase machine | CPU | `SimulateWitness`, `HarvestPhase`, `RetiredPhase` | Compile-time frame phase guards |
 | Assets | GPU | `GeometryArena`, `MeshRegistry`, `ClusterBuffer`, `TextureStore`, `MeshletBuffer` | GPU-side asset storage with suballocation |
 | Lease | CPU | `Lease`, `LeaseMask`, `Scratchpad` | RAII read leases, decaying per-frame scratch buffers |
-| **Replication** | CPU | `ChangeTracker`, `Delta`, `ReplicationRegistry`, `SchemaBuilder`, `RelevanceSet`, `AuthorityTable`, `EventBatch`, `Snapshot`, `Reconciler` | Per-frame change tracking, delta encoding, interest management, ownership, condition filtering, RPC channel, world snapshots, client prediction reconciliation |
+| **Replication** | CPU | `ChangeTracker`, `CpuSimulateWitness`, `Delta`, `Replicable`, `ReplicationRegistry`, `SchemaBuilder`, `RelevanceSet`, `EntityCellMap`, `AuthorityTable`, `EventBatch`, `Snapshot`, `Reconciler`, `DeltaCompressor` | Per-frame change tracking, safe generic delta encoding (`Pod` + owned/heap data via `Replicable`), interest management, ownership, condition filtering, RPC channel, world snapshots + resync, client prediction reconciliation, stateful delta compression |
 
 ## Crates
 

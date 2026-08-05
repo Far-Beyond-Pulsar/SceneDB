@@ -11,12 +11,105 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  no-default-features:
+    # C0 compliance: the core crate must build and pass its tests with zero
+    # GPU dependencies.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check pulsar_scenedb with no default features
+      run: cargo check -p pulsar_scenedb --no-default-features --verbose
+    - name: Test pulsar_scenedb with no default features
+      run: cargo test -p pulsar_scenedb --no-default-features --verbose
+
+  gpu-feature:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Test pulsar_scenedb with the gpu feature
+      run: cargo test -p pulsar_scenedb --features gpu --verbose
+
+  transport:
+    # Explicit, separate job for the real-socket replication transport
+    # tests (TCP/UDP loopback, multi-client, reconnect+resync) — `build`
+    # already runs these via the workspace-wide `cargo test`, but they're
+    # important enough to a "does replication actually work over a real
+    # socket" claim to fail loudly and visibly on their own.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run replication transport tests
+      run: cargo test -p pulsar_scenedb --test replication_transport --verbose
+
+  miri:
+    # Dynamic UB detection for the replication module — this is what
+    # actually caught a real alignment-UB bug in an `Opaque` test fixture
+    # during development; a green run here is stronger evidence of
+    # soundness than "the tests pass" alone.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly toolchain with Miri
+      run: |
+        rustup toolchain install nightly --component miri
+        rustup default nightly
+    - name: Run Miri over the replication module
+      run: cargo miri test -p pulsar_scenedb --no-default-features --lib replication
+
+  fuzz:
+    # Coverage-guided (libFuzzer) fuzzing, bounded to a fixed wall-clock
+    # budget per target so CI stays fast — this is NOT a substitute for
+    # running these for hours/overnight locally when touching a decoder,
+    # just a floor that catches regressions on every PR. These targets
+    # cannot run on Windows (see crates/pulsar_scenedb/fuzz/README.md) —
+    # this Linux runner is where they actually execute.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [delta_from_bytes, handshake_from_bytes, replicable_decode, delta_apply]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly toolchain
+      run: rustup toolchain install nightly
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz
+    - name: Fuzz ${{ matrix.target }} for 60s
+      working-directory: crates/pulsar_scenedb
+      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+    - name: Upload crash corpus on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-crash-${{ matrix.target }}
+        path: crates/pulsar_scenedb/fuzz/artifacts/${{ matrix.target }}
+
+  bench:
+    # Runs the real replication benchmarks and uploads the criterion HTML
+    # report as a build artifact for human trend-watching. Deliberately
+    # does NOT fail the build on a wall-clock regression — GitHub-hosted
+    # runners share unpinned CPUs, and hard-gating absolute timings there is
+    # a well-known false-positive generator. See benches/BASELINE.md.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run replication benchmarks
+      run: cargo bench -p pulsar_scenedb --no-default-features --bench replication_bench | tee bench_output.txt
+    - name: Upload criterion HTML report
+      uses: actions/upload-artifact@v4
+      with:
+        name: criterion-report
+        path: target/criterion
+    - name: Upload raw benchmark output
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-output
+        path: bench_output.txt
