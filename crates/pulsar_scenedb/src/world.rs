@@ -403,8 +403,9 @@ impl World {
     // â”€â”€ Archetype graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Spawn `entity` at its EXACT wire index+generation, directly into the
-    /// archetype identified by `key`, using `column_factory` to construct
-    /// any column the archetype doesn't already have.
+    /// archetype identified by `key`, using `row_ops` to construct any
+    /// column the archetype doesn't already have and to fill a placeholder
+    /// row in every column of that archetype.
     ///
     /// Used by [`crate::replication::Delta::apply`]: replicated entity
     /// handles are shared verbatim between peers (see `Entity::bits`/
@@ -414,22 +415,22 @@ impl World {
     /// that slot is already live under a different occupant, the incoming
     /// spawn is authoritative and the old occupant is despawned first.
     ///
-    /// Every column of the destination archetype (not just the ones
-    /// `column_factory` was just asked to create) is grown by one
-    /// all-zero-byte row so lengths stay in sync with `entities.len()` —
+    /// Every column of the destination archetype (not just the ones newly
+    /// created) is grown by one row via its
+    /// [`crate::replication::RowOps::push_default`] — a real `T::default()`
+    /// push, not a raw byte fill, so this is sound for ANY component type
+    /// that implements `Default` (not just `Pod` ones).
     /// [`crate::replication::Delta::apply`] overwrites the real values
-    /// afterward via `component_deltas`. This is only sound for Pod-like
-    /// component types (all-zero must be a valid bit pattern); see
-    /// `Delta::apply`'s doc for the caller contract.
+    /// afterward via `component_deltas`.
     ///
     /// Returns `None` (leaving the archetype registered but without the
-    /// entity) if `column_factory` can't produce a column for one of
-    /// `key`'s component ids.
+    /// entity) if `row_ops` can't produce ops for one of `key`'s component
+    /// ids.
     pub(crate) fn force_spawn_in_archetype(
         &mut self,
         entity: Entity,
         key: ArchetypeKey,
-        mut column_factory: impl FnMut(ComponentId) -> Option<Box<dyn ErasedColumn>>,
+        mut row_ops: impl FnMut(ComponentId) -> Option<crate::replication::RowOps>,
     ) -> Option<Entity> {
         let idx = entity.index();
         let gen = entity.generation();
@@ -455,7 +456,8 @@ impl World {
         let arch_id = self.get_or_create_archetype(key.clone());
         for &cid in &key.0 {
             if !Self::has_column_id(&self.archetypes[arch_id.0 as usize], cid) {
-                let col = column_factory(cid)?;
+                let ops = row_ops(cid)?;
+                let col = (ops.new_column)();
                 Self::set_column(&mut self.archetypes[arch_id.0 as usize], cid, col);
             }
         }
@@ -468,69 +470,44 @@ impl World {
         let n = self.archetypes[arch_id.0 as usize].active_cids.len();
         for i in 0..n {
             let cid = self.archetypes[arch_id.0 as usize].active_cids[i];
+            let ops = row_ops(cid)?;
             let col = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).unwrap();
-            let elem = col.element_size();
-            // SAFETY: see this method's doc — only sound for Pod-like
-            // component types.
-            unsafe { col.push_bytes(&vec![0u8; elem]) };
+            (ops.push_default)(col.as_mut());
         }
 
         Some(entity)
     }
 
-    /// Byte width of `entity`'s column for `cid`, if it is alive and has
-    /// that component. Used by [`crate::replication::Delta::apply`] to size
-    /// its per-field decode scratch buffers.
-    pub(crate) fn component_element_size(&self, entity: Entity, cid: ComponentId) -> Option<usize> {
-        if !self.is_alive(entity) {
-            return None;
-        }
-        let s = &self.entity_slots[entity.index() as usize];
-        let arch = &self.archetypes[s.archetype.0 as usize];
-        Self::get_erased(arch, cid).map(|c| c.element_size())
-    }
-
-    /// Write `bytes` into `entity`'s existing column for `cid`, starting at
-    /// byte `offset` within the element, overwriting in place. Returns
-    /// `false` if the entity is dead, has no column for `cid`, or `offset`
-    /// is past the column's element size. A `bytes` slice that would run
-    /// past the element's end is clamped rather than rejected.
+    /// Write one field's value into `entity`'s existing column for `cid` at
+    /// its row, via the field's own
+    /// [`crate::replication::FieldOps::decode_into`] closure — no raw
+    /// pointers, no byte-width guessing; the closure downcasts to the
+    /// concrete column type itself.
     ///
-    /// # Safety
-    /// `bytes` must be a valid bit pattern for the destination byte range
-    /// of the column's concrete type — sound only for Pod-like component
-    /// types (see [`crate::replication::Delta::apply`]'s doc).
-    pub(crate) unsafe fn write_component_raw(
+    /// A dead entity or a missing column is a silent no-op (`Ok(())`) —
+    /// expected in ordinary operation (e.g. a stale delta arriving after a
+    /// despawn, or a relevance change) — but a genuine decode failure from
+    /// `decode_into` itself (malformed bytes) is propagated as `Err`.
+    pub(crate) fn write_component_field(
         &mut self,
         entity: Entity,
         cid: ComponentId,
-        offset: usize,
+        decode_into: &(dyn Fn(&mut dyn ErasedColumn, usize, &[u8]) -> Result<(), crate::replication::ErrorCode>
+              + Send
+              + Sync),
         bytes: &[u8],
-    ) -> bool {
+    ) -> Result<(), crate::replication::ErrorCode> {
         if !self.is_alive(entity) {
-            return false;
+            return Ok(());
         }
         let (arch_id, row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
         };
         let Some(col) = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid) else {
-            return false;
+            return Ok(());
         };
-        if row >= col.len() {
-            return false;
-        }
-        let elem = col.element_size();
-        if offset >= elem {
-            return false;
-        }
-        let n = bytes.len().min(elem - offset);
-        // SAFETY: row < col.len() (checked above); offset + n <= elem
-        // (clamped above); caller guarantees `bytes` is a valid bit pattern
-        // for this byte range.
-        let dst = (col.get_raw_mut(row) as *mut u8).add(offset);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
-        true
+        decode_into(col.as_mut(), row, bytes)
     }
 
     pub(crate) fn get_or_create_archetype(&mut self, key: ArchetypeKey) -> ArchetypeId {

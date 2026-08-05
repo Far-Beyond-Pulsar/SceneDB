@@ -91,11 +91,14 @@
 //!
 //! ```ignore
 //! registry.register::<MeshRenderer>()
-//!     .field("mesh",            ReplicationEncoding::GpuHandle,   ReplicationCondition::Always)
-//!     .field("local_transform", ReplicationEncoding::Pod,         ReplicationCondition::ServerAuthority)
-//!     .field("health",          ReplicationEncoding::DeltaCompressed, ReplicationCondition::SimulatedOnly)
+//!     .field("mesh",            |c| &c.mesh,            |c| &mut c.mesh,            ReplicationEncoding::GpuHandle,   ReplicationCondition::Always)
+//!     .field("local_transform", |c| &c.local_transform, |c| &mut c.local_transform, ReplicationEncoding::Pod,         ReplicationCondition::ServerAuthority)
+//!     .field("health",          |c| &c.health,          |c| &mut c.health,          ReplicationEncoding::DeltaCompressed, ReplicationCondition::SimulatedOnly)
 //!     .event("on_hit",          ReplicationCondition::Multicast,  EventChannel::Unreliable);
 //! ```
+//!
+//! `#[derive(Replicate)]` generates exactly this shape from
+//! `#[replicate(...)]` field attributes — see that macro's doc.
 //!
 //! The registry produces a `ReplicationSchema` — a compact per-component-type
 //! descriptor table that the delta encoder walks at runtime. The schema is
@@ -210,6 +213,7 @@ use crate::spatial::{Aabb, SpatialCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::Arc;
 
 // ── Error reporting ────────────────────────────────────────────────────────
 
@@ -329,7 +333,236 @@ pub enum Ownership {
     Shared,
 }
 
+// ── Replicable ───────────────────────────────────────────────────────────────
+
+/// Safe, generic wire encode/decode for one replicated *value* — a whole
+/// component (for [`SchemaBuilder::whole_field`]) or one named field of it
+/// (for [`SchemaBuilder::field`]).
+///
+/// This is the fix for the fundamental hole a byte-oriented replication
+/// design has to close: [`crate::component::Column`] stores real `T` values
+/// for ANY `T: Any + Send + Sync + 'static` (a `String`, a `Vec<u8>`, a
+/// `Box<dyn Trait>` — anything), but the wire only ever carries bytes.
+/// Reinterpreting arbitrary bytes as an arbitrary `T` (the previous
+/// approach) is undefined behavior for anything that isn't
+/// [`crate::page::Pod`] — a heap pointer read back from garbage bytes is a
+/// real memory-safety bug, not a hypothetical one. `Replicable` moves that
+/// boundary to a place where it can be checked by the compiler: every type
+/// used in a replicated field must implement this trait, and every impl is
+/// either the blanket `Pod` fast path below (reusing the crate's existing,
+/// already-audited safety marker — no new unsafe surface) or ordinary safe
+/// Rust (as the `String`/`Vec`/`Option`/`Box` impls below are).
+///
+/// Implement this yourself for any other type you want to replicate — the
+/// bar is "safely constructible from bytes you produced yourself", which is
+/// a much smaller ask than "safe to reinterpret from arbitrary bytes".
+pub trait Replicable: Sized {
+    /// A placeholder value used to grow a column by one row when an entity
+    /// is spawned before its real field values arrive (see
+    /// [`crate::World`]'s replication-support methods). Called once per
+    /// spawned entity per field — never exposed to a remote peer.
+    fn replicate_default() -> Self;
+
+    /// Append this value's wire representation to `buf`. Must be exactly
+    /// invertible by [`Self::replicate_decode`] given the bytes appended
+    /// (and nothing else — no reliance on out-of-band length information).
+    fn replicate_encode(&self, buf: &mut Vec<u8>);
+
+    /// Reconstruct a value from exactly the bytes [`Self::replicate_encode`]
+    /// produced for it. Must return [`ErrorCode::InvalidData`] (never
+    /// panic, never read out of bounds) for truncated or malformed input —
+    /// `bytes` may come from an untrusted remote peer.
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode>;
+}
+
+/// Fast path: any [`crate::page::Pod`] type is `Replicable` via a direct
+/// memcpy. `Pod`'s own safety contract (all-zero / arbitrary bytes are a
+/// valid value) is exactly what makes this sound — this reuses that
+/// existing, audited marker rather than introducing a new unsafe contract.
+impl<T: crate::page::Pod> Replicable for T {
+    fn replicate_default() -> Self {
+        // SAFETY: `Pod` guarantees all-zero bytes are a valid `T`.
+        unsafe { std::mem::zeroed() }
+    }
+
+    fn replicate_encode(&self, buf: &mut Vec<u8>) {
+        // SAFETY: `T: Pod` guarantees every byte of `T`'s representation is
+        // meaningful (no padding-UB) and safe to read.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const T as *const u8, std::mem::size_of::<T>())
+        };
+        buf.extend_from_slice(bytes);
+    }
+
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+        if bytes.len() != std::mem::size_of::<T>() {
+            return Err(ErrorCode::InvalidData);
+        }
+        let mut val = std::mem::MaybeUninit::<T>::uninit();
+        // SAFETY: `bytes.len()` checked equal to `size_of::<T>()` above;
+        // `T: Pod` guarantees any bit pattern (including these bytes) is a
+        // valid `T`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), val.as_mut_ptr() as *mut u8, bytes.len());
+            Ok(val.assume_init())
+        }
+    }
+}
+
+// NOTE: no blanket `impl<T: Pod, const N: usize> Replicable for [T; N]` —
+// same `#[fundamental]`-style coherence conflict as `Box<T>` above, except
+// this one is self-inflicted rather than language-mandated: `[f32; 16]`
+// already implements `Pod` (the C5 mat4-transform special case in
+// `page.rs`), so a generic array blanket would overlap with the `T: Pod`
+// blanket above for that exact concrete type. Fixed-size arrays that aren't
+// individually `Pod` (like the common `[f32; 3]` position/vector shape) get
+// concrete, non-blanket impls instead — no overlap, since `[f32; 3]` etc.
+// don't implement `Pod`.
+macro_rules! impl_replicable_f32_array {
+    ($($n:expr),+ $(,)?) => {
+        $(
+            impl Replicable for [f32; $n] {
+                fn replicate_default() -> Self {
+                    [0.0; $n]
+                }
+                fn replicate_encode(&self, buf: &mut Vec<u8>) {
+                    for v in self {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+                    if bytes.len() != $n * 4 {
+                        return Err(ErrorCode::InvalidData);
+                    }
+                    let mut out = [0.0f32; $n];
+                    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                        out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                    Ok(out)
+                }
+            }
+        )+
+    };
+}
+impl_replicable_f32_array!(2, 3, 4);
+
+impl Replicable for String {
+    fn replicate_default() -> Self {
+        String::new()
+    }
+    fn replicate_encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.as_bytes());
+    }
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+        String::from_utf8(bytes.to_vec()).map_err(|_| ErrorCode::InvalidData)
+    }
+}
+
+/// `Vec<T>` self-frames each element with a `u32` byte-length prefix so it
+/// composes recursively (`Vec<String>`, `Vec<Vec<u8>>`, ...) without any
+/// type needing to know its own encoded width up front.
+impl<T: Replicable> Replicable for Vec<T> {
+    fn replicate_default() -> Self {
+        Vec::new()
+    }
+    fn replicate_encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        for item in self {
+            let mut elem = Vec::new();
+            item.replicate_encode(&mut elem);
+            buf.extend_from_slice(&(elem.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&elem);
+        }
+    }
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+        if bytes.len() < 4 {
+            return Err(ErrorCode::InvalidData);
+        }
+        let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut ofs = 4usize;
+        let mut out = Vec::with_capacity(count.min(1 << 16));
+        for _ in 0..count {
+            if ofs + 4 > bytes.len() {
+                return Err(ErrorCode::InvalidData);
+            }
+            let elem_len = u32::from_le_bytes([bytes[ofs], bytes[ofs + 1], bytes[ofs + 2], bytes[ofs + 3]]) as usize;
+            ofs += 4;
+            if ofs + elem_len > bytes.len() {
+                return Err(ErrorCode::InvalidData);
+            }
+            out.push(T::replicate_decode(&bytes[ofs..ofs + elem_len])?);
+            ofs += elem_len;
+        }
+        Ok(out)
+    }
+}
+
+impl<T: Replicable> Replicable for Option<T> {
+    fn replicate_default() -> Self {
+        None
+    }
+    fn replicate_encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            None => buf.push(0),
+            Some(v) => {
+                buf.push(1);
+                v.replicate_encode(buf);
+            }
+        }
+    }
+    fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+        match bytes.first() {
+            Some(0) => Ok(None),
+            Some(1) => Ok(Some(T::replicate_decode(&bytes[1..])?)),
+            _ => Err(ErrorCode::InvalidData),
+        }
+    }
+}
+
+// NOTE: no blanket `impl<T: Replicable> Replicable for Box<T>` — `Box` is a
+// `#[fundamental]` type, so the compiler must treat it as potentially
+// overlapping with the `T: Pod` blanket impl above (a downstream crate could
+// legally write `unsafe impl Pod for Box<TheirLocalType>` precisely because
+// `Box` is fundamental), and rustc rejects the two blanket impls as
+// conflicting even though no such impl actually exists. If you need a boxed
+// field, implement `Replicable` directly for your concrete `Box<YourType>`
+// (a single non-blanket impl, which does not hit this rule) — it's just
+// `(**self).replicate_encode(buf)` / `Box::new(YourType::replicate_decode(bytes)?)`.
+
 // ── Schema ─────────────────────────────────────────────────────────────────
+
+/// Local-only safe encode/decode dispatch for one field, captured
+/// generically at [`SchemaBuilder::field`]/[`SchemaBuilder::whole_field`]
+/// time (the field's own type `F: Replicable` and the component's type `T`
+/// are both known there). `Arc` rather than a plain `fn` pointer because
+/// these close over the field's accessor functions.
+///
+/// `None` on a [`FieldDescriptor`] built from
+/// [`ReplicationRegistry::from_handshake`] — wire bytes carry field layout,
+/// never Rust types or closures (same limitation
+/// `ReplicationEncoding::Opaque`'s fn pointers already have — see
+/// `u8_from_encoding`'s doc).
+#[derive(Clone)]
+pub(crate) struct FieldOps {
+    pub encode: Arc<dyn Fn(&dyn crate::component::ErasedColumn, usize, &mut Vec<u8>) -> Result<(), ErrorCode> + Send + Sync>,
+    pub decode_into: Arc<dyn Fn(&mut dyn crate::component::ErasedColumn, usize, &[u8]) -> Result<(), ErrorCode> + Send + Sync>,
+}
+
+impl std::fmt::Debug for FieldOps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FieldOps(..)")
+    }
+}
+
+/// Local-only row constructors for a component type, captured generically at
+/// [`ReplicationRegistry::register`] time (`T: Default` is known there).
+/// Plain `fn` pointers (no captures needed) — `Clone`/`Debug` fall out of
+/// the derive on [`ReplicationSchema`] for free.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowOps {
+    pub new_column: fn() -> Box<dyn crate::component::ErasedColumn>,
+    pub push_default: fn(&mut dyn crate::component::ErasedColumn),
+}
 
 /// Describes one replicated field on a component type.
 #[derive(Clone, Debug)]
@@ -338,6 +571,7 @@ pub struct FieldDescriptor {
     pub encoding: ReplicationEncoding,
     pub condition: ReplicationCondition,
     pub event_channel: Option<EventChannel>,
+    pub(crate) ops: Option<FieldOps>,
 }
 
 /// Per-component-type replication schema.
@@ -346,40 +580,78 @@ pub struct FieldDescriptor {
 pub struct ReplicationSchema {
     pub component_type: ComponentId,
     pub fields: Vec<FieldDescriptor>,
-    /// Local-only column constructor, captured generically at
-    /// [`ReplicationRegistry::register`] time (`T` is known there). `None`
-    /// for schemas built by [`ReplicationRegistry::from_handshake`] — a
-    /// remote peer's wire bytes carry field layout, never Rust types, so
-    /// only LOCALLY-registered component types support [`Delta::apply`]'s
-    /// spawn reconstruction (the same limitation `ReplicationEncoding::Opaque`'s
-    /// fn pointers already have — see `u8_from_encoding`'s doc).
-    pub(crate) column_factory: Option<fn() -> Box<dyn crate::component::ErasedColumn>>,
+    /// `None` for schemas built by [`ReplicationRegistry::from_handshake`]
+    /// — see [`RowOps`]'s doc.
+    pub(crate) row_ops: Option<RowOps>,
 }
 
 // ── Schema builder ─────────────────────────────────────────────────────────
 
 /// Fluent builder for declaring a component type's replication layout.
 /// Returned by [`ReplicationRegistry::register`].
-#[derive(Clone, Debug)]
 pub struct SchemaBuilder<T> {
     component_type: ComponentId,
     fields: Vec<FieldDescriptor>,
-    column_factory: fn() -> Box<dyn crate::component::ErasedColumn>,
+    row_ops: RowOps,
     _phantom: PhantomData<T>,
 }
 
 impl<T: crate::Component> SchemaBuilder<T> {
-    /// Declare a state field with its encoding and replication condition.
-    /// `field_index` is auto-incremented per call in declaration order.
-    pub fn field(mut self, _name: &str, encoding: ReplicationEncoding, condition: ReplicationCondition) -> Self {
+    /// Declare a replicated field. `get`/`get_mut` are plain accessors to
+    /// the named field on `T` (e.g. `|c: &Self| &c.pos`); `F: Replicable`
+    /// is that field's own type — see [`Replicable`]'s doc for what
+    /// qualifies (every [`crate::page::Pod`] type already does, plus
+    /// `String`/`Vec<T>`/`Option<T>` out of the box). `field_index` is
+    /// auto-incremented per call in declaration order.
+    pub fn field<F: Replicable + 'static>(
+        mut self,
+        _name: &str,
+        get: fn(&T) -> &F,
+        get_mut: fn(&mut T) -> &mut F,
+        encoding: ReplicationEncoding,
+        condition: ReplicationCondition,
+    ) -> Self {
         let field_index = self.fields.len() as u32;
+        let encode: Arc<
+            dyn Fn(&dyn crate::component::ErasedColumn, usize, &mut Vec<u8>) -> Result<(), ErrorCode> + Send + Sync,
+        > = Arc::new(move |col, row, buf| {
+            let col = col
+                .as_any()
+                .downcast_ref::<crate::component::Column<T>>()
+                .ok_or(ErrorCode::InvalidData)?;
+            let val = col.data.get(row).ok_or(ErrorCode::InvalidData)?;
+            get(val).replicate_encode(buf);
+            Ok(())
+        });
+        let decode_into: Arc<
+            dyn Fn(&mut dyn crate::component::ErasedColumn, usize, &[u8]) -> Result<(), ErrorCode> + Send + Sync,
+        > = Arc::new(move |col, row, bytes| {
+            let col = col
+                .as_any_mut()
+                .downcast_mut::<crate::component::Column<T>>()
+                .ok_or(ErrorCode::InvalidData)?;
+            let slot = col.data.get_mut(row).ok_or(ErrorCode::InvalidData)?;
+            *get_mut(slot) = F::replicate_decode(bytes)?;
+            Ok(())
+        });
         self.fields.push(FieldDescriptor {
             field_index,
             encoding,
             condition,
             event_channel: None,
+            ops: Some(FieldOps { encode, decode_into }),
         });
         self
+    }
+
+    /// Convenience for the common case where the WHOLE component `T` is
+    /// itself the replicated value (e.g. registering a bare `f32`) — an
+    /// identity-accessor wrapper around [`Self::field`].
+    pub fn whole_field(self, name: &str, encoding: ReplicationEncoding, condition: ReplicationCondition) -> Self
+    where
+        T: Replicable + 'static,
+    {
+        self.field(name, |c: &T| c, |c: &mut T| c, encoding, condition)
     }
 
     /// Declare an event/RPC field. Its `encoding` is implicitly `Event`.
@@ -390,6 +662,7 @@ impl<T: crate::Component> SchemaBuilder<T> {
             encoding: ReplicationEncoding::Event,
             condition,
             event_channel: Some(channel),
+            ops: None,
         });
         self
     }
@@ -398,7 +671,7 @@ impl<T: crate::Component> SchemaBuilder<T> {
         ReplicationSchema {
             component_type: self.component_type,
             fields: self.fields,
-            column_factory: Some(self.column_factory),
+            row_ops: Some(self.row_ops),
         }
     }
 }
@@ -421,22 +694,35 @@ impl ReplicationRegistry {
     }
 
     /// Register a component type and get a [`SchemaBuilder`] to describe its
-    /// replicated fields. Call `.field(...)` / `.event(...)` and the schema
-    /// is inserted on drop.
-    pub fn register<T: crate::Component>(&mut self) -> SchemaBuilder<T> {
+    /// replicated fields. Call `.field(...)` / `.whole_field(...)` /
+    /// `.event(...)` then pass the builder to [`Self::insert`].
+    ///
+    /// `T: Default` is used solely to grow a column by one placeholder row
+    /// when [`crate::World`] spawns a replicated entity before its real
+    /// field values arrive — see [`RowOps`].
+    pub fn register<T: crate::Component + Default>(&mut self) -> SchemaBuilder<T> {
         SchemaBuilder {
             component_type: crate::component::component_id::<T>(),
             fields: Vec::new(),
-            column_factory: || Box::new(crate::component::Column::<T>::new()),
+            row_ops: RowOps {
+                new_column: || Box::new(crate::component::Column::<T>::new()),
+                push_default: |col| {
+                    let col = col
+                        .as_any_mut()
+                        .downcast_mut::<crate::component::Column<T>>()
+                        .expect("push_default: column type mismatch — RowOps is generated per-T at register::<T>() time");
+                    col.data.push(T::default());
+                },
+            },
             _phantom: PhantomData,
         }
     }
 
-    /// Local-only column constructor for a registered component type (see
-    /// [`ReplicationSchema::column_factory`]). `None` if `cid` isn't
-    /// registered or was learned only from a remote handshake.
-    pub(crate) fn column_factory(&self, cid: ComponentId) -> Option<Box<dyn crate::component::ErasedColumn>> {
-        self.schemas.get(&cid)?.column_factory.map(|f| f())
+    /// Local-only row constructors for a registered component type (see
+    /// [`RowOps`]). `None` if `cid` isn't registered or was learned only
+    /// from a remote handshake.
+    pub(crate) fn row_ops(&self, cid: ComponentId) -> Option<&RowOps> {
+        self.schemas.get(&cid)?.row_ops.as_ref()
     }
 
     /// Finalise a builder and insert the resulting schema. Called internally
@@ -523,6 +809,9 @@ impl ReplicationRegistry {
                     encoding,
                     condition,
                     event_channel,
+                    // Wire bytes never carry Rust types/closures — see
+                    // `FieldOps`'s doc.
+                    ops: None,
                 });
             }
             schemas.insert(
@@ -530,9 +819,8 @@ impl ReplicationRegistry {
                 ReplicationSchema {
                     component_type,
                     fields,
-                    // Wire bytes never carry Rust types — see
-                    // `ReplicationSchema::column_factory`'s doc.
-                    column_factory: None,
+                    // Wire bytes never carry Rust types — see `RowOps`'s doc.
+                    row_ops: None,
                 },
             );
         }
@@ -946,12 +1234,15 @@ impl Delta {
     ///    A blob that isn't a valid archetype key (truncated, or the plain
     ///    placeholder [`ChangeTracker::drain`] produces) falls back to the
     ///    empty archetype.
-    /// 3. Writes component field data back to columns using `schema`, in
-    ///    field-declaration order, packing each component's fields
-    ///    sequentially by byte offset (the schema has no explicit
-    ///    per-field byte width, so declaration order stands in for it —
-    ///    this matches how every field currently in this codebase records
-    ///    the whole component's bytes at field index 0).
+    /// 3. Writes each field's bytes back via its own
+    ///    [`Replicable::replicate_decode`] (reached through the
+    ///    [`FieldOps`] closure captured at
+    ///    [`SchemaBuilder::field`]/[`SchemaBuilder::whole_field`] time) —
+    ///    `cd.field_data[field_index]` is exactly what
+    ///    [`Replicable::replicate_encode`] produced for that field, so
+    ///    there is no byte-width guessing: every field is safely,
+    ///    generically reconstructed regardless of whether its type is
+    ///    `Pod`, `String`, `Vec<T>`, or a user's own `Replicable` impl.
     ///
     /// Entities are placed at the SAME index+generation as the wire value
     /// (via `Entity::bits`/`from_bits`) — SceneDB's replication model
@@ -962,33 +1253,27 @@ impl Delta {
     ///
     /// Spawning an entity whose archetype names a component type `schema`
     /// has no local (non-handshake) registration for fails with
-    /// [`ErrorCode::InvalidData`] — see [`ReplicationSchema::column_factory`].
-    ///
-    /// # Safety
-    ///
-    /// Component data is memcpy'd directly into column slots via raw
-    /// pointer casts. Every replicated component type touched by a
-    /// `Pod`/`Serialized`/`GpuHandle`/`DeltaCompressed`/`Opaque` field must
-    /// tolerate that (i.e. behave like [`crate::page::Pod`]: safely
-    /// constructible from arbitrary or all-zero bytes). Field data must
-    /// have been produced with the same [`ReplicationEncoding`] the local
-    /// `schema` declares for that field.
+    /// [`ErrorCode::InvalidData`] — see [`RowOps`]. A `ComponentDelta`
+    /// targeting a dead entity, or a field with no local `ops` (same
+    /// handshake limitation), is silently skipped rather than erroring; a
+    /// genuine decode failure (malformed bytes from an untrusted peer) is
+    /// propagated as `Err` without panicking.
     pub fn apply(&self, world: &mut crate::World, schema: &ReplicationRegistry) -> Result<(), ErrorCode> {
         let mut scratch = Vec::new();
         self.apply_with_scratch(world, schema, &mut scratch)
     }
 
-    /// Like [`Self::apply`], but decodes each field into a caller-owned
-    /// `scratch` buffer instead of allocating a fresh `Vec<u8>` per field.
-    /// Pass the SAME `scratch` buffer across many `apply_with_scratch` calls
-    /// (e.g. once per connected client per frame) to amortize its
-    /// allocation to zero after the first call grows it to the largest
-    /// field width seen. `scratch`'s contents on return are unspecified.
+    /// Like [`Self::apply`]. `scratch` is accepted for API stability with
+    /// earlier callers but is no longer needed internally: field decoding
+    /// now goes straight from wire bytes to the field's own owned value via
+    /// [`Replicable::replicate_decode`] (a `String`/`Vec<T>` is heap data
+    /// either way; a `Pod` field decodes into a stack `MaybeUninit`, not a
+    /// `Vec` at all) — there is no intermediate byte buffer left to reuse.
     pub fn apply_with_scratch(
         &self,
         world: &mut crate::World,
         schema: &ReplicationRegistry,
-        scratch: &mut Vec<u8>,
+        _scratch: &mut Vec<u8>,
     ) -> Result<(), ErrorCode> {
         for &entity in &self.despawned {
             world.despawn(entity);
@@ -998,7 +1283,7 @@ impl Delta {
             let cids = decode_archetype_key(blob).unwrap_or_default();
             let key = ArchetypeKey::new(cids);
             if world
-                .force_spawn_in_archetype(*entity, key, |cid| schema.column_factory(cid))
+                .force_spawn_in_archetype(*entity, key, |cid| schema.row_ops(cid).copied())
                 .is_none()
             {
                 return Err(ErrorCode::InvalidData);
@@ -1009,55 +1294,21 @@ impl Delta {
             let Some(s) = schema.schema(cd.component_type) else {
                 continue;
             };
-            let Some(elem_size) = world.component_element_size(cd.entity, cd.component_type) else {
-                continue;
-            };
-            let mut offset = 0usize;
             for field in &s.fields {
-                if offset >= elem_size {
-                    break;
-                }
                 if matches!(field.encoding, ReplicationEncoding::Event) {
                     continue;
                 }
+                let Some(ops) = &field.ops else {
+                    continue;
+                };
                 let idx = field.field_index as usize;
-                let Some(raw) = cd.field_data.get(idx) else {
+                let Some(bytes) = cd.field_data.get(idx) else {
                     continue;
                 };
-                if raw.is_empty() {
+                if bytes.is_empty() {
                     continue;
                 }
-                let remaining = elem_size - offset;
-                let width = match &field.encoding {
-                    ReplicationEncoding::Pod | ReplicationEncoding::Serialized | ReplicationEncoding::GpuHandle => {
-                        raw.len().min(remaining)
-                    }
-                    // No byte-width metadata for a compressed field — a
-                    // decoded LEB128 value is at most 8 bytes wide.
-                    ReplicationEncoding::DeltaCompressed => remaining.min(8),
-                    // Opaque owns its own framing; hand it the whole
-                    // remaining budget and let `decode` write only what it
-                    // needs.
-                    ReplicationEncoding::Opaque { .. } => remaining,
-                    ReplicationEncoding::Event => 0,
-                };
-                if width == 0 {
-                    continue;
-                }
-                // Reuse `scratch` instead of allocating a fresh Vec for
-                // every field: grow once, then just resize (no realloc)
-                // once `scratch`'s capacity covers the widest field seen.
-                scratch.clear();
-                scratch.resize(width, 0);
-                let code = decode_field_value(&field.encoding, raw, scratch);
-                if code != ErrorCode::Ok {
-                    return Err(code);
-                }
-                // SAFETY: see this method's doc.
-                unsafe {
-                    world.write_component_raw(cd.entity, cd.component_type, offset, scratch);
-                }
-                offset += width;
+                world.write_component_field(cd.entity, cd.component_type, &*ops.decode_into, bytes)?;
             }
         }
 
@@ -1719,36 +1970,7 @@ impl Snapshot {
         for arch in &world.archetypes {
             for row in 0..arch.entities.len() {
                 let entity = arch.entities[row];
-                let mut components = Vec::new();
-                for &cid in &arch.active_cids {
-                    let mut field_data = Vec::new();
-                    if let Some(s) = schema.schema(cid) {
-                        for field in &s.fields {
-                            if matches!(field.encoding, ReplicationEncoding::Event) {
-                                continue;
-                            }
-                            if let Some(col) = arch.get_erased(cid) {
-                                if row < col.len() {
-                                    let ptr = unsafe { col.get_raw(row) };
-                                    let elem_size = col.element_size();
-                                    let len = match &field.encoding {
-                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => elem_size,
-                                        _ => 0,
-                                    };
-                                    let bytes = if len > 0 {
-                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let mut buf = Vec::new();
-                                    encode_field_value(&field.encoding, &bytes, &mut buf);
-                                    field_data.push(buf);
-                                }
-                            }
-                        }
-                    }
-                    components.push((cid, field_data));
-                }
+                let components = Self::capture_row_components(arch, row, schema);
                 entities.push(EntitySnapshot { entity, components });
             }
         }
@@ -1771,40 +1993,50 @@ impl Snapshot {
                 if !relevance.contains(entity) {
                     continue;
                 }
-                let mut components = Vec::new();
-                for &cid in &arch.active_cids {
-                    let mut field_data = Vec::new();
-                    if let Some(s) = schema.schema(cid) {
-                        for field in &s.fields {
-                            if matches!(field.encoding, ReplicationEncoding::Event) {
-                                continue;
-                            }
-                            if let Some(col) = arch.get_erased(cid) {
-                                if row < col.len() {
-                                    let ptr = unsafe { col.get_raw(row) };
-                                    let elem_size = col.element_size();
-                                    let len = match &field.encoding {
-                                        ReplicationEncoding::Pod | ReplicationEncoding::GpuHandle => elem_size,
-                                        _ => 0,
-                                    };
-                                    let bytes = if len > 0 {
-                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let mut buf = Vec::new();
-                                    encode_field_value(&field.encoding, &bytes, &mut buf);
-                                    field_data.push(buf);
-                                }
-                            }
-                        }
-                    }
-                    components.push((cid, field_data));
-                }
+                let components = Self::capture_row_components(arch, row, schema);
                 entities.push(EntitySnapshot { entity, components });
             }
         }
         Self { frame, entities, cell_rows: Vec::new() }
+    }
+
+    /// Shared row-capture body for [`Self::capture_full`]/
+    /// [`Self::capture_relevant`]: for every component the archetype
+    /// carries, encode every schema field via its own
+    /// [`FieldOps::encode`] closure (reached through
+    /// [`Replicable::replicate_encode`]) — safe, and genuinely per-field
+    /// (unlike the previous raw-byte approach, which re-read the whole
+    /// column's bytes once per field, duplicating them across any
+    /// multi-field schema).
+    fn capture_row_components(
+        arch: &crate::archetype::Archetype,
+        row: usize,
+        schema: &ReplicationRegistry,
+    ) -> Vec<(ComponentId, Vec<Vec<u8>>)> {
+        let mut components = Vec::new();
+        for &cid in &arch.active_cids {
+            let mut field_data: Vec<Vec<u8>> = Vec::new();
+            if let Some(s) = schema.schema(cid) {
+                if let Some(col) = arch.get_erased(cid) {
+                    for field in &s.fields {
+                        let idx = field.field_index as usize;
+                        if idx >= field_data.len() {
+                            field_data.resize(idx + 1, Vec::new());
+                        }
+                        if matches!(field.encoding, ReplicationEncoding::Event) {
+                            continue;
+                        }
+                        let Some(ops) = &field.ops else { continue };
+                        let mut buf = Vec::new();
+                        if (ops.encode)(col, row, &mut buf).is_ok() {
+                            field_data[idx] = buf;
+                        }
+                    }
+                }
+            }
+            components.push((cid, field_data));
+        }
+        components
     }
 
     /// Capture all live rows from a set of [`SpatialCell`]s.
@@ -2131,7 +2363,22 @@ mod tests {
     /// Empty-fields schema for tests that only exercise `ChangeTracker::drain`
     /// (which ignores its `_schema` argument entirely).
     fn test_schema(component_type: ComponentId) -> ReplicationSchema {
-        ReplicationSchema { component_type, fields: vec![], column_factory: None }
+        ReplicationSchema { component_type, fields: vec![], row_ops: None }
+    }
+
+    /// `RowOps` for hand-built `SchemaBuilder::<f32>` test literals — mirrors
+    /// exactly what `ReplicationRegistry::register::<f32>()` would capture.
+    fn test_row_ops_f32() -> RowOps {
+        RowOps {
+            new_column: || Box::new(crate::component::Column::<f32>::new()),
+            push_default: |col| {
+                col.as_any_mut()
+                    .downcast_mut::<crate::component::Column<f32>>()
+                    .unwrap()
+                    .data
+                    .push(0.0);
+            },
+        }
     }
 
     // ── Fuzz / property-test helpers ─────────────────────────────────
@@ -2387,11 +2634,11 @@ mod tests {
         let schema = SchemaBuilder::<f32> {
             component_type: cid,
             fields: Vec::new(),
-            column_factory: || Box::new(crate::component::Column::<f32>::new()),
+            row_ops: test_row_ops_f32(),
             _phantom: PhantomData,
         }
-        .field("x", ReplicationEncoding::Pod, ReplicationCondition::Always)
-        .field("y", ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly)
+        .field("x", |c: &f32| c, |c: &mut f32| c, ReplicationEncoding::Pod, ReplicationCondition::Always)
+        .field("y", |c: &f32| c, |c: &mut f32| c, ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly)
         .build();
 
         assert_eq!(schema.component_type, cid);
@@ -2406,7 +2653,7 @@ mod tests {
         let schema = SchemaBuilder::<f32> {
             component_type: ComponentId(1),
             fields: Vec::new(),
-            column_factory: || Box::new(crate::component::Column::<f32>::new()),
+            row_ops: test_row_ops_f32(),
             _phantom: PhantomData,
         }
         .event("on_foo", ReplicationCondition::Multicast, EventChannel::Unreliable)
@@ -2471,7 +2718,7 @@ mod tests {
     fn registry_handshake_last_field_at_exact_buffer_end() {
         let mut reg = ReplicationRegistry::new();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let msg = reg.handshake_message();
         // The single field here is the last bytes of the buffer — exactly
@@ -2518,7 +2765,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let mut scratch = Vec::new();
         for v in [1.0f32, 2.0, 3.0] {
@@ -2733,7 +2980,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let f32_cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        let builder = builder.field("test", ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly);
+        let builder = builder.whole_field("test", ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly);
         reg.insert(builder);
 
         let delta = Delta {
@@ -3306,7 +3553,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let f32_cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let snap = Snapshot::capture_full(&world, &reg, 1);
         assert_eq!(snap.entities.len(), 1);
@@ -3332,7 +3579,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let cid = crate::component::component_id::<crate::spatial::InstanceInfo>();
         let builder = reg.register::<crate::spatial::InstanceInfo>();
-        reg.insert(builder.field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let snap = Snapshot::capture_cells(&[cell], &reg, 1);
         assert_eq!(snap.frame, 1);
@@ -3356,7 +3603,7 @@ mod tests {
 
         let mut reg = ReplicationRegistry::new();
         let builder = reg.register::<crate::spatial::InstanceInfo>();
-        reg.insert(builder.field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let snap = Snapshot::capture_cells(&[cell], &reg, 1);
         assert_eq!(snap.cell_rows.len(), 1, "dead row excluded");
@@ -3422,7 +3669,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let delta = Delta {
             frame: 1, base_frame: 0,
@@ -3465,7 +3712,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         let wire_entity = make_entity(41, 3);
         let blob = encode_archetype_key(&[cid]);
@@ -3569,7 +3816,7 @@ mod tests {
         let mut reg = ReplicationRegistry::new();
         let cid = crate::component::component_id::<f32>();
         let builder = reg.register::<f32>();
-        reg.insert(builder.field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
+        reg.insert(builder.whole_field("val", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
         server.insert(e, 7.0f32);
         let mut server_delta = tracker.drain_with_world(&server);
@@ -3630,10 +3877,10 @@ mod tests {
                         } else {
                             None
                         };
-                        FieldDescriptor { field_index, encoding, condition, event_channel }
+                        FieldDescriptor { field_index, encoding, condition, event_channel, ops: None }
                     })
                     .collect();
-                let schema = ReplicationSchema { component_type, fields, column_factory: None };
+                let schema = ReplicationSchema { component_type, fields, row_ops: None };
                 reg.schemas.insert(component_type, schema.clone());
                 expected.push(schema);
             }
@@ -3737,11 +3984,12 @@ mod tests {
                     encoding: ReplicationEncoding::Pod,
                     condition,
                     event_channel: None,
+                    ops: None,
                 })
                 .collect();
 
             let mut reg = ReplicationRegistry::new();
-            reg.schemas.insert(cid, ReplicationSchema { component_type: cid, fields: schema_fields, column_factory: None });
+            reg.schemas.insert(cid, ReplicationSchema { component_type: cid, fields: schema_fields, row_ops: None });
 
             let delta = Delta {
                 frame: 0, base_frame: 0,

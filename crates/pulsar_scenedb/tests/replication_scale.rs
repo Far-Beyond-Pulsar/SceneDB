@@ -24,6 +24,10 @@ marker_types!(Group0, Group1, Group2, Group3, Group4);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Position(f32, f32, f32);
+// SAFETY: three `f32`s, no padding, no niches — trivially safe to
+// zero-init/byte-reinterpret. Needed so `Position: Replicable` via the
+// blanket `impl<T: Pod> Replicable for T` (see `replication.rs`).
+unsafe impl Pod for Position {}
 
 fn insert_shard(world: &mut World, e: Entity, idx: usize) {
     match idx {
@@ -95,7 +99,7 @@ fn ten_thousand_entities_fifty_archetypes_four_client_relevance() {
 
     let mut reg = ReplicationRegistry::new();
     let builder = reg.register::<Position>();
-    reg.insert(builder.field("pos", ReplicationEncoding::Pod, ReplicationCondition::Always));
+    reg.insert(builder.whole_field("pos", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
     let authority = AuthorityTable::new();
 
@@ -258,7 +262,7 @@ fn snapshot_capture_full_ten_thousand_entities_is_deterministic() {
 
     let mut reg = ReplicationRegistry::new();
     let builder = reg.register::<Position>();
-    reg.insert(builder.field("pos", ReplicationEncoding::Pod, ReplicationCondition::Always));
+    reg.insert(builder.whole_field("pos", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
     let snap1 = Snapshot::capture_full(&world, &reg, 1);
     let snap2 = Snapshot::capture_full(&world, &reg, 1);
@@ -291,7 +295,7 @@ fn snapshot_capture_restore_cells_ten_thousand_rows_byte_exact() {
 
     let mut reg = ReplicationRegistry::new();
     let builder = reg.register::<InstanceInfo>();
-    reg.insert(builder.field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
+    reg.insert(builder.whole_field("info", ReplicationEncoding::Pod, ReplicationCondition::Always));
 
     let snap = Snapshot::capture_cells(&cells, &reg, 1);
     assert_eq!(snap.cell_rows.len(), ENTITY_COUNT);

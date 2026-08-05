@@ -28,10 +28,18 @@ pub fn derive_scene_store(input: TokenStream) -> TokenStream {
 /// [`ReplicationSchema`](pulsar_scenedb::ReplicationSchema) from
 /// `#[replicate(encoding = ..., condition = ...)]` field attributes.
 ///
+/// Each annotated field is registered with a real accessor into that named
+/// field (not the whole struct), so replicated updates are byte-accurate
+/// per field — the field's own type must implement
+/// [`Replicable`](pulsar_scenedb::Replicable) (every `Pod` type already
+/// does; `String`/`Vec<T>`/`Option<T>` work out of the box too). The struct
+/// itself must also implement `Default` — used to fill a placeholder row
+/// when an entity is spawned before its real field values arrive.
+///
 /// # Example
 ///
 /// ```ignore
-/// #[derive(Replicate)]
+/// #[derive(Replicate, Default)]
 /// struct Health {
 ///     #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
 ///     value: f32,

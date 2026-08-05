@@ -106,8 +106,9 @@ pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
     condition_passes, CpuSimulateWitness, Delta, DeltaView, decode_archetype_key,
     encode_archetype_key, encode_field_value, encode_pod_raw, EntityCellMap, ErrorCode,
-    EventBatch, EventChannel, Ownership, Reconciler, RelevanceSet, ReplicatedEvent,
-    ReplicationCondition, ReplicationEncoding, ReplicationRegistry, SchemaBuilder, Snapshot,
+    EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler, RelevanceSet,
+    ReplicatedEvent, Replicable, ReplicationCondition, ReplicationEncoding, ReplicationSchema,
+    ReplicationRegistry, SchemaBuilder, Snapshot,
 };
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;

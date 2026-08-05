@@ -165,22 +165,6 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
 
     /// Size in bytes of a single element in this column.
     fn element_size(&self) -> usize;
-
-    /// Push one element by copying `bytes` as this column's raw bit
-    /// pattern, growing the column by exactly one row. Used by
-    /// [`crate::replication::Delta::apply`] to reconstruct replicated rows
-    /// without the caller knowing the concrete `T` — the same "columns are
-    /// dense `Vec<T>`" storage this trait already exposes raw pointers into
-    /// via `get_raw`/`get_raw_mut`.
-    ///
-    /// # Safety
-    /// - `bytes.len()` must equal `self.element_size()`.
-    /// - `bytes` must be a valid bit pattern for the column's concrete `T`
-    ///   (sound only for Pod-like component types — the same discipline
-    ///   `ReplicationEncoding::Pod` fields already require; never call this
-    ///   for a column whose `T` has invalid all-zero/arbitrary bit patterns,
-    ///   e.g. one holding a `Box`, `String`, or an enum with niches).
-    unsafe fn push_bytes(&mut self, bytes: &[u8]);
 }
 
 pub(crate) struct Column<T: Component> {
@@ -255,14 +239,5 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     fn element_size(&self) -> usize {
         std::mem::size_of::<T>()
-    }
-
-    unsafe fn push_bytes(&mut self, bytes: &[u8]) {
-        debug_assert_eq!(bytes.len(), std::mem::size_of::<T>(), "push_bytes: length mismatch");
-        let mut val = std::mem::MaybeUninit::<T>::uninit();
-        // SAFETY: caller guarantees `bytes` is a valid bit pattern for `T`
-        // and is exactly `size_of::<T>()` long (debug-checked above).
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), val.as_mut_ptr() as *mut u8, bytes.len());
-        self.data.push(val.assume_init());
     }
 }

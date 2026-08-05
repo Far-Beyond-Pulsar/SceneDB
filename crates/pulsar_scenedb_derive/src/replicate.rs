@@ -181,8 +181,24 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     .event(#field_name, ::pulsar_scenedb::ReplicationCondition::#condition_ident, ::pulsar_scenedb::EventChannel::#channel_ident)
                 }
             } else {
+                // `get`/`get_mut` are plain, non-capturing field accessors —
+                // they coerce to the `fn(&T) -> &F`/`fn(&mut T) -> &mut F`
+                // pointers `SchemaBuilder::field` expects, and `F` (the
+                // field's own type) is inferred from the accessor's return
+                // type — no turbofish needed. `F` must implement
+                // `pulsar_scenedb::Replicable`: every `Pod` field type
+                // already does (blanket impl), plus `String`/`Vec<T>`/
+                // `Option<T>` out of the box; anything else needs a manual
+                // `impl Replicable` (see that trait's doc).
+                let field_ident = &f.ident;
                 quote! {
-                    .field(#field_name, ::pulsar_scenedb::ReplicationEncoding::#encoding_ident, ::pulsar_scenedb::ReplicationCondition::#condition_ident)
+                    .field(
+                        #field_name,
+                        |c: &Self| &c.#field_ident,
+                        |c: &mut Self| &mut c.#field_ident,
+                        ::pulsar_scenedb::ReplicationEncoding::#encoding_ident,
+                        ::pulsar_scenedb::ReplicationCondition::#condition_ident,
+                    )
                 }
             }
         })
