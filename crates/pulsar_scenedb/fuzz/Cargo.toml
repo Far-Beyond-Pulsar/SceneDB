@@ -1,0 +1,47 @@
+[package]
+name = "pulsar_scenedb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pulsar_scenedb]
+path = ".."
+
+[dependencies.pulsar_scenedb_derive]
+path = "../../pulsar_scenedb_derive"
+
+[[bin]]
+name = "delta_from_bytes"
+path = "fuzz_targets/delta_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_from_bytes"
+path = "fuzz_targets/handshake_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replicable_decode"
+path = "fuzz_targets/replicable_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta_apply"
+path = "fuzz_targets/delta_apply.rs"
+test = false
+doc = false
+bench = false
