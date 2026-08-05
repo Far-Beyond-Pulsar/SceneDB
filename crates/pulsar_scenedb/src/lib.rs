@@ -76,6 +76,8 @@ pub mod liveness;
 pub mod page;
 pub mod query;
 pub mod registry;
+pub mod replication;
+
 pub mod schedule;
 pub mod simd;
 pub mod snapshot;

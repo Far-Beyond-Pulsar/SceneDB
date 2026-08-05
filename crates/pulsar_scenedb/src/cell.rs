@@ -1,4 +1,4 @@
-use crate::cell_type::{GenericColumnDesc, RegisteredCellType};
+use crate::cell_type::RegisteredCellType;
 use crate::component::ComponentId;
 use crate::handle::Handle;
 use crate::liveness::LivenessMask;
