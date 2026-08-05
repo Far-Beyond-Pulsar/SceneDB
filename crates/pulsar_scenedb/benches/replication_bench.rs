@@ -4,6 +4,8 @@
 //! (`String`/`Vec<T>`) cost relative to the `Pod` fast path.
 //!
 //! Run with: `cargo bench -p pulsar_scenedb --bench replication_bench`.
+//! See `BASELINE.md` in this directory for real measured numbers (and why
+//! they're a human reference snapshot, not an automated CI regression gate).
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use pulsar_scenedb::*;

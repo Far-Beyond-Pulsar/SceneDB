@@ -1434,6 +1434,10 @@ impl Delta {
     /// [`Replicable::replicate_decode`] (a `String`/`Vec<T>` is heap data
     /// either way; a `Pod` field decodes into a stack `MaybeUninit`, not a
     /// `Vec` at all) — there is no intermediate byte buffer left to reuse.
+    /// `benches/replication_bench.rs`'s `delta_apply` group measures this
+    /// directly: `apply` and `apply_with_scratch` are statistically
+    /// indistinguishable at both 1k and 10k entities (see
+    /// `benches/BASELINE.md`) — this isn't a theoretical claim.
     pub fn apply_with_scratch(
         &self,
         world: &mut crate::World,

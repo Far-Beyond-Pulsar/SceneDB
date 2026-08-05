@@ -259,17 +259,19 @@ pub struct AiState {
 
 ### Combining `#[gpu]` and `#[replicate]` on the same field
 
-`#[derive(SceneStore)]` only processes `#[gpu(...)]` attributes. `#[replicate(...)]` is a separate attribute that would be processed by a different derive macro or consumed manually. They coexist on the same field because each derive only looks at its own attributes:
+`#[derive(SceneStore)]` only processes `#[gpu(...)]` attributes; `#[derive(Replicate)]` only processes `#[replicate(...)]` attributes. They're independent derives that coexist on the same struct (and even the same field) because each only looks at its own attributes — stack both:
 
 ```rust
-use pulsar_scenedb_derive::SceneStore;
+use pulsar_scenedb_derive::{SceneStore, Replicate};
 use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
 /// A mesh instance that is both GPU-native AND replicated over the network.
-/// SceneStore generates Pod + GPU dispatch for the #[gpu] fields.
-/// The #[replicate] attributes control network encoding.
-#[derive(SceneStore)]
+/// SceneStore generates Pod + GPU dispatch for the #[gpu] fields; Replicate
+/// generates `register_replication` from the #[replicate] fields. `Default`
+/// is required by `Replicate` — it's how a freshly-spawned entity gets a
+/// placeholder row before its real field values arrive over the wire.
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 pub struct MeshInstance {
     /// GPU-mirrored (dirty-tracked every frame) AND network-replicated as a
@@ -289,6 +291,8 @@ pub struct MeshInstance {
 }
 ```
 
+Every `#[replicate(...)]` field's type must implement `Replicable` (see below) — every `Pod` type already does via a blanket impl, which covers all three fields above (`Handle<Mesh>`, `[f32; 16]`, and `f32` are all Pod).
+
 The `#[gpu]` and `#[replicate]` attributes are orthogonal:
 
 | Storage (via `#[gpu]`) | Replication (via `#[replicate]`) | Result |
@@ -301,13 +305,15 @@ The `#[gpu]` and `#[replicate]` attributes are orthogonal:
 
 ### `#[replicate(...)]` — Replication schema on fields
 
-Field-level attribute macros that declare replication behaviour. Each field gets an encoding mode and a replication condition. These are consumed by `ReplicationRegistry` to build the per-component-type schema that drives delta encoding and interest management.
+Field-level attributes that declare replication behaviour, processed by `#[derive(Replicate)]`. Each field gets an encoding mode and a replication condition; the derive turns them into a real per-named-field accessor (not just bookkeeping) registered with `ReplicationRegistry` to build the per-component-type schema that drives delta encoding and interest management. Every annotated field's type must implement `Replicable`; the struct itself must implement `Default` (used to fill a placeholder row when an entity is spawned before its real values arrive). A field with no `#[replicate(...)]` attribute is simply not replicated.
 
 ```rust
+use pulsar_scenedb_derive::Replicate;
 use pulsar_scenedb::ReplicationEncoding::{self, *};
 use pulsar_scenedb::ReplicationCondition::{self, *};
 
 /// A player state component with per-field replication control.
+#[derive(Replicate, Default)]
 struct PlayerState {
     /// Full transform: replicated every frame to everyone as raw Pod bytes.
     #[replicate(encoding = Pod, condition = Always)]
@@ -321,7 +327,9 @@ struct PlayerState {
     #[replicate(encoding = Pod, condition = AutonomousOnly)]
     ammo: u32,
 
-    /// Inventory: sent once at spawn, never again.
+    /// Inventory: sent once at spawn, never again. `Vec<Item>` needs
+    /// `Item: Replicable` — implement it by hand for your own types (see
+    /// `Replicable`'s doc), or use a `Vec` of anything already `Replicable`.
     #[replicate(encoding = Serialized, condition = InitialOnly)]
     inventory: Vec<Item>,
 
@@ -330,23 +338,28 @@ struct PlayerState {
     mesh: Handle<Mesh>,
 
     /// One-shot event: never in state deltas, delivered via RPC channel.
+    /// Event fields don't need `Replicable` — they're never stored in a
+    /// column, only queued and flushed through the RPC channel.
     #[replicate(encoding = Event, condition = Multicast)]
     on_damage_taken: DamageEvent,
 }
+
+let mut registry = ReplicationRegistry::new();
+PlayerState::register_replication(&mut registry);
 ```
 
 ### Combined: full component definition
 
-A component can use both `SceneStore` and `replicate` together — the macros compose:
+A component can use `SceneStore` and `Replicate` together — the macros compose (each only reads its own attributes):
 
 ```rust
-use pulsar_scenedb_derive::SceneStore;
+use pulsar_scenedb_derive::{SceneStore, Replicate};
 use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
 /// A fully wired engine component: SceneStore generates Pod + GPU dispatch,
-/// replicate generates the replication schema for the delta encoder.
-#[derive(SceneStore)]
+/// Replicate generates the replication schema for the delta encoder.
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct Character {
     /// Server-authoritative position, plain memcpy on the wire.
@@ -381,16 +394,26 @@ At compile time, `#[derive(SceneStore)]` expands to:
 - `const COLUMN_DESCS: &[ColumnDesc]` — column layout for `CellStorage::new`
 - `fn write_gpu_columns(&self, store: &SceneGpuStore, handle: Handle, witness: &SimulateWitness)` — per-field GPU mirror writes
 
-The `#[replicate(...)]` attributes are read by a companion derive (`#[derive(Replicate)]` planned) or consumed manually via `SchemaBuilder`:
+The `#[replicate(...)]` attributes are read by the companion `#[derive(Replicate)]` macro, which generates a `register_replication` associated function equivalent to this manual `SchemaBuilder` usage — note `field` takes real accessors to the named field, not just its name, so the encoder/decoder it builds dispatches to that one field specifically:
 
 ```rust
-// Manual equivalent of what the macro generates:
-registry.register::<Character>()
-    .field("position",       Pod,              ServerAuthority)
-    .field("look_direction", Pod,              ClientAuthority)
-    .field("health",         DeltaCompressed,  SimulatedOnly)
-    .field("skinned_mesh",   GpuHandle,        Always)
-    .event("on_play_animation", Multicast,     EventChannel::ReliableOrdered);
+// Manual equivalent of what #[derive(Replicate)] generates for `Character`:
+let builder = registry.register::<Character>();
+registry.insert(
+    builder
+        .field("position", |c: &Character| &c.position, |c: &mut Character| &mut c.position, Pod, ServerAuthority)
+        .field("look_direction", |c: &Character| &c.look_direction, |c: &mut Character| &mut c.look_direction, Pod, ClientAuthority)
+        .field("health", |c: &Character| &c.health, |c: &mut Character| &mut c.health, DeltaCompressed, SimulatedOnly)
+        .field("skinned_mesh", |c: &Character| &c.skinned_mesh, |c: &mut Character| &mut c.skinned_mesh, GpuHandle, Always)
+        .event("on_play_animation", Multicast, EventChannel::ReliableOrdered)
+);
+```
+
+Registering a whole component as one value (no sub-fields) is common enough to have a shortcut — `SchemaBuilder::whole_field` wraps the identity-accessor version of the pattern above:
+
+```rust
+let builder = registry.register::<Health>();
+registry.insert(builder.whole_field("value", DeltaCompressed, SimulatedOnly));
 ```
 
 ### Pattern library
@@ -400,7 +423,7 @@ Here are the common replication patterns expressed as component definitions:
 **Server-authoritative projectile:**
 
 ```rust
-#[derive(SceneStore)]
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct Projectile {
     #[replicate(encoding = Pod, condition = Always)]
@@ -415,7 +438,7 @@ struct Projectile {
 **Client-authoritative player input:**
 
 ```rust
-#[derive(SceneStore)]
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct PlayerInput {
     #[replicate(encoding = DeltaCompressed, condition = ClientAuthority)]
@@ -428,11 +451,13 @@ struct PlayerInput {
 **Editor-only metadata (multi-user):**
 
 ```rust
-#[derive(SceneStore)]
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct EditorMetadata {
     #[replicate(encoding = Pod, condition = Shared)]
     selected: u32,
+    // `Vec<Property>` needs `Property: Replicable` — implement it by hand,
+    // same as `PlayerState::inventory` above.
     #[replicate(encoding = Serialized, condition = Shared)]
     custom_properties: Vec<Property>,
 }
@@ -441,7 +466,7 @@ struct EditorMetadata {
 **Visibility-gated game state:**
 
 ```rust
-#[derive(SceneStore)]
+#[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct FactionVisibility {
     #[replicate(encoding = Pod, condition = Always)]
@@ -467,11 +492,15 @@ Declare which fields on each component type replicate, how they are encoded, and
 use pulsar_scenedb::{ReplicationRegistry, ReplicationEncoding, ReplicationCondition,
     EventChannel, SchemaBuilder, Component};
 
+// `register::<T>()` requires `T: Component + Default` — `Default` fills a
+// placeholder row when an entity is spawned before its real values arrive.
+#[derive(Default)]
 struct Transform {
     matrix: [[f32; 4]; 4],
 }
 impl Component for Transform {}
 
+#[derive(Default)]
 struct Health {
     value: f32,
 }
@@ -479,17 +508,22 @@ impl Component for Health {}
 
 let mut registry = ReplicationRegistry::new();
 
+// `[[f32; 4]; 4]` isn't `Pod` in this crate (only `[f32; 16]`/`[f32; 2/3/4]`
+// are provided) — for a hand-registered (non-derive) type like this, either
+// mark it `unsafe impl Pod for Transform {}` yourself if it's safe to
+// byte-reinterpret, or implement `Replicable` directly.
+unsafe impl pulsar_scenedb::Pod for Transform {}
+
 let builder = registry.register::<Transform>();
 registry.insert(
-    builder
-        .field("matrix", ReplicationEncoding::Pod, ReplicationCondition::Always)
+    // `whole_field` registers the WHOLE component as one value — the
+    // shortcut for when there's nothing to break out into named fields.
+    builder.whole_field("matrix", ReplicationEncoding::Pod, ReplicationCondition::Always)
 );
 
 let builder = registry.register::<Health>();
 registry.insert(
-    builder
-        .field("value", ReplicationEncoding::DeltaCompressed,
-               ReplicationCondition::SimulatedOnly)
+    builder.whole_field("value", ReplicationEncoding::DeltaCompressed, ReplicationCondition::SimulatedOnly)
 );
 
 // Serialize schemas for the connection handshake.
@@ -549,25 +583,26 @@ Any `Pod` type gets this for free via a blanket impl (plain memcpy). `String`, `
 
 ### Change tracking at the frame boundary
 
-Record every mutation during the simulate phase, then drain into a delta at the harvest boundary.
+Record every mutation during the simulate phase, then drain into a `Delta` at the harvest boundary. `CpuSimulateWitness::run_tracked` is the recommended entry point — it runs your systems, drains with real archetype info (so spawns carry a usable archetype-key blob), and advances the frame counter, all in one call:
 
 ```rust
-use pulsar_scenedb::{World, ChangeTracker, Delta, AuthorityTable, ClientId};
+use pulsar_scenedb::{World, ChangeTracker, CpuSimulateWitness};
 
 let mut world = World::new();
-let mut authority = AuthorityTable::new();
 let mut tracker = ChangeTracker::new();
+let witness = CpuSimulateWitness::new();
 
-// Simulate — systems write to the world and optionally track changes.
-let entity = world.spawn_tracked(&mut tracker);
-world.insert_tracked(entity, 100.0f32, &mut tracker);
+let delta = witness.run_tracked(&mut world, &mut tracker, |world, tracker| {
+    // Systems write to the world and track changes here.
+    let entity = world.spawn_tracked(tracker);
+    world.insert_tracked(entity, 100.0f32, tracker);
+});
 
-// At the frame boundary, drain the tracker into a Delta.
-let (delta, _) = tracker.drain(&schema, ClientId(0), &authority);
-tracker.end_frame();
-
-// delta contains: spawned entities, despawned entities, component changes.
+// delta contains: spawned entities, despawned entities, component changes —
+// each already encoded via the field's own `Replicable` impl.
 ```
+
+Lower-level building blocks are still there if you're driving the frame loop yourself: `tracker.drain_with_world(&world)` does the draining step alone (real archetype-key blobs, no frame advance); the even lower-level `tracker.drain(&schema, client, &authority)` ignores all three arguments and produces a placeholder (non-reconstructible) spawn blob — prefer `drain_with_world` unless you specifically don't have a `World` reference at the call site.
 
 ### Interest management and condition filtering
 
@@ -662,7 +697,7 @@ can_send_event(&ReplicationCondition::Multicast, sender, recipient);
 
 ### Snapshots
 
-Capture a full or filtered world state for initial replication or recovery.
+Capture a full or filtered world state for initial replication or recovery, and restore one back into a `World` — the actual resync mechanism for a client that has missed one or more `Delta`s. A `Delta` only carries ONE frame's changes, so a gap (a dropped packet with no reliable-ordered retransmission — SceneDB doesn't own transport, see above) leaves no way to reconstruct the missing state from later `Delta`s alone; a fresh `Snapshot` re-establishes a known-good baseline to resume from.
 
 ```rust
 use pulsar_scenedb::{Snapshot, RelevanceSet};
@@ -672,7 +707,16 @@ let full = Snapshot::capture_full(&world, &registry, current_frame);
 
 // Only entities relevant to a specific client.
 let relevant = Snapshot::capture_relevant(&world, &registry, &relevance, current_frame);
+
+// Restore into a World — e.g. a client resyncing after a connection gap.
+// Entities are (re)spawned at their exact snapshot Entity (index +
+// generation); a component the local `registry` has no registration for
+// is silently skipped, matching `Delta::apply`'s identical contract.
+let mut client_world = pulsar_scenedb::World::new();
+full.restore_to_world(&mut client_world, &registry).unwrap();
 ```
+
+`SpatialCell`/`CellStorage` state has the same pair — `Snapshot::capture_cells`/`Snapshot::restore_to_cells` — for token-registered Pod columns (transform/instance-info) outside the ECS `World`.
 
 ### Client-side prediction reconciliation
 
@@ -692,12 +736,15 @@ reconciler.push_input(ClientInput {
 });
 
 // When a server delta arrives, apply it to the world first, then reconcile.
-apply_delta_to_world(&server_delta, &mut world, &registry);
+server_delta.apply(&mut world, &registry).unwrap();
 reconciler.reconcile(&server_delta, &mut world, |world, input| {
     // Re-apply this input to the corrected world.
     apply_input_to_world(world, input);
 });
 ```
+
+> [!NOTE]
+> `Delta::apply` has no ordering guard — it unconditionally overwrites field values regardless of `delta.frame`. Applying frames out of order (an unordered/best-effort channel can deliver them that way) silently rolls state backward; track the last-applied frame yourself and skip anything not strictly newer before calling `apply`. This is deliberate — frame ordering is the transport/engine's job, not something `Delta::apply` assumes for you (see "SceneDB does NOT own transport" above).
 
 ### Full integration example
 
@@ -706,27 +753,28 @@ Putting it all together in a server tick loop:
 ```rust
 fn server_tick(
     world: &mut World,
+    witness: &CpuSimulateWitness,
     registry: &ReplicationRegistry,
     authority: &AuthorityTable,
     clients: &[ClientId],
     spatial_cells: &[SpatialCell],
+    entity_cell_map: &EntityCellMap,
+    liveness: &LivenessSnapshot,
     scratch: &mut Scratchpad,
 ) -> Vec<(Delta, Vec<EventBatch>)> {
-    // 1. Track all changes this frame.
+    // 1. Track all changes this frame and drain into a Delta in one call —
+    //    real archetype-key blobs, frame counter advanced automatically.
     let mut tracker = ChangeTracker::new();
-    run_systems(world, &mut tracker);
+    let delta = witness.run_tracked(world, &mut tracker, |world, tracker| {
+        run_systems(world, tracker);
+    });
 
-    // 2. Drain into a raw delta.
-    let (delta, _) = tracker.drain(schema, ClientId(0), authority);
-    tracker.end_frame();
-
-    // 3. Build per-client outputs.
+    // 2. Build per-client outputs.
     let mut outputs = Vec::new();
     for &client in clients {
-        // Spatial relevance.
-        let relevance = RelevanceSet::from_frustum(
-            spatial_cells, &client_frustum(client),
-            &liveness_snapshot, scratch, |_, token| resolve_entity(token),
+        // Spatial relevance, resolved to ECS entities via EntityCellMap.
+        let relevance = RelevanceSet::from_frustum_mapped(
+            spatial_cells, &client_frustum(client), liveness, scratch, entity_cell_map,
         );
 
         // Filter by relevance + conditions.
