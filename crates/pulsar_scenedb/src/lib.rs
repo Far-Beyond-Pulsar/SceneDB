@@ -105,8 +105,8 @@ pub use handle::Handle;
 pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
     condition_passes, CpuSimulateWitness, Delta, DeltaCompressor, DeltaView, decode_archetype_key,
-    encode_archetype_key, encode_field_value, encode_pod_raw, EntityCellMap, ErrorCode,
-    EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler, RelevanceSet,
+    encode_archetype_key, encode_field_value, encode_pod_raw, EntityCellMap, EntitySnapshot,
+    ErrorCode, EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler, RelevanceSet,
     ReplicatedEvent, Replicable, ReplicationCondition, ReplicationEncoding, ReplicationSchema,
     ReplicationRegistry, SchemaBuilder, Snapshot,
 };

@@ -9,8 +9,9 @@
 //! Run with: `cargo test -p pulsar_scenedb --test replication_transport`.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::thread;
+use std::time::Duration;
 
 use pulsar_scenedb::*;
 use pulsar_scenedb_derive::Replicate;
@@ -238,4 +239,230 @@ fn mismatched_schema_field_count_is_detected() {
         "this test's own setup must produce a genuine schema mismatch, or it isn't proving the \
          compatibility check in the happy-path test can ever fail",
     );
+}
+
+// ── Shared setup ──────────────────────────────────────────────────────
+
+fn position_registry() -> ReplicationRegistry {
+    let mut registry = ReplicationRegistry::new();
+    Position::register_replication(&mut registry);
+    registry
+}
+
+/// Spawns one entity with `Position { xyz }` on a fresh `World` and returns
+/// a `Delta` describing that spawn — real archetype-key blob, real encoded
+/// field bytes, exactly what `ChangeTracker::drain_with_world` plus a
+/// `Delta::apply`-compatible field patch produces.
+fn one_entity_spawn_delta(xyz: [f32; 3]) -> (World, Entity, Delta) {
+    let mut world = World::new();
+    let mut tracker = ChangeTracker::new();
+    let e = world.spawn_tracked(&mut tracker);
+    world.insert(e, Position { xyz });
+    let mut delta = tracker.drain_with_world(&world);
+    let cid = component_id::<Position>();
+    let mut bytes = Vec::new();
+    world.get::<Position>(e).unwrap().xyz.replicate_encode(&mut bytes);
+    delta.component_deltas.push(ComponentDelta { entity: e, component_type: cid, field_data: vec![bytes] });
+    (world, e, delta)
+}
+
+// ── UDP: real games replicate over UDP, not TCP ─────────────────────────
+
+#[test]
+fn delta_round_trips_over_real_udp_datagram() {
+    // Unlike TCP, UDP preserves message boundaries per `send_to`/`recv_from`
+    // call — no length-prefix framing needed, but also no automatic
+    // retransmission or ordering, which is exactly why real game netcode
+    // that picks UDP has to build those guarantees itself (again: SceneDB
+    // does not own transport).
+    let server_socket = UdpSocket::bind("127.0.0.1:0").expect("bind server UDP socket");
+    let server_addr = server_socket.local_addr().unwrap();
+    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("bind client UDP socket");
+
+    let (_world, e, delta) = one_entity_spawn_delta([4.0, 5.0, 6.0]);
+    let payload = delta.to_bytes();
+    assert!(payload.len() < 1400, "keep this comfortably under a typical UDP MTU for the test's own sake");
+
+    client_socket.send_to(&payload, server_addr).expect("send datagram");
+
+    let mut buf = [0u8; 2048];
+    let (n, _from) = server_socket.recv_from(&mut buf).expect("receive datagram");
+    let received = Delta::from_bytes(&buf[..n]).expect("valid delta");
+
+    let registry = position_registry();
+    let mut receiver_world = World::new();
+    assert_eq!(received.apply(&mut receiver_world, &registry), Ok(()));
+    assert!(receiver_world.is_alive(e));
+    assert_eq!(receiver_world.get::<Position>(e).unwrap().xyz, [4.0, 5.0, 6.0]);
+}
+
+// ── Multiple concurrent clients ──────────────────────────────────────────
+
+#[test]
+fn server_handles_multiple_concurrent_clients_over_tcp() {
+    const CLIENT_COUNT: usize = 8;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        for i in 0..CLIENT_COUNT {
+            let (mut stream, _) = listener.accept().expect("accept a client");
+            // Each client gets its OWN entity/value — proves the server
+            // isn't accidentally sharing state across connections handled
+            // concurrently.
+            let (_world, _e, delta) = one_entity_spawn_delta([i as f32, 0.0, 0.0]);
+            write_frame(&mut stream, &delta.to_bytes()).expect("write delta to client");
+        }
+    });
+
+    let registry = position_registry();
+    let clients: Vec<_> = (0..CLIENT_COUNT)
+        .map(|i| {
+            let registry = position_registry();
+            thread::spawn(move || {
+                // Small stagger so connections don't all race the single
+                // `accept()` loop identically every run — real clients
+                // don't connect in perfect lockstep either.
+                thread::sleep(Duration::from_millis(i as u64 % 3));
+                let mut stream = TcpStream::connect(addr).expect("connect to loopback listener");
+                let bytes = read_frame(&mut stream).unwrap().expect("delta frame delivered");
+                let delta = Delta::from_bytes(&bytes).expect("valid delta");
+                let mut world = World::new();
+                assert_eq!(delta.apply(&mut world, &registry), Ok(()));
+                let e = delta.spawned[0].0;
+                assert!(world.is_alive(e));
+                world.get::<Position>(e).unwrap().xyz[0]
+            })
+        })
+        .collect();
+
+    let mut received_values: Vec<f32> = clients.into_iter().map(|c| c.join().expect("client thread panicked")).collect();
+    received_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let expected: Vec<f32> = (0..CLIENT_COUNT).map(|i| i as f32).collect();
+    assert_eq!(received_values, expected, "every client independently received and applied its own distinct entity");
+
+    server.join().expect("server thread panicked");
+    let _ = registry; // kept alive for clarity of intent; each client built its own copy above
+}
+
+// ── Reconnect + resync via Snapshot, over a real socket ─────────────────
+
+#[test]
+fn client_reconnect_and_resync_via_snapshot_over_real_socket() {
+    // Models the scenario `Snapshot::restore_to_world`'s doc describes:
+    // a client that drops its connection and misses however many Deltas
+    // the server produced in the meantime cannot recover that missing
+    // state from later Deltas alone (each one only carries its own frame's
+    // changes) — it has to request a fresh Snapshot on reconnect instead.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || -> io::Result<()> {
+        // First connection: client gets one entity, then "disconnects"
+        // (this thread's handling of that connection just ends).
+        let (mut first, _) = listener.accept()?;
+        let (mut server_world, e1, delta) = one_entity_spawn_delta([1.0, 0.0, 0.0]);
+        write_frame(&mut first, &delta.to_bytes())?;
+        drop(first);
+
+        // While the client is "away", the server keeps advancing state the
+        // client never sees a Delta for — exactly the gap a resync has to
+        // recover from.
+        let mut tracker = ChangeTracker::new();
+        let e2 = server_world.spawn_tracked(&mut tracker);
+        server_world.insert(e2, Position { xyz: [2.0, 0.0, 0.0] });
+        let e3 = server_world.spawn_tracked(&mut tracker);
+        server_world.insert(e3, Position { xyz: [3.0, 0.0, 0.0] });
+        let _dropped_delta = tracker.drain_with_world(&server_world); // never sent — simulates loss
+
+        // Second connection: the same client reconnecting. Instead of
+        // resuming Deltas (which would skip straight from frame 0 to
+        // whatever's next, silently missing e2/e3), the server sends a
+        // full resync Snapshot.
+        let (mut second, _) = listener.accept()?;
+        let registry = position_registry();
+        let snapshot = Snapshot::capture_full(&server_world, &registry, 99);
+        write_frame(&mut second, &encode_snapshot(&snapshot))?;
+
+        let _ = (e1, e2, e3); // kept alive for readability of intent above
+        Ok(())
+    });
+
+    let registry = position_registry();
+
+    // First connection: apply the one Delta the client actually receives.
+    let mut client_world = World::new();
+    let mut stream = TcpStream::connect(addr).expect("first connect");
+    let first_bytes = read_frame(&mut stream).unwrap().expect("first delta frame");
+    let first_delta = Delta::from_bytes(&first_bytes).expect("valid delta");
+    assert_eq!(first_delta.apply(&mut client_world, &registry), Ok(()));
+    drop(stream);
+
+    // Reconnect and resync from a full snapshot instead of continuing to
+    // wait for Deltas the connection gap already made unrecoverable.
+    let mut stream = TcpStream::connect(addr).expect("reconnect");
+    let snapshot_bytes = read_frame(&mut stream).unwrap().expect("snapshot frame");
+    let snapshot = decode_snapshot(&snapshot_bytes);
+    assert_eq!(snapshot.restore_to_world(&mut client_world, &registry), Ok(()));
+
+    // All three entities (including the two the client never got a Delta
+    // for) are present and correct after the snapshot resync.
+    assert_eq!(client_world.query::<()>().count(), 3, "resync recovers every entity, not just the ones seen via Delta");
+
+    server.join().expect("server thread panicked").expect("server I/O failed");
+}
+
+/// Minimal ad-hoc wire encoding for a `Snapshot` — `Snapshot` itself has no
+/// `to_bytes`/`from_bytes` (unlike `Delta`), so this test's server/client
+/// halves agree on a small bincode-free format just to move one across the
+/// socket: entity count, then per entity its bits, component count, then
+/// per component its id, field count, then per field a length-prefixed blob.
+fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(snapshot.entities.len() as u32).to_le_bytes());
+    for es in &snapshot.entities {
+        buf.extend_from_slice(&es.entity.bits().to_le_bytes());
+        buf.extend_from_slice(&(es.components.len() as u32).to_le_bytes());
+        for (cid, field_data) in &es.components {
+            buf.extend_from_slice(&cid.0.to_le_bytes());
+            buf.extend_from_slice(&(field_data.len() as u32).to_le_bytes());
+            for field in field_data {
+                buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                buf.extend_from_slice(field);
+            }
+        }
+    }
+    buf
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Snapshot {
+    let mut ofs = 0usize;
+    let mut read_u32 = || {
+        let v = u32::from_le_bytes(bytes[ofs..ofs + 4].try_into().unwrap());
+        ofs += 4;
+        v
+    };
+    let entity_count = read_u32();
+    let mut entities = Vec::new();
+    for _ in 0..entity_count {
+        let bits = u64::from_le_bytes(bytes[ofs..ofs + 8].try_into().unwrap());
+        ofs += 8;
+        let entity = Entity::from_bits(bits);
+        let component_count = read_u32();
+        let mut components = Vec::new();
+        for _ in 0..component_count {
+            let cid = ComponentId(read_u32());
+            let field_count = read_u32();
+            let mut field_data = Vec::new();
+            for _ in 0..field_count {
+                let field_len = read_u32() as usize;
+                field_data.push(bytes[ofs..ofs + field_len].to_vec());
+                ofs += field_len;
+            }
+            components.push((cid, field_data));
+        }
+        entities.push(EntitySnapshot { entity, components });
+    }
+    Snapshot { frame: 0, entities, cell_rows: vec![] }
 }
