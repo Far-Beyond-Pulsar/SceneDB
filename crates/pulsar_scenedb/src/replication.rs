@@ -204,6 +204,8 @@
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
+use crate::snapshot::LivenessSnapshot;
+use crate::spatial::SpatialCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
@@ -696,6 +698,7 @@ pub struct Delta {
     pub spawned: Vec<(Entity, Vec<u8>)>,
     pub despawned: Vec<Entity>,
     pub component_deltas: Vec<ComponentDelta>,
+    pub events: Vec<ReplicatedEvent>,
 }
 
 /// Sparse component data for one entity within a Delta.
@@ -791,9 +794,9 @@ impl ChangeTracker {
                 .collect(),
             despawned: mem::take(&mut self.despawned),
             component_deltas: mem::take(&mut self.component_changes),
+            events: mem::take(&mut self.events),
         };
-        let events = mem::take(&mut self.events);
-        (delta, events)
+        (delta, Vec::new())
     }
 
     pub fn end_frame(&mut self) {
@@ -806,16 +809,54 @@ impl ChangeTracker {
 /// Per-connection filter, built each frame from spatial queries + conditions.
 #[derive(Clone, Debug)]
 pub struct RelevanceSet {
-    /// Placeholder: raw entity allowlist.
     relevant_entities: Vec<Entity>,
 }
 
 impl RelevanceSet {
-    /// Build from spatial queries. Delegates to `SpatialCell::query_aabb_in`.
+    /// Build an empty relevance set.
     pub fn new() -> Self {
         Self {
             relevant_entities: Vec::new(),
         }
+    }
+
+    /// Build from a frustum query against spatial cells.
+    ///
+    /// For each spatial cell with visible rows, calls `resolve(cell_idx, row_token)`
+    /// which should return `Some(entity)` for rows that map to an ECS entity.
+    /// Uses `SpatialCell::query_frustum_in` internally — zero alloc after warm-up
+    /// when using `Scratchpad` + `LivenessSnapshot`.
+    pub fn from_frustum(
+        cells: &[SpatialCell],
+        frustum: &crate::spatial::Frustum,
+        liveness: &LivenessSnapshot,
+        scratch: &mut crate::lease::Scratchpad,
+        mut resolve: impl FnMut(usize, u32) -> Option<Entity>,
+    ) -> Self {
+        let mut set = Self::new();
+        for (i, cell) in cells.iter().enumerate() {
+            let len = cell.rows_in_use() as usize;
+            if len == 0 {
+                continue;
+            }
+            let (out, words) = scratch.get_u32_u64(len, len.div_ceil(64));
+            let nw = LivenessSnapshot::capture_words(cell.liveness(), len as u32, words);
+            let nh = cell.query_frustum_in(frustum, &words[..nw], out) as usize;
+            for row in 0..nh.min(len) {
+                let token = out[row];
+                if token != crate::registry::NULL_ROW {
+                    if let Some(entity) = resolve(i, token) {
+                        set.relevant_entities.push(entity);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// Add an entity that should always be relevant (local player, HUD, etc.).
+    pub fn add_always_relevant(&mut self, entity: Entity) {
+        self.relevant_entities.push(entity);
     }
 
     /// Add an entity to the relevance set.
@@ -823,23 +864,99 @@ impl RelevanceSet {
         self.relevant_entities.push(entity);
     }
 
+    /// Check whether a single entity is in the relevance set.
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.relevant_entities.contains(&entity)
+    }
+
+    /// Number of entities in this relevance set.
+    pub fn len(&self) -> usize {
+        self.relevant_entities.len()
+    }
+
+    /// Returns true if the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.relevant_entities.is_empty()
+    }
+
     /// Filter a Delta to only the changes relevant to `client`.
+    ///
+    /// Applies two layers of filtering:
+    /// 1. Entity allowlist — only entities in this set are considered.
+    /// 2. Per-field condition check — each `ComponentDelta`'s component schema
+    ///    is checked against `ReplicationCondition` using the `AuthorityTable`.
     pub fn filter<'a>(
         &self,
         delta: &'a Delta,
-        _authority: &AuthorityTable,
-        _client: ClientId,
+        authority: &AuthorityTable,
+        schema_registry: &ReplicationRegistry,
+        client: ClientId,
     ) -> DeltaView<'a> {
+        let component_deltas = delta
+            .component_deltas
+            .iter()
+            .filter(|cd| {
+                if !self.relevant_entities.contains(&cd.entity) {
+                    return false;
+                }
+                let owner = authority.owner_of(cd.entity);
+                if let Some(schema) = schema_registry.schema(cd.component_type) {
+                    for field in &schema.fields {
+                        if !condition_passes(&field.condition, &owner, &client) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
+
         DeltaView {
             spawned: &delta.spawned,
             despawned: &delta.despawned,
-            component_deltas: delta
-                .component_deltas
-                .iter()
-                .filter(|cd| self.relevant_entities.contains(&cd.entity))
-                .collect(),
+            component_deltas,
             events: Vec::new(),
         }
+    }
+}
+
+impl Default for RelevanceSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returns `true` if `client` passes the replication condition given the
+/// entity's ownership.
+pub fn condition_passes(condition: &ReplicationCondition, owner: &Ownership, client: &ClientId) -> bool {
+    match condition {
+        ReplicationCondition::Always => true,
+        ReplicationCondition::ServerAuthority => true,
+        ReplicationCondition::ClientAuthority => true,
+        ReplicationCondition::OwnerOnly => match owner {
+            Ownership::Client(id) => id == client,
+            Ownership::Server => false,
+            Ownership::Shared => true,
+        },
+        ReplicationCondition::SkipOwner => match owner {
+            Ownership::Client(id) => id != client,
+            Ownership::Server => true,
+            Ownership::Shared => true,
+        },
+        ReplicationCondition::SimulatedOnly => match owner {
+            Ownership::Client(id) => id != client,
+            Ownership::Server => true,
+            Ownership::Shared => true,
+        },
+        ReplicationCondition::AutonomousOnly => match owner {
+            Ownership::Client(id) => id == client,
+            Ownership::Server => false,
+            Ownership::Shared => true,
+        },
+        ReplicationCondition::InitialOnly => false,
+        ReplicationCondition::ServerToClient => false,
+        ReplicationCondition::ClientToServer => false,
+        ReplicationCondition::Multicast => true,
     }
 }
 
@@ -896,6 +1013,15 @@ impl AuthorityTable {
         }
     }
 
+    pub fn owner_of(&self, entity: Entity) -> Ownership {
+        // Per-field override is not returned here — this is entity-level.
+        self.entity_owners
+            .iter()
+            .find(|(e, _)| *e == entity)
+            .map(|(_, o)| *o)
+            .unwrap_or(Ownership::Server)
+    }
+
     pub fn can_write(
         &self,
         entity: Entity,
@@ -923,6 +1049,70 @@ impl AuthorityTable {
             };
         }
         false
+    }
+
+    /// Resolve conflicting writes from two deltas (Shared / multi-user editor).
+    ///
+    /// For each entity+component in both deltas, the field values from the
+    /// delta whose client has the higher `ClientId` are kept. Tiebreak is
+    /// deterministic: higher `ClientId` wins. Spawns and despawns from both
+    /// deltas are merged (deduplicated by Entity).
+    pub fn resolve_conflict(
+        authority: &Self,
+        a: &Delta,
+        client_a: ClientId,
+        b: &Delta,
+        client_b: ClientId,
+    ) -> Delta {
+        let winner = if client_a > client_b { a } else { b };
+        let loser = if client_a > client_b { b } else { a };
+
+        // Start with the winner's data.
+        let mut spawned = winner.spawned.clone();
+        let mut despawned = winner.despawned.clone();
+        let mut component_deltas = winner.component_deltas.clone();
+        let mut events = winner.events.clone();
+
+        // Merge the loser's spawns that don't conflict with the winner.
+        for s in &loser.spawned {
+            if !spawned.iter().any(|(e, _)| e == &s.0) {
+                spawned.push(s.clone());
+            }
+        }
+
+        // Merge the loser's despawns.
+        for d in &loser.despawned {
+            if !despawned.contains(d) {
+                despawned.push(*d);
+            }
+        }
+
+        // Merge the loser's component deltas for entities the winner didn't touch.
+        for cd in &loser.component_deltas {
+            if !component_deltas.iter().any(|c| c.entity == cd.entity && c.component_type == cd.component_type) {
+                component_deltas.push(cd.clone());
+            }
+        }
+
+        // Merge events.
+        for ev in &loser.events {
+            events.push(ev.clone());
+        }
+
+        Delta {
+            frame: winner.frame.max(loser.frame),
+            base_frame: winner.base_frame.min(loser.base_frame),
+            spawned,
+            despawned,
+            component_deltas,
+            events,
+        }
+    }
+}
+
+impl Default for AuthorityTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1069,10 +1259,10 @@ mod tests {
             channel: EventChannel::ReliableOrdered,
         };
         t.record_event(ev.clone());
-        let (_, events) = t.drain(&ReplicationSchema { component_type: ComponentId(1), fields: vec![] }, ClientId(0), &AuthorityTable::new());
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].entity, e);
-        assert_eq!(events[0].payload, vec![99u8]);
+        let (delta, _) = t.drain(&ReplicationSchema { component_type: ComponentId(1), fields: vec![] }, ClientId(0), &AuthorityTable::new());
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].entity, e);
+        assert_eq!(delta.events[0].payload, vec![99u8]);
     }
 
     #[test]
@@ -1289,5 +1479,268 @@ mod tests {
         assert_eq!(decode_field_value(&opaque, &buf, &mut decoded), ErrorCode::Ok);
         let result = u64::from_le_bytes(decoded.try_into().unwrap());
         assert_eq!(result, original);
+    }
+
+    // ── R3: Relevance, conditions, authority ────────────────────────
+
+    #[test]
+    fn condition_passes_always() {
+        assert!(condition_passes(&ReplicationCondition::Always, &Ownership::Server, &ClientId(0)));
+        assert!(condition_passes(&ReplicationCondition::Always, &Ownership::Client(ClientId(1)), &ClientId(0)));
+    }
+
+    #[test]
+    fn condition_passes_owner_only() {
+        let owner = Ownership::Client(ClientId(42));
+        assert!(condition_passes(&ReplicationCondition::OwnerOnly, &owner, &ClientId(42)));
+        assert!(!condition_passes(&ReplicationCondition::OwnerOnly, &owner, &ClientId(7)));
+        assert!(!condition_passes(&ReplicationCondition::OwnerOnly, &Ownership::Server, &ClientId(0)));
+    }
+
+    #[test]
+    fn condition_passes_skip_owner() {
+        let owner = Ownership::Client(ClientId(42));
+        assert!(!condition_passes(&ReplicationCondition::SkipOwner, &owner, &ClientId(42)));
+        assert!(condition_passes(&ReplicationCondition::SkipOwner, &owner, &ClientId(7)));
+    }
+
+    #[test]
+    fn condition_passes_simulated() {
+        let owner = Ownership::Client(ClientId(42));
+        assert!(!condition_passes(&ReplicationCondition::SimulatedOnly, &owner, &ClientId(42)));
+        assert!(condition_passes(&ReplicationCondition::SimulatedOnly, &owner, &ClientId(7)));
+        assert!(condition_passes(&ReplicationCondition::SimulatedOnly, &Ownership::Server, &ClientId(0)));
+    }
+
+    #[test]
+    fn condition_passes_autonomous() {
+        let owner = Ownership::Client(ClientId(42));
+        assert!(condition_passes(&ReplicationCondition::AutonomousOnly, &owner, &ClientId(42)));
+        assert!(!condition_passes(&ReplicationCondition::AutonomousOnly, &owner, &ClientId(7)));
+        assert!(!condition_passes(&ReplicationCondition::AutonomousOnly, &Ownership::Server, &ClientId(0)));
+    }
+
+    #[test]
+    fn condition_passes_authority_flags() {
+        assert!(condition_passes(&ReplicationCondition::ServerAuthority, &Ownership::Server, &ClientId(0)));
+        assert!(condition_passes(&ReplicationCondition::ClientAuthority, &Ownership::Server, &ClientId(0)));
+        assert!(condition_passes(&ReplicationCondition::Multicast, &Ownership::Server, &ClientId(0)));
+    }
+
+    #[test]
+    fn condition_passes_initial_and_rpc_always_false() {
+        assert!(!condition_passes(&ReplicationCondition::InitialOnly, &Ownership::Server, &ClientId(0)));
+        assert!(!condition_passes(&ReplicationCondition::ServerToClient, &Ownership::Server, &ClientId(0)));
+        assert!(!condition_passes(&ReplicationCondition::ClientToServer, &Ownership::Server, &ClientId(0)));
+    }
+
+    #[test]
+    fn authority_table_owner_of() {
+        let mut at = AuthorityTable::new();
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        assert_eq!(at.owner_of(e1), Ownership::Server); // default
+        at.set_entity_owner(e1, Ownership::Client(ClientId(7)));
+        assert_eq!(at.owner_of(e1), Ownership::Client(ClientId(7)));
+        assert_eq!(at.owner_of(e2), Ownership::Server); // unset
+    }
+
+    #[test]
+    fn authority_table_can_write_respects_entity_owner() {
+        let mut at = AuthorityTable::new();
+        let e = make_entity(0, 1);
+        at.set_entity_owner(e, Ownership::Client(ClientId(5)));
+        assert!(at.can_write(e, ComponentId(1), 0, ClientId(5)));
+        assert!(!at.can_write(e, ComponentId(1), 0, ClientId(9)));
+        // Server cannot write to a client-owned entity.
+        assert!(!at.can_write(e, ComponentId(1), 0, ClientId(0)));
+    }
+
+    #[test]
+    fn authority_table_can_write_field_override_takes_precedence() {
+        let mut at = AuthorityTable::new();
+        let e = make_entity(0, 1);
+        at.set_entity_owner(e, Ownership::Client(ClientId(5)));
+        at.set_field_owner(e, ComponentId(1), 0, Ownership::Shared);
+        // Field override: anyone can write field 0.
+        assert!(at.can_write(e, ComponentId(1), 0, ClientId(99)));
+        // Different field still uses entity-level.
+        assert!(!at.can_write(e, ComponentId(1), 1, ClientId(99)));
+    }
+
+    #[test]
+    fn resolve_conflict_picks_higher_client_id() {
+        let mut at = AuthorityTable::new();
+        let e = make_entity(0, 1);
+        let cid = ComponentId(1);
+
+        let delta_a = Delta {
+            frame: 10, base_frame: 9,
+            spawned: vec![(e, vec![1])],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta { entity: e, component_type: cid, field_data: vec![vec![1]] }],
+            events: vec![],
+        };
+        let delta_b = Delta {
+            frame: 10, base_frame: 9,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta { entity: e, component_type: cid, field_data: vec![vec![2]] }],
+            events: vec![],
+        };
+
+        // client_b (higher ID) wins.
+        let merged = AuthorityTable::resolve_conflict(&at, &delta_a, ClientId(1), &delta_b, ClientId(2));
+        assert_eq!(merged.component_deltas[0].field_data[0], vec![2]);
+        assert_eq!(merged.spawned.len(), 1);
+    }
+
+    #[test]
+    fn resolve_conflict_merges_spawns_from_both() {
+        let at = AuthorityTable::new();
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        let delta_a = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(e1, vec![])],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        let delta_b = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(e2, vec![])],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        let merged = AuthorityTable::resolve_conflict(&at, &delta_a, ClientId(1), &delta_b, ClientId(2));
+        assert_eq!(merged.spawned.len(), 2);
+    }
+
+    #[test]
+    fn relevance_set_condition_filter() {
+        let mut set = RelevanceSet::new();
+        let e = make_entity(0, 1);
+        set.add(e);
+
+        let mut authority = AuthorityTable::new();
+        authority.set_entity_owner(e, Ownership::Client(ClientId(42)));
+
+        let mut reg = ReplicationRegistry::new();
+        let f32_cid = crate::component::component_id::<f32>();
+        let builder = reg.register::<f32>();
+        let builder = builder.field("test", ReplicationEncoding::Pod, ReplicationCondition::SimulatedOnly);
+        reg.insert(builder);
+
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta { entity: e, component_type: f32_cid, field_data: vec![vec![1]] }],
+            events: vec![],
+        };
+
+        // Different client (not owner) — SimulatedOnly passes because client != owner.
+        let view = set.filter(&delta, &authority, &reg, ClientId(7));
+        assert_eq!(view.component_deltas.len(), 1);
+
+        // Owner client — SimulatedOnly fails because client == owner.
+        let view = set.filter(&delta, &authority, &reg, ClientId(42));
+        assert_eq!(view.component_deltas.len(), 0);
+    }
+
+    #[test]
+    fn relevance_set_spawns_always_pass() {
+        let set = RelevanceSet::new(); // empty
+        let delta = Delta {
+            frame: 1, base_frame: 0,
+            spawned: vec![(make_entity(0, 1), vec![])],
+            despawned: vec![],
+            component_deltas: vec![],
+            events: vec![],
+        };
+        let view = set.filter(&delta, &AuthorityTable::new(), &ReplicationRegistry::new(), ClientId(0));
+        // Spawns pass through even with empty relevance set.
+        assert_eq!(view.spawned.len(), 1);
+    }
+
+    #[test]
+    fn multi_client_relevance_filter() {
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(1, 1);
+        let e3 = make_entity(2, 1);
+        let cid = crate::component::component_id::<f32>();
+
+        let mut authority = AuthorityTable::new();
+        authority.set_entity_owner(e1, Ownership::Client(ClientId(100)));
+        authority.set_entity_owner(e2, Ownership::Client(ClientId(200)));
+        // e3 has no owner (defaults to Server)
+
+        // Client 100: only e1 and e3 are relevant.
+        let mut set_a = RelevanceSet::new();
+        set_a.add(e1);
+        set_a.add(e3);
+
+        // Client 200: only e2 and e3 are relevant.
+        let mut set_b = RelevanceSet::new();
+        set_b.add(e2);
+        set_b.add(e3);
+
+        let delta = Delta {
+            frame: 5, base_frame: 4,
+            spawned: vec![(e1, vec![]), (e2, vec![]), (e3, vec![])],
+            despawned: vec![],
+            component_deltas: vec![
+                ComponentDelta { entity: e1, component_type: cid, field_data: vec![vec![10]] },
+                ComponentDelta { entity: e2, component_type: cid, field_data: vec![vec![20]] },
+                ComponentDelta { entity: e3, component_type: cid, field_data: vec![vec![30]] },
+            ],
+            events: vec![],
+        };
+
+        let reg = ReplicationRegistry::new(); // no schema means conditions always pass (empty fields)
+
+        let view_a = set_a.filter(&delta, &authority, &reg, ClientId(100));
+        assert_eq!(view_a.component_deltas.len(), 2); // e1 + e3
+        assert!(view_a.component_deltas.iter().any(|cd| cd.entity == e1));
+        assert!(view_a.component_deltas.iter().any(|cd| cd.entity == e3));
+        assert!(!view_a.component_deltas.iter().any(|cd| cd.entity == e2));
+
+        let view_b = set_b.filter(&delta, &authority, &reg, ClientId(200));
+        assert_eq!(view_b.component_deltas.len(), 2); // e2 + e3
+        assert!(view_b.component_deltas.iter().any(|cd| cd.entity == e2));
+        assert!(view_b.component_deltas.iter().any(|cd| cd.entity == e3));
+        assert!(!view_b.component_deltas.iter().any(|cd| cd.entity == e1));
+    }
+
+    #[test]
+    fn shared_conflict_resolution_two_writes() {
+        let at = AuthorityTable::new();
+        let e = make_entity(0, 1);
+        let cid = ComponentId(99);
+
+        let delta_a = Delta {
+            frame: 10, base_frame: 9,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta { entity: e, component_type: cid, field_data: vec![vec![10]] }],
+            events: vec![],
+        };
+        let delta_b = Delta {
+            frame: 10, base_frame: 9,
+            spawned: vec![],
+            despawned: vec![],
+            component_deltas: vec![ComponentDelta { entity: e, component_type: cid, field_data: vec![vec![20]] }],
+            events: vec![],
+        };
+
+        // Higher ClientId wins: client_b (200) beats client_a (100).
+        let merged = AuthorityTable::resolve_conflict(&at, &delta_a, ClientId(100), &delta_b, ClientId(200));
+        assert_eq!(merged.component_deltas[0].field_data[0], vec![20]);
+
+        // Reversed: client_a (200) now beats client_b (100).
+        let merged = AuthorityTable::resolve_conflict(&at, &delta_b, ClientId(100), &delta_a, ClientId(200));
+        assert_eq!(merged.component_deltas[0].field_data[0], vec![10]);
     }
 }
