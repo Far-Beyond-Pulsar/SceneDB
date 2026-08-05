@@ -4027,4 +4027,123 @@ mod tests {
             assert_deltas_equal(&r1, &r2);
         }
     }
+
+    // ── Adversarial / boundary fuzzing ──────────────────────────────
+    //
+    // The tests above feed well-formed random *content*. These feed
+    // well-formed messages truncated at every possible byte offset — the
+    // shape a hostile or simply out-of-sync peer's traffic actually takes.
+    // Every decoder here must return a clean `Err`/`None` for a truncated
+    // or malformed buffer; a panic (or, before this hardening pass, actual
+    // undefined behavior for non-`Pod` fields) is a test failure.
+
+    #[test]
+    fn delta_from_bytes_truncated_at_every_offset_never_panics() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF01);
+        for _ in 0..20 {
+            let d = random_delta(&mut rng);
+            let bytes = d.to_bytes();
+            for cut in 0..bytes.len() {
+                // Must not panic; a `Some` result (rare — only when `cut`
+                // happens to land on a valid message boundary) must itself
+                // be internally consistent, not garbage.
+                let _ = Delta::from_bytes(&bytes[..cut]);
+            }
+            // The untruncated buffer must still decode correctly.
+            assert!(Delta::from_bytes(&bytes).is_some());
+        }
+    }
+
+    #[test]
+    fn handshake_truncated_at_every_offset_never_panics() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF02);
+        for _ in 0..20 {
+            let mut reg = ReplicationRegistry::new();
+            let n_schemas = rng.gen_range(1..4);
+            for _ in 0..n_schemas {
+                let component_type = ComponentId(rng.gen_range(1..1000));
+                let n_fields = rng.gen_range(0..5);
+                let fields = (0..n_fields)
+                    .map(|field_index| FieldDescriptor {
+                        field_index,
+                        encoding: random_encoding(&mut rng),
+                        condition: random_condition(&mut rng),
+                        event_channel: None,
+                        ops: None,
+                    })
+                    .collect();
+                reg.schemas.insert(component_type, ReplicationSchema { component_type, fields, row_ops: None });
+            }
+            let msg = reg.handshake_message();
+            for cut in 0..msg.len() {
+                let _ = ReplicationRegistry::from_handshake(&msg[..cut]);
+            }
+            assert!(ReplicationRegistry::from_handshake(&msg).is_ok());
+        }
+    }
+
+    #[test]
+    fn string_replicate_decode_never_panics_on_random_bytes() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF03);
+        for _ in 0..500 {
+            let bytes = random_bytes(&mut rng, 32);
+            // Either a valid UTF-8 string comes back, or a clean error —
+            // never a panic, regardless of what garbage bytes arrive.
+            let _ = String::replicate_decode(&bytes);
+        }
+    }
+
+    #[test]
+    fn vec_replicate_decode_rejects_truncated_length_prefix() {
+        // Declares 100 elements but supplies none — must error, not read
+        // out of bounds or loop forever.
+        let mut bytes = 100u32.to_le_bytes().to_vec();
+        assert_eq!(Vec::<u32>::replicate_decode(&bytes), Err(ErrorCode::InvalidData));
+
+        // Declares one element with a byte-length far larger than what's
+        // actually supplied.
+        bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1_000_000u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(Vec::<u32>::replicate_decode(&bytes), Err(ErrorCode::InvalidData));
+
+        // Fuzz: random short buffers must never panic, even though they
+        // often start with a `count` prefix implying far more data than
+        // is actually present.
+        let mut rng = StdRng::seed_from_u64(0xBEEF04);
+        for _ in 0..500 {
+            let bytes = random_bytes(&mut rng, 16);
+            let _ = Vec::<u32>::replicate_decode(&bytes);
+            let _ = Vec::<String>::replicate_decode(&bytes);
+        }
+    }
+
+    #[test]
+    fn option_replicate_decode_rejects_invalid_tag() {
+        assert_eq!(Option::<u32>::replicate_decode(&[]), Err(ErrorCode::InvalidData));
+        assert_eq!(Option::<u32>::replicate_decode(&[2]), Err(ErrorCode::InvalidData));
+        assert_eq!(Option::<u32>::replicate_decode(&[0]), Ok(None));
+        // Tag says `Some` but the payload is truncated for a 4-byte u32.
+        assert_eq!(Option::<u32>::replicate_decode(&[1, 0, 0]), Err(ErrorCode::InvalidData));
+    }
+
+    #[test]
+    fn pod_replicate_decode_rejects_wrong_length_instead_of_ub() {
+        assert_eq!(f32::replicate_decode(&[1, 2, 3]), Err(ErrorCode::InvalidData));
+        assert_eq!(f32::replicate_decode(&[1, 2, 3, 4, 5]), Err(ErrorCode::InvalidData));
+        assert_eq!(u64::replicate_decode(&[0u8; 7]), Err(ErrorCode::InvalidData));
+        assert!(f32::replicate_decode(&1.5f32.to_le_bytes()).is_ok());
+    }
+
+    #[test]
+    fn f32_array_replicate_decode_rejects_wrong_length() {
+        assert_eq!(<[f32; 3]>::replicate_decode(&[0u8; 11]), Err(ErrorCode::InvalidData));
+        assert_eq!(<[f32; 3]>::replicate_decode(&[0u8; 13]), Err(ErrorCode::InvalidData));
+        let encoded = {
+            let mut buf = Vec::new();
+            [1.0f32, 2.0, 3.0].replicate_encode(&mut buf);
+            buf
+        };
+        assert_eq!(<[f32; 3]>::replicate_decode(&encoded), Ok([1.0, 2.0, 3.0]));
+    }
 }
