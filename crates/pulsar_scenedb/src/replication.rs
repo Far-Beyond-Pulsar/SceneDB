@@ -332,12 +332,11 @@ pub enum Ownership {
 
 /// Describes one replicated field on a component type.
 #[derive(Clone, Debug)]
-pub(crate) struct FieldDescriptor {
-    field_index: u32,
-    encoding: ReplicationEncoding,
-    condition: ReplicationCondition,
-    /// For Event fields: the delivery channel.
-    event_channel: Option<EventChannel>,
+pub struct FieldDescriptor {
+    pub field_index: u32,
+    pub encoding: ReplicationEncoding,
+    pub condition: ReplicationCondition,
+    pub event_channel: Option<EventChannel>,
 }
 
 /// Per-component-type replication schema.
