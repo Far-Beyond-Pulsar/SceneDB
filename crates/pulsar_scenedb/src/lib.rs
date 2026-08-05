@@ -102,7 +102,12 @@ pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
 pub use handle::Handle;
-pub use replication::{ReplicationRegistry, SchemaBuilder};
+pub use replication::{
+    AuthorityTable, ChangeTracker, ClientId, ClientInput, ComponentDelta, condition_passes,
+    Delta, DeltaView, encode_field_value, ErrorCode, EventBatch, EventChannel, Ownership,
+    Reconciler, RelevanceSet, ReplicatedEvent, ReplicationCondition, ReplicationEncoding,
+    ReplicationRegistry, SchemaBuilder, Snapshot,
+};
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;
 pub use page::{
