@@ -1977,4 +1977,31 @@ mod tests {
             assert_eq!(ev.payload, vec![i as u8]);
         }
     }
+
+    #[test]
+    fn event_encoding_excluded_from_state_deltas() {
+        // Event encoding should produce no bytes in the buffer.
+        let mut buf = Vec::new();
+        assert_eq!(encode_field_value(&ReplicationEncoding::Event, &[1, 2, 3], &mut buf), ErrorCode::Ok);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn event_channel_marking_is_preserved() {
+        let ev = ReplicatedEvent {
+            entity: make_entity(0, 1),
+            component_type: ComponentId(1),
+            event_field: 0,
+            payload: vec![],
+            channel: EventChannel::Unreliable,
+            target_client: None,
+        };
+        assert_eq!(ev.channel, EventChannel::Unreliable);
+
+        let ev2 = ReplicatedEvent {
+            channel: EventChannel::ReliableOrdered,
+            ..ev.clone()
+        };
+        assert_eq!(ev2.channel, EventChannel::ReliableOrdered);
+    }
 }
