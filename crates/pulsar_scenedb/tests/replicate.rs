@@ -1,4 +1,7 @@
-use pulsar_scenedb::{ReplicationEncoding, ReplicationCondition, EventChannel, ReplicationRegistry};
+use pulsar_scenedb::{
+    component_id, ReplicationEncoding, ReplicationCondition,
+    EventChannel, ReplicationRegistry,
+};
 use pulsar_scenedb_derive::Replicate;
 
 #[derive(Replicate)]
@@ -18,7 +21,7 @@ fn replicate_derive_registers_schema() {
     let mut registry = ReplicationRegistry::new();
     TestComp::register_replication(&mut registry);
 
-    let cid = pulsar_scenedb::component_id::<TestComp>();
+    let cid = component_id::<TestComp>();
     let schema = registry.schema(cid).unwrap();
     assert_eq!(schema.fields.len(), 3);
     assert!(matches!(schema.fields[0].encoding, ReplicationEncoding::Pod));
