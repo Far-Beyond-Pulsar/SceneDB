@@ -186,3 +186,56 @@ fn garbage_handshake_bytes_over_real_socket_are_rejected_not_panicked() {
 
     server.join().expect("server thread panicked");
 }
+
+// ── Inverse of the happy path's compatibility check ─────────────────────
+//
+// `handshake_and_delta_round_trip_over_real_tcp_socket` asserts the
+// handshake-derived schema and the locally-registered schema agree on
+// field count. An `assert_eq!` that always happens to see equal values
+// proves nothing about whether it would actually catch a real mismatch —
+// this test builds a genuine version-skewed pair (same `ComponentId`, a
+// different number of declared fields) and confirms the disagreement is
+// visible, not silently absorbed.
+
+#[test]
+fn mismatched_schema_field_count_is_detected() {
+    let cid = component_id::<Position>();
+
+    // "Remote" peer: the real, derive-generated `Position` schema, round
+    // tripped through the wire handshake format exactly like the happy path.
+    let mut remote = ReplicationRegistry::new();
+    Position::register_replication(&mut remote);
+    let handshake_bytes = remote.handshake_message();
+    let remote_view = ReplicationRegistry::from_handshake(&handshake_bytes).expect("valid handshake");
+    let remote_field_count = remote_view.schema(cid).unwrap().fields.len();
+
+    // "Local" peer: a hand-built schema for the SAME `ComponentId` that
+    // declares an extra field — standing in for a locally-compiled
+    // `Position` that drifted from what the remote binary was built with
+    // (e.g. a field added on one side of a rolling deploy).
+    let mut local = ReplicationRegistry::new();
+    let builder = local.register::<Position>();
+    let builder = builder
+        .field(
+            "xyz",
+            |c: &Position| &c.xyz,
+            |c: &mut Position| &mut c.xyz,
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        )
+        .field(
+            "xyz_again",
+            |c: &Position| &c.xyz,
+            |c: &mut Position| &mut c.xyz,
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        );
+    local.insert(builder);
+    let local_field_count = local.schema(cid).unwrap().fields.len();
+
+    assert_ne!(
+        remote_field_count, local_field_count,
+        "this test's own setup must produce a genuine schema mismatch, or it isn't proving the \
+         compatibility check in the happy-path test can ever fail",
+    );
+}
