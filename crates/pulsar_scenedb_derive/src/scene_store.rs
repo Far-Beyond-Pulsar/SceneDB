@@ -42,6 +42,68 @@ impl Parse for GpuAttr {
     }
 }
 
+// ── Struct-level `#[gpu(layout = packed)]` attribute parsing ───────────────
+//
+// A separate, struct-level use of the same `gpu` attribute name as the
+// per-field one above -- no ambiguity, since `syn`/the derive macro reads
+// struct attrs (`DeriveInput::attrs`) and field attrs (`Field::attrs`)
+// through entirely separate code paths.
+
+pub struct StructGpuAttr {
+    pub layout_packed: bool,
+}
+
+impl Parse for StructGpuAttr {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(StructGpuAttr { layout_packed: false });
+        }
+        let key: Ident = input.parse()?;
+        if key != "layout" {
+            return Err(syn::Error::new(key.span(), "expected `layout` (e.g. `#[gpu(layout = packed)]`)"));
+        }
+        let _: syn::Token![=] = input.parse()?;
+        let value: Ident = input.parse()?;
+        if value != "packed" {
+            return Err(syn::Error::new(value.span(), "expected `packed` -- the only supported layout today"));
+        }
+        Ok(StructGpuAttr { layout_packed: true })
+    }
+}
+
+/// Scans a struct's own attributes (not its fields') for `#[gpu(layout = packed)]`.
+///
+/// Packed layout groups every `#[gpu]` field into ONE GPU buffer (a single
+/// interleaved record per row) instead of the default one-buffer-per-field
+/// split -- for structs, like a renderer's per-instance GPU record, whose
+/// `#[gpu]` fields are always read together and were never independent
+/// columns to begin with. Deliberately scoped to the World-mirror path only
+/// (`register_gpu_columns_growable` + `World::insert`'s automatic dispatch):
+/// it does NOT change `gpu_columns()`, `write_gpu`, or the fixed
+/// `register_gpu_columns` at all -- those stay exactly as they are for
+/// EVERY `#[derive(SceneStore)]` type, packed or not, because the
+/// cell-mirrored path's dirty-tracked boundary sync reads FROM CellStorage's
+/// own per-field SoA columns, which packing has no relationship to (packing
+/// only changes what shape of buffer the data is written *into* on the GPU
+/// side, not how it's stored on the CPU side). Requires at least one
+/// `#[gpu]` field to have any effect -- a packed struct with none behaves
+/// identically to one without the attribute at all (nothing to pack).
+pub fn struct_is_packed(attrs: &[syn::Attribute]) -> bool {
+    // Lenient on parse failure (a bare `#[gpu]` with no `(...)` at all, or
+    // unrecognized content), matching the existing per-field `#[gpu]`
+    // parsing's own tolerance (`scene_store::expand`'s field loop: `if let
+    // Ok(...) = attr.parse_args()`) rather than hard-erroring -- consistent
+    // behavior for the same attribute name used at two different syntactic
+    // positions in this macro.
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("gpu")
+            && attr
+                .parse_args::<StructGpuAttr>()
+                .map(|parsed| parsed.layout_packed)
+                .unwrap_or(false)
+    })
+}
+
 // ── Per-field metadata ────────────────────────────────────────────────────
 
 pub struct FieldInfo {
@@ -199,8 +261,15 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         })
         .collect();
 
-    let gpu_column_set =
-        generate_gpu_column_set(name, &impl_generics, &ty_generics, where_clause, &gpu_fields);
+    let is_packed = struct_is_packed(&input.attrs);
+    let gpu_column_set = generate_gpu_column_set(
+        name,
+        &impl_generics,
+        &ty_generics,
+        where_clause,
+        &gpu_fields,
+        is_packed,
+    );
     // NOTE: HasTypeToken is NOT generated here — the blanket impl in
     // `pulsar_scenedb::token` covers `T: Pod + 'static`, which our Pod impl
     // satisfies.  An explicit impl would conflict.

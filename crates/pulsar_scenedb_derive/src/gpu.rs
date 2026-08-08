@@ -10,6 +10,7 @@ pub fn generate_gpu_column_set(
     ty_generics: &syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
     gpu_fields: &[&FieldInfo],
+    is_packed: bool,
 ) -> TokenStream {
     if gpu_fields.is_empty() {
         return quote! {
@@ -137,7 +138,109 @@ pub fn generate_gpu_column_set(
     // submits no registration at all, so `World::insert` for it is exactly
     // one `HashMap` miss when a mirror is attached, nothing when it isn't.
     let mirror_dispatch_fn_name = quote::format_ident!("__scenedb_gpu_mirror_dispatch_{}", name);
-    let world_mirror_registration = quote! {
+
+    // Packed layout (`#[gpu(layout = packed)]`, struct-level): ONE GPU
+    // buffer for every `#[gpu]` field combined, instead of the default
+    // one-per-field split -- see `struct_is_packed`'s doc for the full
+    // rationale and why this is scoped to ONLY `register_gpu_columns_growable`
+    // + the World-mirror dispatch fn (`gpu_columns()`/`write_gpu`/the fixed
+    // `register_gpu_columns`, generated above, are completely unaffected --
+    // still per-field, for the cell-mirrored path, regardless of this flag).
+    let packed_view_ident = quote::format_ident!("__ScenedbGpuPacked_{}", name);
+    let packed_field_defs: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            quote! { pub #ident: #ty }
+        })
+        .collect();
+    let packed_field_idents: Vec<_> = gpu_fields.iter().map(|f| f.ident.clone()).collect();
+    let packed_view_def = quote! {
+        // Field-for-field copy of every #[gpu] field on #name, in
+        // declaration order -- NOT a repr(transparent) single-field wrapper
+        // like the per-field #[gpu] wrappers above; this is the actual
+        // interleaved GPU-side record a shader reads as one struct. Unique
+        // by construction (its name embeds #name), so unlike the per-field
+        // wrappers it doesn't need the (struct, field) disambiguation
+        // trick -- there's exactly one of these per packed struct.
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct #packed_view_ident {
+            #(#packed_field_defs),*
+        }
+        unsafe impl ::pulsar_scenedb::page::Pod for #packed_view_ident {}
+    };
+
+    let register_growable_calls_packed = {
+        let buffer_label = format!("{}::packed", name);
+        quote! {
+            store.register_growable_gpu_buffer::<#packed_view_ident>(initial_capacity, None, device, #buffer_label);
+        }
+    };
+
+    let world_mirror_registration_packed = quote! {
+        #packed_view_def
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_dispatch_fn_name(
+            mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
+            row: u32,
+            data: *const (),
+        ) {
+            // SAFETY: same contract as the non-packed dispatch fn below --
+            // `data` is guaranteed to point at a live, correctly-aligned
+            // `#name` (the sole caller, `World::insert_inner`, only reaches
+            // this via `#name`'s own `ComponentId`).
+            let data = unsafe { &*(data as *const #name #ty_generics) };
+            // Assembled via ordinary field access, NOT a raw byte-offset
+            // read from `&#name` -- #name's own field layout is compiler-
+            // chosen (no repr(C) forced on it) and may interleave #[gpu]
+            // and non-#[gpu] fields in any order, so the packed fields are
+            // not generally contiguous within #name itself. Building a
+            // fresh #packed_view_ident value by name is what makes packed
+            // layout correct regardless of #name's actual layout.
+            let packed = #packed_view_ident {
+                #(#packed_field_idents: data.#packed_field_idents),*
+            };
+            let bytes: &[u8] = unsafe {
+                ::std::slice::from_raw_parts(
+                    &packed as *const #packed_view_ident as *const u8,
+                    ::std::mem::size_of::<#packed_view_ident>(),
+                )
+            };
+            let id = ::pulsar_scenedb::component::component_id::<#packed_view_ident>();
+            let store = mirror.store();
+            let queue = mirror.queue();
+            if store.write_row_bytes(id, queue, bytes, row) {
+                return;
+            }
+            match store.write_row_bytes_growing(id, queue, bytes, row) {
+                None => {} // not registered at all -- bring-up, not an error
+                Some(Ok(())) => {}
+                Some(Err(cap_err)) => panic!(
+                    "World-mirrored packed GPU column for {} hit its configured \
+                     max_capacity ({}) at row {row} (requested {}) -- packed columns \
+                     registered via register_gpu_columns_growable never set a ceiling, \
+                     so this should be unreachable unless this type's packed buffer was \
+                     registered by hand with an explicit max_capacity",
+                    stringify!(#name), cap_err.max, cap_err.requested,
+                ),
+            }
+        }
+
+        ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+            ::pulsar_scenedb::gpu::GpuMirrorRegistration {
+                component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                dispatch: #mirror_dispatch_fn_name,
+            }
+        }
+    };
+
+    let world_mirror_registration_default = quote! {
         #[doc(hidden)]
         #[allow(non_snake_case)]
         fn #mirror_dispatch_fn_name(
@@ -167,6 +270,33 @@ pub fn generate_gpu_column_set(
                 dispatch: #mirror_dispatch_fn_name,
             }
         }
+    };
+
+    let (register_growable_calls, world_mirror_registration) = if is_packed {
+        (vec![register_growable_calls_packed], world_mirror_registration_packed)
+    } else {
+        (register_growable_calls, world_mirror_registration_default)
+    };
+
+    // Only emitted for packed types: the packed view struct is intentionally
+    // unnameable from outside this macro's generated code (same reasoning as
+    // the per-field `#[gpu]` wrapper types -- see `FieldInfo::gpu_wrapper`'s
+    // doc), so this is the supported way to reach its `ComponentId` (and,
+    // through `SceneGpuStore::with_growable_buffer_for_id`/`buffer_for_id`,
+    // its actual `wgpu::Buffer`) from outside — needed by anything binding
+    // this buffer into a shader (the real motivating use, e.g. Helio).
+    let packed_accessor = if is_packed {
+        quote! {
+            impl #impl_generics #name #ty_generics #where_clause {
+                /// `ComponentId` of this type's packed GPU buffer
+                /// (registered via [`Self::register_gpu_columns_growable`]).
+                pub fn packed_gpu_component_id() -> ::pulsar_scenedb::ComponentId {
+                    ::pulsar_scenedb::component::component_id::<#packed_view_ident>()
+                }
+            }
+        }
+    } else {
+        quote! {}
     };
 
     quote! {
@@ -235,6 +365,8 @@ pub fn generate_gpu_column_set(
                 #(#register_growable_calls)*
             }
         }
+
+        #packed_accessor
 
         #world_mirror_registration
     }
