@@ -302,17 +302,32 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             stats.ranges += 1;
             stats.bytes += ((end - start) as usize * std::mem::size_of::<T>()) as u64;
         };
-        for row in 0..shadow_len {
-            if dirty.is_marked(row) {
-                if run_start.is_none() {
+        // Helio#214: walk only the marked rows (`DirtyMask::for_each_marked`
+        // skips whole all-zero 64-bit words), not every row in
+        // `0..shadow_len` -- a benchmark found the row-by-row scan cost
+        // nearly the same at 0% and 10% dirty (100,000 capacity), the scan
+        // itself dominating over the actual writes. Adjacency is now
+        // detected by row delta (`row != run_end`) instead of "was this
+        // specific row NOT marked", since non-dirty rows are no longer
+        // visited at all to compare against.
+        let mut run_end: u32 = 0;
+        dirty.for_each_marked(|row| {
+            match run_start {
+                Some(_) if row == run_end => {
+                    // extends the current run
+                }
+                Some(start) => {
+                    flush_run(start, run_end, &mut stats);
                     run_start = Some(row);
                 }
-            } else if let Some(start) = run_start.take() {
-                flush_run(start, row, &mut stats);
+                None => {
+                    run_start = Some(row);
+                }
             }
-        }
+            run_end = row + 1;
+        });
         if let Some(start) = run_start {
-            flush_run(start, shadow_len, &mut stats);
+            flush_run(start, run_end, &mut stats);
         }
         dirty.clear_all();
         stats
