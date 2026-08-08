@@ -114,3 +114,7 @@ required-features = ["gpu"]
 [[test]]
 name = "world_gpu_mirror_growable"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_packed_layout"
+required-features = ["gpu"]

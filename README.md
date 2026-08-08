@@ -271,6 +271,44 @@ pub struct StaticMeshInstance {
 }
 ```
 
+#### Packed layout with `#[gpu(layout = packed)]`
+
+By default every `#[gpu]` field gets its own buffer — the right shape for genuinely independent fields (two components' unrelated `f32`s never share storage just because they're the same size). Some structs are the opposite case: a renderer's per-instance GPU record, where every `#[gpu]` field is always read together, by one shader, as one interleaved struct — exactly the shape of Helio's `GpuInstanceData` (model matrix, normal matrix, bounds, previous-frame matrix, mesh/material ids, flags — always bound and read as a single 208-byte record, never independently). Splitting that into 8 separate buffers has no benefit and forces a shader rewrite for no reason. `#[gpu(layout = packed)]` on the struct groups every `#[gpu]` field into one buffer instead:
+
+```rust
+#[derive(SceneStore, Clone, Copy)]
+#[gpu(layout = packed)]
+pub struct InstanceComponent {
+    #[gpu]
+    pub model: [f32; 16],
+    #[gpu]
+    pub mesh_id: u32,
+    #[gpu]
+    pub material_id: u32,
+    #[gpu]
+    pub flags: u32,
+    pub local_lod_bias: f32, // no #[gpu] -- stays CPU-only, excluded from the packed buffer
+}
+
+InstanceComponent::register_gpu_columns_growable(&mut store, 1024, &device);
+world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(&queue)));
+world.insert(entity, InstanceComponent { model, mesh_id, material_id, flags, local_lod_bias: 0.0 });
+// -> one write, one buffer, one interleaved record per row, assembled by
+//    field access (safe -- InstanceComponent's own field order isn't
+//    forced to match the packed record's, since it's built fresh from
+//    named field reads, not a raw byte-range copy).
+
+// The packed buffer's underlying type is intentionally unnameable (same
+// reasoning as the per-field #[gpu] wrapper types) -- reach it by
+// ComponentId instead:
+let id = InstanceComponent::packed_gpu_component_id();
+store.with_growable_buffer_for_id(id, &mut |buf| {
+    // bind `buf` into a bind group, exactly like any other wgpu::Buffer
+});
+```
+
+Scoped deliberately to the World-mirror path only: `gpu_columns()`, `write_gpu` (the `CellStorage`/`Handle` path), and the fixed (non-growable) `register_gpu_columns` are completely unaffected by this attribute — they stay per-field regardless, because the cell-mirrored boundary sync reads from `CellStorage`'s own per-field SoA columns, which packing has no relationship to. Only `register_gpu_columns_growable` and `World::insert`'s automatic dispatch route through the packed buffer. If you need a packed layout for the cell-mirrored path too, hand-write a `GpuColumnSet` treating the whole struct as one column (the pattern `tests/gpu_generic_column.rs` proves) — the derive doesn't generate that for you today.
+
 #### Fully CPU-only component
 
 Omit `#[gpu]` entirely:
