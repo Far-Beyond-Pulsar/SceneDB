@@ -103,6 +103,48 @@ pub fn generate_gpu_column_set(
         })
         .collect();
 
+    // World-mirror dispatch registration (`pulsar_scenedb::gpu::world_mirror`):
+    // a non-generic function with `#name` already concrete, submitted via
+    // `inventory` so `World::insert` can find it by `ComponentId` without
+    // needing compile-time specialization on the caller's generic `T` --
+    // see that module's doc for why the specialization approach doesn't
+    // work through a generic `insert_inner<T>` body. Only emitted here (in
+    // the non-empty-`gpu_fields` branch) -- a type with no `#[gpu]` fields
+    // submits no registration at all, so `World::insert` for it is exactly
+    // one `HashMap` miss when a mirror is attached, nothing when it isn't.
+    let mirror_dispatch_fn_name = quote::format_ident!("__scenedb_gpu_mirror_dispatch_{}", name);
+    let world_mirror_registration = quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_dispatch_fn_name(
+            mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
+            row: u32,
+            data: *const (),
+        ) {
+            // SAFETY: the sole caller, `World::insert_inner`, only reaches
+            // this function by looking it up under `#name`'s own
+            // `ComponentId` (via `crate::component::component_id::<#name>`,
+            // the same key this registration is submitted under below), and
+            // passes `&value as *const T as *const ()` for that exact `T` --
+            // so `data` is guaranteed to point at a live, correctly-aligned
+            // `#name`.
+            let data = unsafe { &*(data as *const #name #ty_generics) };
+            ::pulsar_scenedb::gpu::world_mirror::write_gpu_columns_at_row(
+                mirror.store(),
+                mirror.queue(),
+                row,
+                data,
+            );
+        }
+
+        ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+            ::pulsar_scenedb::gpu::GpuMirrorRegistration {
+                component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                dispatch: #mirror_dispatch_fn_name,
+            }
+        }
+    };
+
     quote! {
         impl #impl_generics ::pulsar_scenedb::GpuColumnSet for #name #ty_generics #where_clause {
             fn gpu_columns() -> Vec<::pulsar_scenedb::GpuColumnDesc> {
@@ -151,5 +193,7 @@ pub fn generate_gpu_column_set(
                 #(#register_calls)*
             }
         }
+
+        #world_mirror_registration
     }
 }

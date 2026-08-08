@@ -107,7 +107,16 @@ pub use component::{component_id, Component, ComponentId};
 pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp, ComponentStore};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
+pub use gpu::{
+    GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle, GpuMirrorRegistration,
+    MirrorMode,
+};
+// Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
+// whatever crate uses the derive, not here) can reach `inventory::submit!`
+// via `::pulsar_scenedb::pulsar_reflection::inventory` without that crate
+// needing its own direct `pulsar_reflection` dependency — same reasoning
+// `wgpu` re-exports work by for `#[gpu]` field types.
+pub use pulsar_reflection;
 #[cfg(feature = "gpu")]
 pub use subsystem::{Subsystem, SubsystemRegistry};
 #[cfg(feature = "gpu")]

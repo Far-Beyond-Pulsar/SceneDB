@@ -61,6 +61,7 @@ jobs:
         --test gpu_store
         --test stress_gpu
         --test subsystem_reflection_test
+        --test world_gpu_mirror
     - name: Test allocation-count assertions (informational)
       # alloc_gate_gpu.rs asserts EXACT GPU allocation counts (e.g. "N=32 ->
       # 9 allocs, N=64 -> 8 allocs" must be equal) -- observed to differ
