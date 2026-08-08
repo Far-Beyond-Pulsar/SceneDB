@@ -23,6 +23,7 @@ mod grid;
 mod harvest;
 mod phase;
 mod region;
+mod scatter_write;
 mod scene_store;
 mod tracker;
 mod view_upload;

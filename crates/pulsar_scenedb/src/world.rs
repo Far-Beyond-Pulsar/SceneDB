@@ -101,16 +101,22 @@ impl World {
         self.gpu_mirror.as_ref()
     }
 
-    /// Uploads every row marked dirty since the last call, across every
-    /// `#[gpu(mirror = DirtyTracked)]` World-mirrored field (the default
-    /// `#[gpu]` mode), coalesced into as few GPU writes as row adjacency
-    /// allows. Call once per frame — the World-mirror analogue of the
-    /// cell-mirrored path's own boundary-phase sync. `None` if no mirror is
-    /// attached; `Some(SyncStats::default()-shaped)` (zero ranges/bytes) if
-    /// one is attached but nothing was dirty.
+    /// Uploads every row queued since the last call — both `#[gpu(mirror =
+    /// DirtyTracked)]` World-mirrored fields (the default `#[gpu]` mode) and,
+    /// as of SceneDB#39, `#[gpu(mirror = Once)]` fields and the liveness/
+    /// generation mirror, all of which now defer their writes here too
+    /// instead of writing immediately inline with `spawn`/`insert`/`despawn`
+    /// — coalesced into as few GPU writes as row adjacency allows. Call once
+    /// per frame — the World-mirror analogue of the cell-mirrored path's own
+    /// boundary-phase sync. `None` if no mirror is attached;
+    /// `Some(SyncStats::default()-shaped)` (zero ranges/bytes) if one is
+    /// attached but nothing was pending.
     #[cfg(feature = "gpu")]
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> Option<crate::gpu::SyncStats> {
-        self.gpu_mirror.as_ref().map(|m| m.store().flush_gpu_mirror(queue))
+        self.gpu_mirror.as_ref().map(|m| {
+            m.generations().flush(queue);
+            m.store().flush_gpu_mirror(queue)
+        })
     }
 
     /// Reserves capacity `n` on every registered World-mirrored GPU buffer
@@ -222,15 +228,17 @@ impl World {
         empty.entities.push(entity);
         self.entity_slots[idx as usize].row = row;
 
-        // GPU liveness mirror: keep row `idx`'s generation on the GPU in
-        // lockstep with entity_slots[idx].generation, the same value
-        // is_alive checks against on the CPU side. See
-        // `crate::gpu::world_mirror::GenerationMirror`'s doc for the
-        // read-side contract this exists to support.
-        #[cfg(feature = "gpu")]
-        if let Some(mirror) = &self.gpu_mirror {
-            mirror.write_generation(idx, gen);
-        }
+        // GPU liveness mirror: deliberately NOT touched here (SceneDB#39).
+        // A freshly spawned entity has no components yet, so at this point
+        // there is no way to know whether it will ever carry a `#[gpu]`
+        // field -- writing (or even queuing) a generation entry for every
+        // spawn regardless would mean every entity in the World pays a
+        // GPU-mirror cost the instant a mirror is attached, whether or not
+        // it ever touches GPU-mirrored data. Instead, `insert_inner` queues
+        // this row's generation the first time (if ever) it actually
+        // receives a `#[gpu]`-bearing component -- see
+        // `crate::gpu::world_mirror::GenerationMirror::note_gpu_bearing_insert`'s
+        // doc for the full contract this splits across spawn/insert/despawn.
 
         if let Some(t) = tracker {
             t.record_spawn(entity);
@@ -274,16 +282,22 @@ impl World {
         let new_generation = slot.generation;
         self.free_slots.push(entity.index());
 
-        // GPU liveness mirror: write the FRESHLY-BUMPED generation, not
+        // GPU liveness mirror: queue the FRESHLY-BUMPED generation, not
         // `entity`'s own (now-dead) one -- a reader still holding `entity`
         // must see a mismatch against this row going forward, exactly what
         // CPU-side `is_alive` already guarantees for `entity.generation()`
-        // vs. `entity_slots[idx].generation`. Written immediately at
-        // despawn, not deferred to the slot's eventual reuse by a future
-        // spawn -- `is_alive` itself doesn't wait for that either.
+        // vs. `entity_slots[idx].generation`. A genuine no-op (SceneDB#39)
+        // if this row never received a `#[gpu]`-bearing component in the
+        // first place -- see `GenerationMirror::note_despawn`'s doc. Queued
+        // for the next `flush_gpu_mirror`, not written immediately; the
+        // "reader must see a mismatch going forward" guarantee only needs to
+        // hold by the next point anything actually reads GPU-mirrored state,
+        // which is already gated on a flush having happened (same standing
+        // assumption every other World-mirrored write in this crate rests
+        // on).
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            mirror.write_generation(entity.index(), new_generation);
+            mirror.generations().note_despawn(entity.index(), new_generation);
         }
 
         if let Some(t) = tracker {
@@ -407,6 +421,18 @@ impl World {
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
             if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+                // First time this entity gets ANY `#[gpu]`-bearing component
+                // (checked via `is_new_insert`, not re-derived here): tell
+                // the liveness mirror there is now something on the GPU at
+                // this row that needs a generation entry -- and, eventually,
+                // invalidating on despawn. See
+                // `GenerationMirror::note_gpu_bearing_insert`'s doc; this is
+                // the other half of SceneDB#39's "non-GPU entities pay
+                // nothing" fix (the first half is that `spawn_inner` no
+                // longer touches the liveness mirror at all).
+                if is_new_insert {
+                    mirror.generations().note_gpu_bearing_insert(entity.index(), entity.generation());
+                }
                 dispatch(mirror, entity.index(), &value as *const T as *const (), is_new_insert);
             }
         }

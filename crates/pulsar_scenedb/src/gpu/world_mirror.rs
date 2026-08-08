@@ -64,9 +64,10 @@
 //! attempt, despite compiling cleanly with no errors or warnings pointing
 //! at the problem, was not.
 use crate::component::ComponentId;
-use crate::gpu::{GpuColumnSet, GrowableSceneBuffer, SceneGpuStore};
+use crate::gpu::{DirtyTrackedSceneBuffer, GpuColumnSet, SceneGpuStore};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Row-indexed liveness/generation buffer, mirroring `World::entity_slots`'s
 /// `generation` field on the GPU, keyed by `Entity::index()` exactly like
@@ -78,15 +79,67 @@ use std::sync::{Arc, OnceLock};
 /// `World::is_alive` already performs on the CPU side, made available to
 /// shaders.
 ///
-/// Built on [`GrowableSceneBuffer<u32>`] rather than the CellStorage-oriented
-/// `GenerationBuffer` type ([`super::GenerationBuffer`]) — that type's
-/// `rebuild`/`rebuild_region` methods and fixed `max_slots` are tailored to
-/// `RegionPool`'s boundary-scan self-healing, which World-mirroring has no
-/// equivalent of; a plain growable `u32` column already has everything this
-/// needs (one write per spawn/despawn, growing in lockstep with entity
-/// count, same as every other World-mirrored buffer).
+/// Built on [`DirtyTrackedSceneBuffer<u32>`] — the same shadow+dirty-mask
+/// mechanism `#[gpu]` (`DirtyTracked`) fields use — rather than the
+/// CellStorage-oriented `GenerationBuffer` type ([`super::GenerationBuffer`])
+/// or a hand-rolled pending-write queue. See "Why `DirtyTrackedSceneBuffer`,
+/// not a lighter structure" below for why this is the right call even though
+/// it costs one CPU-side `u32` shadow per row.
+///
+/// # Deferred, gated writes (SceneDB#39)
+///
+/// Writes here used to be immediate (`queue.write_buffer`, once per spawn
+/// AND once per despawn — i.e. at least two synchronous GPU calls per churn
+/// cycle) and unconditional: `World::spawn`/`despawn` wrote a generation
+/// entry for every entity regardless of whether it ever carried a `#[gpu]`
+/// field, since a freshly spawned entity's eventual components aren't known
+/// yet at spawn time. Confirmed by reading the call sites while
+/// investigating SceneDB#39 — not merely suspected. Fixed two ways,
+/// together:
+///
+/// - **Deferred**: [`Self::note_gpu_bearing_insert`]/[`Self::note_despawn`]
+///   only mark a row dirty ([`DirtyTrackedSceneBuffer::mark_dirty`], no GPU
+///   work, read-lock-first fast path); the actual upload happens in
+///   [`Self::flush`], coalesced the same way `#[gpu]` field flushes already
+///   are. A row despawned and respawned within the same unflushed frame
+///   collapses to one write of the final generation, not two.
+/// - **Gated**: an entity that never receives a `#[gpu]`-bearing component
+///   insert now costs *zero* GPU-mirror work, at spawn or at despawn —
+///   [`GpuMirroredRows`] tracks, per row, whether it has ever actually
+///   carried GPU-mirrored data, and both `note_*` methods no-op unless that
+///   flag says there is something on the GPU that actually needs
+///   invalidating. This is what makes "non-GPU entities are never affected"
+///   true by construction rather than by convention: an entity with no
+///   `#[gpu]` fields anywhere in its component set is now indistinguishable,
+///   cost-wise, from spawning/despawning it with no [`GpuMirrorHandle`]
+///   attached to the `World` at all.
+///
+/// # Why `DirtyTrackedSceneBuffer`, not a lighter structure
+///
+/// An earlier version of this fix used a hand-rolled `Mutex<HashMap<row,
+/// bytes>>` pending-write queue instead, specifically to avoid paying a
+/// persistent per-row CPU shadow for data that (for `Once`-mode fields) is
+/// only ever written once. Real-device re-benchmarking after that version
+/// showed it was the wrong trade: the `Mutex` (always exclusive, even
+/// single-threaded) plus a `HashMap` insert plus a `Box<[u8]>` heap
+/// allocation *per queued write* cost more, on the hot churn path, than the
+/// coalescing it bought back -- low-density churn (a small fraction of a
+/// large population respawning per frame, where few queued rows end up
+/// adjacent) measured *slower* than the original immediate-write code, not
+/// faster. `DirtyTrackedSceneBuffer::mark_dirty`'s read-lock-first fast path
+/// (Helio#213) has none of that: no heap allocation (the shadow's already
+/// there), no `HashMap` hashing, and multiple threads marking disjoint rows
+/// don't serialize against each other at all. The one thing it costs that
+/// the hand-rolled version didn't is a permanent `Vec<u32>` shadow sized to
+/// capacity -- 4 bytes/row for this specific column, and paid only by
+/// columns that actually opt into deferred writes (`Once`-mode fields and
+/// this liveness mirror), not by anything else. That's the right place to
+/// spend memory: a little, scoped to the fields that need it, in exchange
+/// for using the one write path in this crate already proven fast under
+/// real concurrent load.
 pub struct GenerationMirror {
-    buf: GrowableSceneBuffer<u32>,
+    buf: DirtyTrackedSceneBuffer<u32>,
+    gpu_mirrored_rows: GpuMirroredRows,
 }
 
 impl GenerationMirror {
@@ -95,16 +148,48 @@ impl GenerationMirror {
         // World-mirrored buffer's recommended (register_gpu_columns_growable)
         // configuration; see that method's doc for why World-mirrored
         // buffers specifically should never set a max_capacity ceiling.
-        Self { buf: GrowableSceneBuffer::new(device, "scenedb-world-mirror-generations", 64, None) }
+        Self {
+            buf: DirtyTrackedSceneBuffer::new(device, "scenedb-world-mirror-generations", 64),
+            gpu_mirrored_rows: GpuMirroredRows::new(),
+        }
     }
 
-    fn write(&self, queue: &wgpu::Queue, row: u32, generation: u32) {
-        // Growth here can never fail (no max_capacity was set above), so
-        // this is infallible in practice -- same reasoning
-        // `write_gpu_columns_at_row` documents for its own growable path.
-        self.buf
-            .write_row_growing(queue, row, &[generation])
-            .expect("generation mirror has no max_capacity -- growth cannot fail");
+    /// Called from `World::insert_inner` the first time `row` receives a
+    /// component with `#[gpu]` fields (i.e. exactly once per entity, not
+    /// once per `#[gpu]`-bearing component it happens to carry, and never
+    /// for an entity that never gets one at all). Marks `generation` (the
+    /// value already assigned at spawn, just not yet communicated to the
+    /// GPU) dirty for the next [`Self::flush`]. A no-op if this row was
+    /// already marked — a later insert of a second `#[gpu]`-bearing
+    /// component type onto the same entity doesn't change its generation,
+    /// so there is nothing new to mark.
+    pub(crate) fn note_gpu_bearing_insert(&self, row: u32, generation: u32) {
+        if self.gpu_mirrored_rows.mark_first_time(row) {
+            self.buf.mark_dirty(row, generation);
+        }
+    }
+
+    /// Called from `World::despawn_inner`. Marks the freshly-bumped
+    /// `new_generation` dirty for the next [`Self::flush`] — but only if
+    /// this row ever actually received a `#[gpu]`-bearing insert
+    /// ([`Self::note_gpu_bearing_insert`]); otherwise there is nothing on
+    /// the GPU at this row that needs invalidating, and this is a complete
+    /// no-op (one `GpuMirroredRows` read-lock check, nothing else). Clears
+    /// the row's flag either way, so a future entity that reuses this slot
+    /// starts fresh and must earn its own GPU-mirror cost by actually
+    /// carrying a `#[gpu]` field, exactly like a brand-new entity would.
+    pub(crate) fn note_despawn(&self, row: u32, new_generation: u32) {
+        if self.gpu_mirrored_rows.clear(row) {
+            self.buf.mark_dirty(row, new_generation);
+        }
+    }
+
+    /// Uploads every row marked dirty since the last flush, coalesced into
+    /// contiguous runs. Called from `World::flush_gpu_mirror`, alongside
+    /// (not instead of) [`super::SceneGpuStore::flush_gpu_mirror`] — call
+    /// both once per frame, same as before this type deferred its writes.
+    pub(crate) fn flush(&self, queue: &wgpu::Queue) {
+        self.buf.flush(queue);
     }
 
     pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
@@ -113,6 +198,58 @@ impl GenerationMirror {
 
     pub fn epoch(&self) -> u64 {
         self.buf.epoch()
+    }
+}
+
+/// Per-row "has this entity ever received a `#[gpu]`-bearing component
+/// insert" flags, backing [`GenerationMirror`]'s gating (see its doc).
+/// `RwLock<Vec<AtomicBool>>`, not a plain `Mutex<Vec<bool>>`: the common
+/// case (row already within the backing `Vec`, which is true for almost
+/// every call once a `World` has warmed up) only needs the **read** side of
+/// the lock plus one atomic swap -- multiple threads marking/clearing
+/// *disjoint* rows proceed concurrently, the same read-lock-first shape
+/// [`DirtyTrackedSceneBuffer::mark_dirty`] uses for its own shadow. Only
+/// growing the backing `Vec` (a row past the current end) needs the write
+/// side.
+struct GpuMirroredRows {
+    rows: RwLock<Vec<AtomicBool>>,
+}
+
+impl GpuMirroredRows {
+    fn new() -> Self {
+        Self { rows: RwLock::new(Vec::new()) }
+    }
+
+    /// Returns `true` the first time `row` is marked; returns `false` on
+    /// every call after that for the same row, until [`Self::clear`] resets
+    /// it.
+    fn mark_first_time(&self, row: u32) -> bool {
+        let idx = row as usize;
+        {
+            let rows = self.rows.read().expect("GpuMirroredRows lock poisoned");
+            if idx < rows.len() {
+                return !rows[idx].swap(true, Ordering::Relaxed);
+            }
+        }
+        let mut rows = self.rows.write().expect("GpuMirroredRows lock poisoned");
+        if idx >= rows.len() {
+            rows.resize_with(idx + 1, || AtomicBool::new(false));
+        }
+        !rows[idx].swap(true, Ordering::Relaxed)
+    }
+
+    /// Clears `row`'s flag and returns what it was before clearing (i.e.
+    /// whether the caller should treat this as "there was GPU-mirrored data
+    /// here that needs invalidating"). A row past the end of the backing
+    /// `Vec` (never marked) returns `false` without growing anything --
+    /// read-lock only, never escalates.
+    fn clear(&self, row: u32) -> bool {
+        let idx = row as usize;
+        let rows = self.rows.read().expect("GpuMirroredRows lock poisoned");
+        if idx >= rows.len() {
+            return false;
+        }
+        rows[idx].swap(false, Ordering::Relaxed)
     }
 }
 
@@ -148,15 +285,6 @@ impl GpuMirrorHandle {
     #[inline]
     pub fn generations(&self) -> &GenerationMirror {
         &self.generations
-    }
-
-    /// Called by `World::spawn`/`despawn` (when this mirror is attached) to
-    /// keep the GPU-side generation mirror in lockstep with
-    /// `World::entity_slots`'s own generation for `row`. Not part of this
-    /// module's own dispatch path (unlike component field writes, this
-    /// isn't driven by `#[gpu]` metadata) -- `World` calls it directly.
-    pub(crate) fn write_generation(&self, row: u32, generation: u32) {
-        self.generations.write(&self.queue, row, generation);
     }
 }
 
@@ -226,13 +354,22 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
         };
         let id = col.field_token.id();
 
-        if col.mode == crate::gpu::MirrorMode::DirtyTracked && store.mark_gpu_row_dirty(id, row, bytes) {
+        // SceneDB#39: `Once`-mode fields are registered through the SAME
+        // `register_dirty_tracked_gpu_buffer` path as `DirtyTracked` ones
+        // (`#[derive(SceneStore)]` does this automatically), and marked
+        // dirty here the same way -- the two modes only differ in WHEN this
+        // point is reached: `DirtyTracked` reaches it on every insert,
+        // `Once` only on the first (the early `continue` above skips every
+        // later one). Once marked, both flush identically. This reuses
+        // `DirtyTrackedSceneBuffer::mark_dirty`'s proven, mostly-lock-free
+        // fast path instead of a separate mechanism -- see
+        // `GenerationMirror`'s doc for why a from-scratch alternative tried
+        // first was measurably worse, not just different.
+        if (col.mode == crate::gpu::MirrorMode::DirtyTracked || col.mode == crate::gpu::MirrorMode::Once)
+            && store.mark_gpu_row_dirty(id, row, bytes)
+        {
             continue;
         }
-        // Either `Once`-mode, or `DirtyTracked` but registered through one
-        // of the immediate paths instead of `register_dirty_tracked_gpu_buffer`
-        // (an older/simpler registration choice this function still honors
-        // rather than requiring) -- write immediately.
         if store.write_row_bytes(id, queue, bytes, row) {
             continue;
         }
