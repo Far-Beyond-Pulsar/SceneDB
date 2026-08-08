@@ -10,7 +10,12 @@ gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "cf37ed000fedb9a01424c7e575d1d6ee30db7281" }
+# Repinned onto the `dyn-method-registry` branch (Pulsar-Reflection#3) for
+# DynMethodRegistry/DYN_METHOD_REGISTRY, which `subsystem.rs`'s dynamic
+# dispatch path needs. Additive-only on the Pulsar-Reflection side (see
+# that PR), so this is safe ahead of merge; repin to whatever commit
+# Pulsar-Reflection#3 merges as once that lands.
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "b9dd888d84fd5e0724f8c6cc8abcbb10c351e5ff" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
@@ -88,4 +93,8 @@ required-features = ["gpu"]
 
 [[test]]
 name = "stress_gpu"
+required-features = ["gpu"]
+
+[[test]]
+name = "subsystem_reflection_test"
 required-features = ["gpu"]

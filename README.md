@@ -791,6 +791,115 @@ fn server_tick(
 
 ---
 
+## Integrating with SceneDB
+
+Everything above is the storage/spatial/replication core. This section is for engine subsystems (a physics engine, an audio mixer, a renderer) that need to hook into SceneDB's frame — registering themselves once, running on the phase machine's schedule, and being callable both from hot-path Rust and by name from scripts/blueprints/editor tooling.
+
+### `Subsystem` + `SubsystemRegistry` + `SceneDb`
+
+A subsystem implements `Subsystem` and registers an instance with a `SceneDb`. Every hook is optional (default no-op) — implement only the phases you need:
+
+```rust
+use pulsar_scenedb::{Subsystem, World};
+use pulsar_scenedb::gpu::{SimulateA, SimulateB, HarvestPhase, RetiredPhase, SceneGpuStore};
+use std::any::Any;
+
+struct PhysicsSubsystem {
+    gravity: [f32; 3],
+}
+
+impl Subsystem for PhysicsSubsystem {
+    fn name(&self) -> &'static str { "physics" }
+
+    fn simulate_a(&mut self, world: &mut World, _witness: &SimulateA) {
+        // apply forces, step the solver — mutation is permitted here.
+    }
+
+    fn harvest(&mut self, store: &SceneGpuStore, _phase: &HarvestPhase) {
+        // read-only pass over GPU-resident state.
+    }
+
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+```
+
+Note there's no single generic `simulate(witness: &impl SimulateWitness)` hook: `SimulateWitness` is sealed (only `SimulateA`/`SimulateB` implement it), and a trait method generic over a sealed trait can't be called through a `Box<dyn Subsystem>` — the vtable has nothing to call. `simulate_a`/`simulate_b` are two concrete, object-safe hooks instead, which also matches the phase machine's own gameplay/physics-writeback split. `boundary(&mut self, phase: &RetiredPhase)` is likewise gated on the real mid-boundary pause point (after `retire`, before `compact`) — there's no witness spanning the whole boundary to gate on.
+
+`SceneDb` owns a `World`, a `SubsystemRegistry`, and a `FrameDriver`, and drives them together:
+
+```rust
+use pulsar_scenedb::SceneDb;
+
+let mut db = SceneDb::new();
+db.register_subsystem(PhysicsSubsystem { gravity: [0.0, -9.8, 0.0] });
+
+// CPU-only: SimulateA -> SimulateB, dispatched to every registered
+// subsystem's simulate_a/simulate_b hook.
+db.step();
+
+// GPU phases (Harvest -> Boundary), given a real SceneGpuStore/CellSlots
+// the caller already owns. Kept separate from step() because a
+// SceneGpuStore needs a real EngineGpuContext — SceneDb has no business
+// owning a GPU device (C0: the core stays graphics-free).
+// db.step_gpu(&mut store, &mut cells);
+
+// Static path — zero-cost typed borrow, no reflection involved:
+let physics = db.subsystem_mut::<PhysicsSubsystem>().unwrap();
+physics.gravity = [0.0, -1.6, 0.0]; // low gravity, why not
+```
+
+### Dynamic dispatch: `#[scenedb_subsystem]` / `#[subsystem_method]`
+
+For scripts, blueprints, or editor tooling that need to call a subsystem method by name rather than through a typed Rust reference, mark methods with `#[subsystem_method]` inside a `#[scenedb_subsystem(name = "...")]` impl block:
+
+```rust
+use pulsar_scenedb::Handle;
+use pulsar_scenedb_derive::{scenedb_subsystem, subsystem_method};
+
+#[scenedb_subsystem(name = "physics")]
+impl PhysicsSubsystem {
+    #[subsystem_method]
+    pub fn apply_impulse(&mut self, entity_index: u64, impulse: [f32; 3]) {
+        // ...
+    }
+}
+```
+
+This generates an `inventory::submit!` registration into Pulsar's central reflection database (`pulsar_reflection::DYN_METHOD_REGISTRY`) at link time — the same `inventory`-based mechanism `EngineClassRegistry` uses for `#[derive(EngineClass)]` components, just keyed to a plain `&mut dyn Any` receiver instead of `&mut dyn EngineClass` (a subsystem singleton doesn't want `EngineClass`'s spawn/property-panel obligations). Requires `pulsar_reflection` with `DynMethodRegistry` (the `dyn-method-registry` line — see [Pulsar-Reflection#3](https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection/pull/3)). Method parameter and return types must implement `pulsar_reflection::Reflectable` (every primitive in `prims/core` does out of the box; `Handle` currently does not — pass entity identity as `u64`/`Handle::index()` until that's registered).
+
+Dispatch by name through `SceneDb`:
+
+```rust
+db.dispatch(
+    "physics",
+    "apply_impulse",
+    vec![Box::new(42u64), Box::new([1.0f32, 0.0, 0.0])],
+).expect("dispatch succeeds");
+```
+
+`SceneDb::dispatch`/`SubsystemRegistry::dispatch` look the subsystem up by its registered name, get a `&mut dyn Any` onto it, and hand off to `DYN_METHOD_REGISTRY::invoke` — a name-not-found or method-not-found miss is a typed `Err`, not a panic.
+
+### Relational indexing: `RelationIndex` / `RelationView`
+
+For relational component patterns — portal links, multi-body attachments, anything where one entity's component points at another's — `RelationIndex` builds a dense, columnar view over `World` without per-row dynamic dispatch:
+
+```rust
+use pulsar_scenedb::{RelationIndex, World, Entity};
+
+struct PortalLink { linked_to: Entity }
+
+let mut index = RelationIndex::new();
+index.build::<PortalLink>(&world, |link| link.linked_to);
+
+let view = index.view();
+// view.pairs:     &[(Entity, Entity)]  — confirmed reciprocal links, once each
+// view.unmatched: &[Entity]            — linked to something that doesn't link back
+// view.conflicts: &[ConflictEntry]     — linked to something that reciprocates with someone else
+```
+
+`build` takes a link-extractor closure rather than assuming a fixed `PortalComponent` type — SceneDB stays agnostic to what a "portal" is, it only knows how to ask a caller-supplied component for the `Entity` it points at. Pairs are `Entity` (the CPU `World`'s identity), not `Handle` (this crate's GPU-cell identity) — a relation built by scanning `World` components has no `Handle` in scope to produce one from. Rebuild the index whenever the underlying links might have changed (typically once per boundary); reads via `view()` borrow the already-built buffers with zero further allocation.
+
 ## Layer reference
 
 | Layer | Location | Types | Responsibility |
@@ -808,7 +917,7 @@ fn server_tick(
 ## Crates
 
 - **pulsar_scenedb** — the core library (ECS + spatial + GPU + replication). `replication` is always available (no feature gate, C0-compatible).
-- **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for Pod impls and GPU dispatch boilerplate.
+- **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for Pod impls and GPU dispatch boilerplate; `#[scenedb_subsystem]`/`#[subsystem_method]` for reflection-database method registration (see [Integrating with SceneDB](#integrating-with-scenedb)).
 - **scenedb_dashboard** — runtime TUI monitoring dashboard.
 
 ## FAQ
