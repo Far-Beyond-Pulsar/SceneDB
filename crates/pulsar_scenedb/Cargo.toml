@@ -118,3 +118,7 @@ required-features = ["gpu"]
 [[test]]
 name = "gpu_packed_layout"
 required-features = ["gpu"]
+
+[[test]]
+name = "world_gpu_mirror_liveness"
+required-features = ["gpu"]

@@ -64,24 +64,75 @@
 //! attempt, despite compiling cleanly with no errors or warnings pointing
 //! at the problem, was not.
 use crate::component::ComponentId;
-use crate::gpu::{GpuColumnSet, SceneGpuStore};
+use crate::gpu::{GpuColumnSet, GrowableSceneBuffer, SceneGpuStore};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-/// The two resources `World`'s automatic GPU mirroring needs: the store
-/// every `#[gpu]` field's buffer lives in, and the queue to write through.
+/// Row-indexed liveness/generation buffer, mirroring `World::entity_slots`'s
+/// `generation` field on the GPU, keyed by `Entity::index()` exactly like
+/// every other World-mirrored buffer. See the "Liveness" section of the
+/// README for the read-side contract this exists to support: a GPU consumer
+/// holding a captured `(row, generation)` pair compares `generation` against
+/// this buffer's value at `row` before trusting any other World-mirrored
+/// buffer's contents at that row -- the same staleness check
+/// `World::is_alive` already performs on the CPU side, made available to
+/// shaders.
+///
+/// Built on [`GrowableSceneBuffer<u32>`] rather than the CellStorage-oriented
+/// `GenerationBuffer` type ([`super::GenerationBuffer`]) — that type's
+/// `rebuild`/`rebuild_region` methods and fixed `max_slots` are tailored to
+/// `RegionPool`'s boundary-scan self-healing, which World-mirroring has no
+/// equivalent of; a plain growable `u32` column already has everything this
+/// needs (one write per spawn/despawn, growing in lockstep with entity
+/// count, same as every other World-mirrored buffer).
+pub struct GenerationMirror {
+    buf: GrowableSceneBuffer<u32>,
+}
+
+impl GenerationMirror {
+    fn new(device: Arc<wgpu::Device>) -> Self {
+        // Small initial capacity, unbounded growth -- matches every other
+        // World-mirrored buffer's recommended (register_gpu_columns_growable)
+        // configuration; see that method's doc for why World-mirrored
+        // buffers specifically should never set a max_capacity ceiling.
+        Self { buf: GrowableSceneBuffer::new(device, "scenedb-world-mirror-generations", 64, None) }
+    }
+
+    fn write(&self, queue: &wgpu::Queue, row: u32, generation: u32) {
+        // Growth here can never fail (no max_capacity was set above), so
+        // this is infallible in practice -- same reasoning
+        // `write_gpu_columns_at_row` documents for its own growable path.
+        self.buf
+            .write_row_growing(queue, row, &[generation])
+            .expect("generation mirror has no max_capacity -- growth cannot fail");
+    }
+
+    pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
+        self.buf.with_buffer(f);
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.buf.epoch()
+    }
+}
+
+/// The resources `World`'s automatic GPU mirroring needs: the store every
+/// `#[gpu]` field's buffer lives in, the queue to write through, and the
+/// liveness/generation mirror (see [`GenerationMirror`]).
 ///
 /// Attach via [`crate::world::World::attach_gpu_mirror`]. Cheap to clone
-/// (`Arc<SceneGpuStore>` + `Arc<wgpu::Queue>`).
+/// (`Arc<SceneGpuStore>` + `Arc<wgpu::Queue>` + `Arc<GenerationMirror>`).
 #[derive(Clone)]
 pub struct GpuMirrorHandle {
     store: Arc<SceneGpuStore>,
     queue: Arc<wgpu::Queue>,
+    generations: Arc<GenerationMirror>,
 }
 
 impl GpuMirrorHandle {
     pub fn new(store: Arc<SceneGpuStore>, queue: Arc<wgpu::Queue>) -> Self {
-        Self { store, queue }
+        let generations = Arc::new(GenerationMirror::new(store.device_arc()));
+        Self { store, queue, generations }
     }
 
     #[inline]
@@ -92,6 +143,20 @@ impl GpuMirrorHandle {
     #[inline]
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    #[inline]
+    pub fn generations(&self) -> &GenerationMirror {
+        &self.generations
+    }
+
+    /// Called by `World::spawn`/`despawn` (when this mirror is attached) to
+    /// keep the GPU-side generation mirror in lockstep with
+    /// `World::entity_slots`'s own generation for `row`. Not part of this
+    /// module's own dispatch path (unlike component field writes, this
+    /// isn't driven by `#[gpu]` metadata) -- `World` calls it directly.
+    pub(crate) fn write_generation(&self, row: u32, generation: u32) {
+        self.generations.write(&self.queue, row, generation);
     }
 }
 

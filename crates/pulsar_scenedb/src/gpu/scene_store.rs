@@ -251,6 +251,17 @@ pub struct SceneGpuStore {
 }
 
 impl SceneGpuStore {
+    /// Cheap `Arc` clone of the device this store was constructed with.
+    /// Needed by anything that must allocate a NEW buffer alongside this
+    /// store's own (e.g. [`crate::gpu::world_mirror::GenerationMirror`],
+    /// which owns a device-independent growable buffer rather than one
+    /// registered in this store's own `gpu_buffers`/`growable_gpu_buffers`
+    /// maps) without threading a separate `Arc<wgpu::Device>` through every
+    /// call site that already has a `&SceneGpuStore` in hand.
+    pub fn device_arc(&self) -> Arc<wgpu::Device> {
+        Arc::clone(&self.device)
+    }
+
     pub fn new(ctx: &EngineGpuContext, cfg: SceneGpuConfig) -> Self {
         let mut row_pools = Vec::with_capacity(cfg.classes.len());
         let mut slot_pools = Vec::with_capacity(cfg.classes.len());
