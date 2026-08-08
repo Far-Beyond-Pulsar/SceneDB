@@ -113,6 +113,45 @@ impl World {
         self.gpu_mirror.as_ref().map(|m| m.store().flush_gpu_mirror(queue))
     }
 
+    /// Reserves capacity `n` on every registered World-mirrored GPU buffer
+    /// right now, ahead of a known-size batch of upcoming inserts — moves
+    /// what would otherwise be an unpredictable, mid-batch reallocation
+    /// (a real GPU-to-GPU copy, potentially tens of milliseconds at
+    /// AAA-relevant scale — see Helio#211's benchmark findings) off the
+    /// per-insert critical path and onto this one, caller-controlled call.
+    /// `None` if no mirror is attached (nothing to reserve on); `Some(Err(..))`
+    /// if some registered column can't grow that far (e.g. the device's own
+    /// `wgpu::Limits::max_buffer_size` — see
+    /// `gpu::DynamicGpuBuffer::ensure_capacity`'s doc).
+    ///
+    /// Call this before a batch, not instead of sizing
+    /// `register_gpu_columns_growable`'s `initial_capacity` sensibly — the
+    /// two aren't redundant: `initial_capacity` is what a *fresh* `World`
+    /// starts with, `reserve` is for growing an *already-running* `World`
+    /// ahead of a specific future batch.
+    #[cfg(feature = "gpu")]
+    pub fn reserve_gpu_mirror_capacity(&self, queue: &wgpu::Queue, n: u32) -> Option<Result<(), crate::gpu::CapacityError>> {
+        self.gpu_mirror.as_ref().map(|m| m.store().reserve_world_mirror_capacity(queue, n))
+    }
+
+    /// Shrinks every registered World-mirrored GPU buffer to the smallest
+    /// capacity that still covers `highest_live_row`, with `slack_factor`
+    /// headroom (e.g. `1.5` = 50% extra room before the next growth).
+    /// `highest_live_row` must come from the caller — `World` doesn't
+    /// currently expose a ready-made "highest live `Entity::index()`" query
+    /// on its own; a caller can compute one from `entity_slots.len()` minus
+    /// its own trailing-freed-slot bookkeeping, or from whatever tracks
+    /// object counts already. Call at a natural boundary (a level unload, a
+    /// large despawn batch settling), not every frame — this is a real
+    /// GPU-to-GPU copy per buffer that actually shrinks. No-op if no mirror
+    /// is attached.
+    #[cfg(feature = "gpu")]
+    pub fn shrink_gpu_mirror_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) {
+        if let Some(mirror) = &self.gpu_mirror {
+            mirror.store().shrink_world_mirror_to_fit(queue, highest_live_row, slack_factor);
+        }
+    }
+
     /// Debug assertion: every archetype's column lengths must equal its entity
     /// count.  Panics on the first mismatch.  Compiled out in release builds
     /// (the loop body becomes a no-op).

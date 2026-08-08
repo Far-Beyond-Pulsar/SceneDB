@@ -1163,6 +1163,49 @@ impl SceneGpuStore {
         }
     }
 
+    /// Reserves capacity `n` on every World-mirrored buffer registered so
+    /// far (both the growable and dirty-tracked maps) — call before a
+    /// known-size batch spawn (streaming in a sublevel with M known
+    /// objects, spawning a wave of enemies from a design-time-known count)
+    /// to move every affected buffer's reallocation cost off the per-insert
+    /// critical path, in one call. See
+    /// [`crate::world::World::reserve_gpu_mirror_capacity`] for the
+    /// `World`-level convenience this backs.
+    ///
+    /// Stops at the first error and returns it — a caller reserving ahead
+    /// of a batch wants to know immediately if some column can't grow that
+    /// far (e.g. it hit `wgpu::Limits::max_buffer_size`, see
+    /// `DynamicGpuBuffer::ensure_capacity`'s doc), not partway through
+    /// spawning the batch itself. Buffers already visited before the
+    /// failing one keep whatever capacity they were successfully grown to
+    /// — this is a best-effort batch operation, not transactional.
+    pub fn reserve_world_mirror_capacity(&self, queue: &wgpu::Queue, n: u32) -> Result<(), CapacityError> {
+        for buf in self.growable_gpu_buffers.values() {
+            buf.reserve(queue, n)?;
+        }
+        for buf in self.dirty_tracked_gpu_buffers.values() {
+            buf.reserve(queue, n)?;
+        }
+        Ok(())
+    }
+
+    /// Shrinks every World-mirrored buffer registered so far (both maps) to
+    /// the smallest capacity that still covers `highest_live_row`, with
+    /// `slack_factor` headroom. See
+    /// [`crate::gpu::DynamicGpuBuffer::shrink_to_fit`]'s doc — same
+    /// semantics, applied across every registered column at once. Call at a
+    /// natural boundary (a level unload, a large despawn batch settling),
+    /// not every frame; this is a real GPU-to-GPU copy per buffer that
+    /// actually shrinks, same cost profile as growth.
+    pub fn shrink_world_mirror_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) {
+        for buf in self.growable_gpu_buffers.values() {
+            buf.shrink_to_fit(queue, highest_live_row, slack_factor);
+        }
+        for buf in self.dirty_tracked_gpu_buffers.values() {
+            buf.shrink_to_fit(queue, highest_live_row, slack_factor);
+        }
+    }
+
     /// Cull's token→mesh link (M3-α T4, C5 amendment): row-indexed beside
     /// `transform_buffer()`, mirrored via [`Self::write_instance_info`].
     ///

@@ -32,6 +32,7 @@
 //! already perf-validated — to serve both this type and the cell-mirrored
 //! path wasn't judged worth the risk to land alongside this feature without
 //! its own benchmarking pass; a reasonable follow-up, not done here.
+use crate::gpu::dynamic_buffer::CapacityError;
 use crate::gpu::{DirtyMask, SyncStats};
 use crate::page::Pod;
 use std::sync::{Arc, RwLock};
@@ -40,6 +41,30 @@ struct DirtyTrackedState<T: Pod> {
     buf: crate::gpu::DynamicGpuBuffer<T>,
     shadow: Vec<T>,
     dirty: DirtyMask,
+}
+
+/// Grows `state.shadow`/`state.dirty` (pure CPU, no GPU work) to cover
+/// `new_len`, if it doesn't already — shared by [`DirtyTrackedSceneBuffer::mark_dirty`]
+/// (grows lazily, one row at a time as marks arrive) and
+/// [`DirtyTrackedSceneBuffer::reserve`] (grows eagerly, ahead of a known
+/// batch). `DirtyMask` has no resize primitive of its own, so growing it
+/// means rebuilding at the new capacity and re-marking whatever was already
+/// dirty — only runs when `new_len` actually exceeds the current shadow
+/// length, not on every call.
+fn grow_shadow_to<T: Pod>(state: &mut DirtyTrackedState<T>, new_len: usize) {
+    if new_len <= state.shadow.len() {
+        return;
+    }
+    // SAFETY: `T: Pod`'s own safety contract (`page.rs`) guarantees
+    // all-zero bytes are a valid `T`.
+    state.shadow.resize(new_len, unsafe { std::mem::zeroed::<T>() });
+    let new_dirty = DirtyMask::new(new_len as u32);
+    for r in 0..state.dirty.capacity() {
+        if state.dirty.is_marked(r) {
+            new_dirty.mark(r);
+        }
+    }
+    state.dirty = new_dirty;
 }
 
 /// Type-erased counterpart, mirroring [`super::GrowableGpuBufferDispatch`]'s
@@ -59,6 +84,14 @@ pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
     /// in practice, since these buffers are never registered with a
     /// `max_capacity` ceiling (see `SceneGpuStore::register_dirty_tracked_gpu_buffer`).
     fn flush(&self, queue: &wgpu::Queue) -> SyncStats;
+
+    /// Grows the shadow and GPU buffer to `capacity` right now. See
+    /// [`DirtyTrackedSceneBuffer::reserve`].
+    fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError>;
+
+    /// Shrinks the shadow and GPU buffer to fit `highest_live_row`. See
+    /// [`DirtyTrackedSceneBuffer::shrink_to_fit`].
+    fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool;
 
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer));
 
@@ -88,21 +121,53 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             while new_len <= row as usize {
                 new_len = new_len.saturating_mul(2);
             }
-            // SAFETY: see `Self::new`'s identical zero-fill.
-            state.shadow.resize(new_len, unsafe { std::mem::zeroed::<T>() });
-            // DirtyMask has no resize -- rebuild at the new capacity,
-            // re-marking whatever was already dirty. Only runs on growth
-            // (rare), not on every mark.
-            let new_dirty = DirtyMask::new(new_len as u32);
-            for r in 0..state.dirty.capacity() {
-                if state.dirty.is_marked(r) {
-                    new_dirty.mark(r);
-                }
-            }
-            state.dirty = new_dirty;
+            grow_shadow_to(&mut state, new_len);
         }
         state.shadow[row as usize] = value;
         state.dirty.mark(row);
+    }
+
+    /// Grows the CPU-side shadow (and `DirtyMask`) to cover `capacity` right
+    /// now, and the underlying GPU buffer to match, ahead of any
+    /// `mark_dirty`/`flush` call that would otherwise trigger either
+    /// lazily. See [`crate::gpu::DynamicGpuBuffer::reserve`]'s doc for the
+    /// intent — moving a known-size batch's reallocation cost off the
+    /// per-insert/per-flush critical path. Growing the GPU buffer here too
+    /// (not just the shadow) means a `flush()` right after a reserved batch
+    /// doesn't ALSO need to grow it at that point.
+    pub fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        let mut state = self.state.write().expect("DirtyTrackedSceneBuffer lock poisoned");
+        grow_shadow_to(&mut state, capacity as usize);
+        if state.buf.capacity() < capacity {
+            state.buf.reserve(&self.device, queue, capacity)?;
+        }
+        Ok(())
+    }
+
+    /// Shrinks both the CPU-side shadow and the underlying GPU buffer to
+    /// the smallest size that still covers `highest_live_row` (plus
+    /// `slack_factor` headroom). See
+    /// [`crate::gpu::DynamicGpuBuffer::shrink_to_fit`]'s doc — same
+    /// semantics, applied to both halves of this type's storage together
+    /// (shrinking only the GPU buffer while leaving a larger shadow around
+    /// would just waste CPU memory for no benefit).
+    pub fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool {
+        let mut state = self.state.write().expect("DirtyTrackedSceneBuffer lock poisoned");
+        let target = (((highest_live_row as u64 + 1) as f64 * slack_factor.max(1.0) as f64).ceil() as u64)
+            .min(u32::MAX as u64) as usize;
+        if target >= state.shadow.len() {
+            return false;
+        }
+        state.shadow.truncate(target);
+        state.shadow.shrink_to_fit();
+        let new_dirty = DirtyMask::new(target as u32);
+        for r in 0..(target as u32).min(state.dirty.capacity()) {
+            if state.dirty.is_marked(r) {
+                new_dirty.mark(r);
+            }
+        }
+        state.dirty = new_dirty;
+        state.buf.shrink_to_fit(&self.device, queue, highest_live_row, slack_factor)
     }
 
     pub fn flush(&self, queue: &wgpu::Queue) -> SyncStats {
@@ -155,6 +220,14 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedGpuBufferDispatch for DirtyTrac
 
     fn flush(&self, queue: &wgpu::Queue) -> SyncStats {
         DirtyTrackedSceneBuffer::flush(self, queue)
+    }
+
+    fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        DirtyTrackedSceneBuffer::reserve(self, queue, capacity)
+    }
+
+    fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool {
+        DirtyTrackedSceneBuffer::shrink_to_fit(self, queue, highest_live_row, slack_factor)
     }
 
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
@@ -255,5 +328,46 @@ mod tests {
         buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, 51 * 4));
         assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 1);
         assert_eq!(u32::from_ne_bytes(bytes[200..204].try_into().unwrap()), 999);
+    }
+
+    #[test]
+    fn reserve_grows_both_shadow_and_gpu_buffer_so_flush_needs_no_further_growth() {
+        let (device, queue) = test_device();
+        let buf: DirtyTrackedSceneBuffer<u32> = DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", 2);
+
+        buf.reserve(&queue, 500).expect("reserve");
+        for row in 0..500u32 {
+            buf.mark_dirty(row, row * 2);
+        }
+        let stats = buf.flush(&queue);
+        assert_eq!(stats.ranges, 1, "500 contiguous dirty rows must coalesce into one range");
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, 500 * 4));
+        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_ne_bytes(bytes[996..1000].try_into().unwrap()), 498);
+    }
+
+    #[test]
+    fn shrink_to_fit_reclaims_both_shadow_and_gpu_buffer() {
+        let (device, queue) = test_device();
+        let buf: DirtyTrackedSceneBuffer<u32> = DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", 2);
+        buf.mark_dirty(999, 42);
+        buf.flush(&queue);
+
+        let shrank = buf.shrink_to_fit(&queue, 999, 1.0);
+        assert!(shrank);
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, 1000 * 4));
+        assert_eq!(bytes.len(), 4000, "buffer must have actually shrunk to exactly 1000 rows");
+        assert_eq!(u32::from_ne_bytes(bytes[999 * 4..999 * 4 + 4].try_into().unwrap()), 42);
+
+        // Further marks/flushes must still work correctly post-shrink.
+        buf.mark_dirty(500, 777);
+        buf.flush(&queue);
+        let mut bytes2 = Vec::new();
+        buf.with_buffer(&mut |b| bytes2 = readback(&device, &queue, b, 1000 * 4));
+        assert_eq!(u32::from_ne_bytes(bytes2[500 * 4..500 * 4 + 4].try_into().unwrap()), 777);
     }
 }
