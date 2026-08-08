@@ -1035,6 +1035,23 @@ Reading a `DirtyTracked` field's buffer goes through `SceneGpuStore::with_dirty_
 
 `#[gpu(layout = packed)]` structs (above) require every `#[gpu]` field to share one mirror mode — mixing `Once` and `DirtyTracked` within one packed record is a compile error, since the whole record is written as a single unit and "half of this write is deferred" has no meaning.
 
+**Reservation and shrinking.** Growth is lazy by default — the first insert whose row doesn't fit pays a real GPU-to-GPU copy, wherever that happens to land. Measured cost is not small at scale (Helio#211: ~43ms for a 100k→200k-row reallocation, over 2.5x a 60fps frame budget) — for any batch whose size you know ahead of time (streaming in a sublevel, spawning a wave of enemies), reserve capacity up front instead:
+
+```rust
+world.reserve_gpu_mirror_capacity(&queue, expected_entity_count)
+    .expect("mirror attached")
+    .expect("reserve succeeds");
+// every insert() in the batch that follows now costs zero further growth
+```
+
+And shrink back down after a peak (a big fight that spawned and despawned thousands of transient entities), at a natural boundary — not every frame, this is a real reallocation too:
+
+```rust
+world.shrink_gpu_mirror_to_fit(&queue, highest_live_entity_index, 1.5); // 50% slack
+```
+
+Growth also now respects the device's own `wgpu::Limits::max_buffer_size` (256 MiB by default) — previously, growth would double past this and `device.create_buffer` would reject it with an unrecoverable `wgpu` validation panic; a 256-byte packed row hits this at 1,048,576 rows in one buffer, well within AAA-relevant entity counts. It now comes back as an ordinary `CapacityError`, the same one an explicit `max_capacity` ceiling already produces — `reserve`/`insert`'s automatic dispatch both surface it (the latter via a panic with a clear message, since `World::insert` has nothing to return a `Result` through — see the "Mirror mode" panic note above for the same reasoning applied here).
+
 **Staleness / liveness.** Despawning an entity does not clear its row in a mirrored `#[gpu]` component buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. What DOES happen automatically: `World::spawn`/`despawn` (when a mirror is attached) keep a dedicated, GPU-resident generation buffer — `GpuMirrorHandle::generations()` — in lockstep with `entity_slots`' own generation for that row, exactly the value `World::is_alive` already checks on the CPU side. A GPU-side reader (a shader, a cull pass) that captured `(row, generation)` at some point — typically alongside the same visible-index/draw list it's iterating — should compare `generation` against `generations_buffer[row]` before trusting any other World-mirrored buffer's contents at `row`:
 
 ```rust

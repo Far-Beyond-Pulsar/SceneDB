@@ -126,3 +126,7 @@ required-features = ["gpu"]
 [[test]]
 name = "world_gpu_mirror_dirty_tracked"
 required-features = ["gpu"]
+
+[[test]]
+name = "world_gpu_mirror_reservation_shrink"
+required-features = ["gpu"]

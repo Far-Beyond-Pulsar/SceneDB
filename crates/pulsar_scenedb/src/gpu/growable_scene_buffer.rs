@@ -36,6 +36,18 @@ pub trait GrowableGpuBufferDispatch: Send + Sync {
     fn capacity(&self) -> u32;
     fn element_size(&self) -> usize;
 
+    /// Grows to at least `capacity` right now, ahead of any write that
+    /// would otherwise trigger it lazily — see
+    /// [`super::DynamicGpuBuffer::reserve`]'s doc for the intent this
+    /// exists to support (moving a known-size batch's reallocation cost off
+    /// the per-insert critical path).
+    fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError>;
+
+    /// Shrinks to the smallest capacity that still covers `highest_live_row`
+    /// (plus `slack_factor` headroom) — see
+    /// [`super::DynamicGpuBuffer::shrink_to_fit`]'s doc.
+    fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool;
+
     /// Runs `f` against the buffer's current `wgpu::Buffer` — the lock-safe
     /// way to reach it for e.g. bind group construction. Do not attempt to
     /// stash the `&wgpu::Buffer` past this call; a concurrent growth on
@@ -109,6 +121,18 @@ impl<T: Pod + Send + Sync + 'static> GrowableSceneBuffer<T> {
         let guard = self.inner.read().expect("GrowableSceneBuffer lock poisoned");
         f(guard.buffer());
     }
+
+    /// See [`GrowableGpuBufferDispatch::reserve`].
+    pub fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        let mut guard = self.inner.write().expect("GrowableSceneBuffer lock poisoned");
+        guard.reserve(&self.device, queue, capacity)
+    }
+
+    /// See [`GrowableGpuBufferDispatch::shrink_to_fit`].
+    pub fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool {
+        let mut guard = self.inner.write().expect("GrowableSceneBuffer lock poisoned");
+        guard.shrink_to_fit(&self.device, queue, highest_live_row, slack_factor)
+    }
 }
 
 impl<T: Pod + Send + Sync + 'static> GrowableGpuBufferDispatch for GrowableSceneBuffer<T> {
@@ -134,6 +158,14 @@ impl<T: Pod + Send + Sync + 'static> GrowableGpuBufferDispatch for GrowableScene
 
     fn element_size(&self) -> usize {
         std::mem::size_of::<T>()
+    }
+
+    fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        GrowableSceneBuffer::reserve(self, queue, capacity)
+    }
+
+    fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool {
+        GrowableSceneBuffer::shrink_to_fit(self, queue, highest_live_row, slack_factor)
     }
 
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
@@ -221,5 +253,39 @@ mod tests {
             .write_row_growing(&queue, 10, &[1])
             .expect_err("row 10 exceeds max_capacity 4 -- must error, not silently drop the write");
         assert_eq!(err.max, 4);
+    }
+
+    #[test]
+    fn reserve_moves_growth_off_the_write_path() {
+        let (device, queue) = test_device();
+        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
+
+        buf.reserve(&queue, 500).expect("reserve");
+        assert!(buf.capacity() >= 500);
+        let epoch_after_reserve = buf.epoch();
+
+        // Every write in the reserved batch must land with zero further growth.
+        for row in 0..500u32 {
+            buf.write_row_growing(&queue, row, &[row]).expect("within reserved capacity");
+        }
+        assert_eq!(buf.epoch(), epoch_after_reserve, "a fully-reserved batch must trigger no further reallocation");
+    }
+
+    #[test]
+    fn shrink_to_fit_reclaims_capacity_through_the_dispatch_trait() {
+        let (device, queue) = test_device();
+        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
+        buf.write_row_growing(&queue, 999, &[42]).expect("grow");
+        let grown_capacity = buf.capacity();
+
+        let dispatch: &dyn GrowableGpuBufferDispatch = &buf;
+        let shrank = dispatch.shrink_to_fit(&queue, 999, 1.0);
+        assert!(shrank);
+        assert!(buf.capacity() < grown_capacity);
+        assert_eq!(buf.capacity(), 1000);
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, 1000 * 4));
+        assert_eq!(u32::from_ne_bytes(bytes[999 * 4..999 * 4 + 4].try_into().unwrap()), 42);
     }
 }

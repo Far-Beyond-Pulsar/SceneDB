@@ -98,9 +98,25 @@ impl<T: Pod> DynamicGpuBuffer<T> {
     ///
     /// Returns `Ok(true)` if a reallocation happened (bumping [`Self::epoch`]),
     /// `Ok(false)` if the existing capacity already sufficed, and
-    /// `Err(CapacityError)` if `min_capacity` exceeds a configured
-    /// [`Self::with_max_capacity`] ceiling — in the error case the buffer is
-    /// left completely unchanged (no partial growth).
+    /// `Err(CapacityError)` if `min_capacity` exceeds the *effective* ceiling
+    /// — the smaller of a configured [`Self::with_max_capacity`] and the
+    /// device's own `Limits::max_buffer_size` — in the error case the
+    /// buffer is left completely unchanged (no partial growth).
+    ///
+    /// The device-limit half of that ceiling exists because, without it,
+    /// growth would keep doubling past what the device can actually
+    /// allocate and `device.create_buffer` would reject the request via a
+    /// `wgpu` *validation-error panic* — not a catchable `Result` at all.
+    /// Confirmed reachable in practice, not a theoretical concern: a
+    /// 256-byte packed row hits the default 256 MiB `max_buffer_size` at
+    /// 1,048,576 rows in one buffer (Helio#211's benchmark harness). This
+    /// check converts that hard panic into the same `CapacityError` an
+    /// explicit `max_capacity` ceiling already produces — callers that
+    /// already handle `CapacityError` (including
+    /// `gpu::world_mirror::write_gpu_columns_at_row`'s panic-with-context
+    /// path for World-mirrored columns) get a clearer, SceneDB-authored
+    /// error instead of an opaque `wgpu` one, even when they never set an
+    /// explicit `max_capacity` at all.
     pub fn ensure_capacity(
         &mut self,
         device: &wgpu::Device,
@@ -110,18 +126,20 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         if min_capacity <= self.capacity {
             return Ok(false);
         }
-        if let Some(max) = self.max_capacity {
-            if min_capacity > max {
-                return Err(CapacityError { requested: min_capacity, max });
-            }
+        let device_limit_rows =
+            (device.limits().max_buffer_size / std::mem::size_of::<T>().max(1) as u64) as u32;
+        let effective_max = match self.max_capacity {
+            Some(max) => max.min(device_limit_rows),
+            None => device_limit_rows,
+        };
+        if min_capacity > effective_max {
+            return Err(CapacityError { requested: min_capacity, max: effective_max });
         }
         let mut new_capacity = self.capacity.max(1);
         while new_capacity < min_capacity {
             new_capacity = new_capacity.saturating_mul(2);
         }
-        if let Some(max) = self.max_capacity {
-            new_capacity = new_capacity.min(max);
-        }
+        new_capacity = new_capacity.min(effective_max);
 
         let new_buf = Self::alloc(device, &self.label, new_capacity);
         // Copy the live prefix (the old buffer's full capacity — every row
@@ -141,6 +159,67 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         self.capacity = new_capacity;
         self.epoch += 1;
         Ok(true)
+    }
+
+    /// Grows to at least `capacity` right now, if it doesn't already have
+    /// that much — the exact same reallocation [`Self::ensure_capacity`]
+    /// performs lazily on a crossing write, just performed on the caller's
+    /// own schedule instead of whichever write happens to trigger it. Call
+    /// ahead of a known-size batch operation (streaming in a sublevel with
+    /// M known objects, spawning a wave of enemies from a design-time-known
+    /// count) to move the reallocation cost off any per-frame critical
+    /// path. A thin alias for `ensure_capacity` — kept as a separate,
+    /// intention-revealing name because "ensure capacity because I'm about
+    /// to need it right now, at this exact call site" and "reserve capacity
+    /// ahead of a batch I haven't started yet" are different caller intents
+    /// even though the mechanism is identical.
+    pub fn reserve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        self.ensure_capacity(device, queue, capacity)?;
+        Ok(())
+    }
+
+    /// Shrinks to the smallest capacity that still covers
+    /// `(highest_live_row + 1) * slack_factor`, rounded up — a no-op
+    /// (returns `false`) if the current capacity is already at or below
+    /// that target. `highest_live_row` must come from the caller (this
+    /// type has no notion of which rows are "live" vs. stale-but-allocated
+    /// — that's `World`'s/the caller's concern, via `entity_slots`/liveness
+    /// tracking, not this buffer's). `slack_factor` should be `>= 1.0`
+    /// (e.g. `1.5` leaves 50% headroom before the *next* growth is needed);
+    /// passing exactly `1.0` shrinks as tight as possible, trading VRAM for
+    /// a higher chance of needing to grow again soon.
+    ///
+    /// Reallocates as a real GPU-to-GPU copy of the surviving prefix, same
+    /// cost profile as growth — call this at a natural boundary (a level
+    /// unload, a large despawn batch settling), not every frame.
+    pub fn shrink_to_fit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        highest_live_row: u32,
+        slack_factor: f32,
+    ) -> bool {
+        debug_assert!(slack_factor >= 1.0, "slack_factor < 1.0 would shrink below the caller's own stated live-row watermark");
+        let target = (((highest_live_row as u64 + 1) as f64 * slack_factor.max(1.0) as f64).ceil() as u64).min(u32::MAX as u64) as u32;
+        if target >= self.capacity {
+            return false;
+        }
+        let new_buf = Self::alloc(device, &self.label, target);
+        // Only the surviving prefix needs copying -- rows past `target`
+        // are, by the caller's own claim (`highest_live_row`), not live,
+        // so their bytes are not owed any preservation guarantee.
+        let copy_bytes = target as u64 * std::mem::size_of::<T>() as u64;
+        if copy_bytes > 0 {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dynamic-gpu-buffer-shrink-copy"),
+            });
+            encoder.copy_buffer_to_buffer(&self.buf, 0, &new_buf, 0, copy_bytes);
+            queue.submit([encoder.finish()]);
+        }
+        self.buf = new_buf;
+        self.capacity = target;
+        self.epoch += 1;
+        true
     }
 
     /// Writes `data` starting at row `offset`. Panics if `offset + data.len()`
@@ -266,5 +345,60 @@ mod tests {
         // exactly max_capacity when doubling would otherwise overshoot it.
         buf.ensure_capacity(&device, &queue, 6).expect("within ceiling");
         assert_eq!(buf.capacity(), 8, "doubling 4->8 exactly hits max_capacity");
+    }
+
+    #[test]
+    fn device_max_buffer_size_is_a_real_ceiling_not_a_hard_panic() {
+        let (device, queue) = test_device();
+        // No explicit max_capacity -- this is exactly the World-mirror
+        // default (register_gpu_columns_growable never sets one). Request
+        // something absurdly larger than any real device's max_buffer_size
+        // (u32 elements at 4 bytes each -> ~16 TiB) -- must come back as a
+        // normal Err, never a wgpu validation panic.
+        let mut buf: DynamicGpuBuffer<u32> = DynamicGpuBuffer::new(&device, "test", 4);
+        let device_limit_rows = device.limits().max_buffer_size / 4;
+        let err = buf
+            .ensure_capacity(&device, &queue, u32::MAX)
+            .expect_err("must error via the device's own max_buffer_size, not panic inside wgpu");
+        assert_eq!(err.requested, u32::MAX);
+        assert_eq!(err.max as u64, device_limit_rows.min(u32::MAX as u64));
+        assert_eq!(buf.capacity(), 4, "a failed grow must leave the buffer completely unchanged");
+    }
+
+    #[test]
+    fn reserve_grows_ahead_of_any_write_and_is_a_true_no_op_once_satisfied() {
+        let (device, queue) = test_device();
+        let mut buf: DynamicGpuBuffer<u32> = DynamicGpuBuffer::new(&device, "test", 4);
+        buf.reserve(&device, &queue, 1000).expect("reserve");
+        assert!(buf.capacity() >= 1000);
+        let epoch_after_reserve = buf.epoch();
+
+        // Writes within the reserved capacity must never trigger growth.
+        buf.write(&queue, 999, &[42]);
+        assert_eq!(buf.epoch(), epoch_after_reserve, "a write within reserved capacity must not grow");
+
+        // A second reserve for less than what's already there is a no-op.
+        buf.reserve(&device, &queue, 10).expect("no-op reserve");
+        assert_eq!(buf.epoch(), epoch_after_reserve);
+    }
+
+    #[test]
+    fn shrink_to_fit_reclaims_capacity_and_preserves_the_surviving_prefix() {
+        let (device, queue) = test_device();
+        let mut buf: DynamicGpuBuffer<u32> = DynamicGpuBuffer::new(&device, "test", 4);
+        buf.ensure_capacity(&device, &queue, 1000).expect("grow to 1000+");
+        let grown_capacity = buf.capacity();
+        buf.write(&queue, 0, &[111, 222, 333]);
+
+        let shrank = buf.shrink_to_fit(&device, &queue, 2, 1.0); // highest live row = 2 (rows 0,1,2 survive), no slack
+        assert!(shrank, "capacity was {grown_capacity}, well above the shrink target");
+        assert_eq!(buf.capacity(), 3, "target = (highest_live_row + 1) * slack_factor = 3 * 1.0");
+
+        let bytes = readback(&device, &queue, buf.buffer(), 3 * 4);
+        let values: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(values, vec![111, 222, 333], "shrink must preserve the surviving prefix's bytes");
+
+        // Already at (or below) the target -- a true no-op.
+        assert!(!buf.shrink_to_fit(&device, &queue, 2, 1.0));
     }
 }
