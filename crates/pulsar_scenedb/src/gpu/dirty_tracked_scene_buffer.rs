@@ -77,7 +77,8 @@
 //! removing *growth* from the concurrent path entirely) aren't sufficient —
 //! deliberately not committed to speculatively here.
 use crate::gpu::dynamic_buffer::CapacityError;
-use crate::gpu::{DirtyMask, SyncStats};
+use crate::gpu::scatter_write::ScatterWritePipeline;
+use crate::gpu::{DirtyMask, DynamicGpuBuffer, SyncStats};
 use crate::page::Pod;
 use std::cell::UnsafeCell;
 use std::sync::{Arc, RwLock};
@@ -122,9 +123,14 @@ impl<T: Copy> ShadowRow<T> {
 }
 
 struct DirtyTrackedState<T: Pod> {
-    buf: crate::gpu::DynamicGpuBuffer<T>,
+    buf: DynamicGpuBuffer<T>,
     shadow: Vec<ShadowRow<T>>,
     dirty: DirtyMask,
+    /// Scratch buffers for [`super::scatter_write`]'s GPU-side scatter path
+    /// — sized to whatever the largest flush so far needed, not to `buf`'s
+    /// capacity; grown lazily inside `flush` itself, same as `buf`.
+    scatter_indices: DynamicGpuBuffer<u32>,
+    scatter_values: DynamicGpuBuffer<u32>,
 }
 
 /// Grows `state.shadow`/`state.dirty` (pure CPU, no GPU work) to cover
@@ -149,6 +155,94 @@ fn grow_shadow_to<T: Pod>(state: &mut DirtyTrackedState<T>, new_len: usize) {
         }
     }
     state.dirty = new_dirty;
+}
+
+/// Uploads `dirty_rows` (already sorted ascending, already coalesced by the
+/// caller into however many contiguous runs it forms) via one
+/// `queue.write_buffer` call per run. The cheaper strategy when there are
+/// few runs — see [`DirtyTrackedSceneBuffer::SCATTER_RUN_THRESHOLD`]'s doc.
+fn flush_via_direct_writes<T: Pod>(
+    buf: &mut DynamicGpuBuffer<T>,
+    shadow: &[ShadowRow<T>],
+    dirty_rows: &[u32],
+    queue: &wgpu::Queue,
+) -> SyncStats {
+    let mut stats = SyncStats { ranges: 0, bytes: 0 };
+    let mut run_buf: Vec<T> = Vec::new();
+    let mut upload_run = |start: u32, end: u32, stats: &mut SyncStats| {
+        run_buf.clear();
+        run_buf.extend(shadow[start as usize..end as usize].iter().map(ShadowRow::get));
+        buf.write(queue, start, &run_buf);
+        stats.ranges += 1;
+        stats.bytes += ((end - start) as usize * std::mem::size_of::<T>()) as u64;
+    };
+    let mut run_start = dirty_rows[0];
+    let mut run_end = run_start + 1;
+    for &row in &dirty_rows[1..] {
+        if row == run_end {
+            run_end = row + 1;
+            continue;
+        }
+        upload_run(run_start, run_end, &mut stats);
+        run_start = row;
+        run_end = row + 1;
+    }
+    upload_run(run_start, run_end, &mut stats);
+    stats
+}
+
+/// Uploads `dirty_rows` via [`super::scatter_write::ScatterWritePipeline`]:
+/// two flat, contiguous host-side arrays (row indices + their values,
+/// packed in the same order) uploaded in exactly two `queue.write_buffer`
+/// calls, then one compute dispatch scatters each value to its destination
+/// row on the GPU. Constant GPU-call count regardless of how many rows are
+/// dirty or how scattered they are — the strategy for many runs (see
+/// [`DirtyTrackedSceneBuffer::SCATTER_RUN_THRESHOLD`]'s doc).
+fn flush_via_scatter<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scatter: &ScatterWritePipeline,
+    buf: &mut DynamicGpuBuffer<T>,
+    shadow: &[ShadowRow<T>],
+    scatter_indices: &mut DynamicGpuBuffer<u32>,
+    scatter_values: &mut DynamicGpuBuffer<u32>,
+    dirty_rows: &[u32],
+) -> SyncStats {
+    let words_per_element = (std::mem::size_of::<T>() / 4) as u32;
+    let dirty_count = dirty_rows.len() as u32;
+
+    scatter_indices
+        .ensure_capacity(device, queue, dirty_count)
+        .expect("scatter-write scratch buffer has no max_capacity -- growth cannot fail");
+    scatter_values
+        .ensure_capacity(device, queue, dirty_count * words_per_element)
+        .expect("scatter-write scratch buffer has no max_capacity -- growth cannot fail");
+
+    // Packed in the SAME order as dirty_rows: index i's value lives at
+    // words [i*words_per_element, (i+1)*words_per_element) below.
+    let values: Vec<T> = dirty_rows.iter().map(|&row| shadow[row as usize].get()).collect();
+    scatter_indices.write(queue, 0, dirty_rows);
+    // SAFETY: reinterpreting `&[T]` as `&[u32]` of `values.len() *
+    // words_per_element` elements -- valid because `T: Pod` (no padding/
+    // niche issues) and `DirtyTrackedSceneBuffer::new` asserts
+    // `size_of::<T>() % 4 == 0`, so `words_per_element` exactly accounts
+    // for every byte of every `T`.
+    let values_as_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(values.as_ptr() as *const u32, values.len() * words_per_element as usize)
+    };
+    scatter_values.write(queue, 0, values_as_u32);
+
+    scatter.dispatch(
+        device,
+        queue,
+        scatter_indices.buffer(),
+        scatter_values.buffer(),
+        buf.buffer(),
+        words_per_element,
+        dirty_count,
+    );
+
+    SyncStats { ranges: 1, bytes: dirty_count as u64 * std::mem::size_of::<T>() as u64 }
 }
 
 /// Type-erased counterpart, mirroring [`super::GrowableGpuBufferDispatch`]'s
@@ -179,23 +273,50 @@ pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
 
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer));
 
+    /// See [`DirtyTrackedSceneBuffer::epoch`].
+    fn epoch(&self) -> u64;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub struct DirtyTrackedSceneBuffer<T: Pod> {
     device: Arc<wgpu::Device>,
+    /// Stateless after construction (see [`ScatterWritePipeline`]'s doc) --
+    /// lives outside the lock deliberately, so using it never needs to wait
+    /// on `state`.
+    scatter: Arc<ScatterWritePipeline>,
     state: RwLock<DirtyTrackedState<T>>,
 }
 
 impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
     pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32) -> Self {
-        let buf = crate::gpu::DynamicGpuBuffer::new(&device, label, initial_capacity);
+        // gpu::scatter_write's shader treats every element as whole `u32`
+        // words -- see its module doc for why this is the one requirement
+        // on `T` that isn't already implied by `Pod`.
+        assert_eq!(
+            std::mem::size_of::<T>() % 4,
+            0,
+            "DirtyTrackedSceneBuffer requires size_of::<T>() to be a multiple of 4 bytes \
+             (scatter-write operates on whole u32 words); got {} bytes",
+            std::mem::size_of::<T>(),
+        );
+        let buf = DynamicGpuBuffer::new(&device, label, initial_capacity);
         // SAFETY: `T: Pod`'s own safety contract (`page.rs`) guarantees
         // all-zero bytes are a valid `T` -- the same invariant `CellStorage`
         // itself relies on for freshly-allocated, not-yet-written rows.
         let shadow = (0..initial_capacity).map(|_| ShadowRow::new(unsafe { std::mem::zeroed::<T>() })).collect();
         let dirty = DirtyMask::new(initial_capacity);
-        Self { device, state: RwLock::new(DirtyTrackedState { buf, shadow, dirty }) }
+        // Capacity 1, not 0 -- a zero-sized wgpu buffer is invalid (`size`
+        // must be > 0). Grows to whatever a flush actually needs, same as
+        // every other lazily-grown buffer in this crate.
+        let scatter_indices = DynamicGpuBuffer::new(&device, &format!("{label}-scatter-indices"), 1);
+        let scatter_values = DynamicGpuBuffer::new(&device, &format!("{label}-scatter-values"), 1);
+        let scatter = Arc::new(ScatterWritePipeline::new(&device));
+        Self {
+            scatter,
+            state: RwLock::new(DirtyTrackedState { buf, shadow, dirty, scatter_indices, scatter_values }),
+            device,
+        }
     }
 
     /// Records `value` as row `row`'s new value and marks it dirty.
@@ -277,6 +398,18 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
         state.buf.shrink_to_fit(&self.device, queue, highest_live_row, slack_factor)
     }
 
+    /// Above this many contiguous runs, [`Self::flush`] switches from direct
+    /// `queue.write_buffer`-per-run uploads to [`super::scatter_write`]'s
+    /// GPU-side scatter pass. Below it, direct writes win (scatter's fixed
+    /// cost -- two buffer uploads plus a compute dispatch -- isn't paid back
+    /// by avoiding just a couple of `write_buffer` calls). Above it, scatter
+    /// wins decisively, because its cost is constant in run count while
+    /// direct writes' is linear -- see `gpu::scatter_write`'s module doc for
+    /// the real measurement this threshold is picked from (roughly uniform
+    /// scattered churn at realistic entity counts produces dirty sets that
+    /// are ~all runs of length 1, i.e. thousands of runs).
+    const SCATTER_RUN_THRESHOLD: u32 = 4;
+
     pub fn flush(&self, queue: &wgpu::Queue) -> SyncStats {
         let mut state = self.state.write().expect("DirtyTrackedSceneBuffer lock poisoned");
         let shadow_len = state.shadow.len() as u32;
@@ -286,56 +419,51 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
                 .ensure_capacity(&self.device, queue, shadow_len)
                 .expect("DirtyTrackedSceneBuffer never sets a max_capacity -- growth cannot fail");
         }
-        let DirtyTrackedState { buf, shadow, dirty } = &mut *state;
-        let mut stats = SyncStats { ranges: 0, bytes: 0 };
-        let mut run_start: Option<u32> = None;
-        // `shadow` is `[ShadowRow<T>]`, not `[T]` -- `flush` holds the outer
-        // lock's write (exclusive) side for its whole duration, so every
-        // `ShadowRow` in the run is guaranteed not to be concurrently
-        // written while these `.get()` calls materialize a plain `&[T]`
-        // `write` can pass straight through to `queue.write_buffer`.
-        let mut run_buf: Vec<T> = Vec::new();
-        let mut flush_run = |start: u32, end: u32, stats: &mut SyncStats| {
-            run_buf.clear();
-            run_buf.extend(shadow[start as usize..end as usize].iter().map(ShadowRow::get));
-            buf.write(queue, start, &run_buf);
-            stats.ranges += 1;
-            stats.bytes += ((end - start) as usize * std::mem::size_of::<T>()) as u64;
-        };
-        // Helio#214: walk only the marked rows (`DirtyMask::for_each_marked`
-        // skips whole all-zero 64-bit words), not every row in
-        // `0..shadow_len` -- a benchmark found the row-by-row scan cost
-        // nearly the same at 0% and 10% dirty (100,000 capacity), the scan
-        // itself dominating over the actual writes. Adjacency is now
-        // detected by row delta (`row != run_end`) instead of "was this
-        // specific row NOT marked", since non-dirty rows are no longer
-        // visited at all to compare against.
+
+        // Gather every dirty row once -- O(capacity/64 + dirty_count), the
+        // same cost the old row-by-row coalescing scan already paid
+        // (Helio#214) -- and count how many contiguous runs they'd form.
+        // That count decides the strategy below; the gathered list itself
+        // is what BOTH strategies actually upload from.
+        let mut dirty_rows: Vec<u32> = Vec::new();
+        let mut run_count: u32 = 0;
         let mut run_end: u32 = 0;
-        dirty.for_each_marked(|row| {
-            match run_start {
-                Some(_) if row == run_end => {
-                    // extends the current run
-                }
-                Some(start) => {
-                    flush_run(start, run_end, &mut stats);
-                    run_start = Some(row);
-                }
-                None => {
-                    run_start = Some(row);
-                }
+        state.dirty.for_each_marked(|row| {
+            if dirty_rows.is_empty() || row != run_end {
+                run_count += 1;
             }
             run_end = row + 1;
+            dirty_rows.push(row);
         });
-        if let Some(start) = run_start {
-            flush_run(start, run_end, &mut stats);
+        if dirty_rows.is_empty() {
+            return SyncStats { ranges: 0, bytes: 0 };
         }
-        dirty.clear_all();
+
+        let stats = if run_count <= Self::SCATTER_RUN_THRESHOLD {
+            let DirtyTrackedState { buf, shadow, .. } = &mut *state;
+            flush_via_direct_writes(buf, shadow, &dirty_rows, queue)
+        } else {
+            let DirtyTrackedState { buf, shadow, scatter_indices, scatter_values, .. } = &mut *state;
+            flush_via_scatter(&self.device, queue, &self.scatter, buf, shadow, scatter_indices, scatter_values, &dirty_rows)
+        };
+        state.dirty.clear_all();
         stats
     }
 
     pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
         let state = self.state.read().expect("DirtyTrackedSceneBuffer lock poisoned");
         f(state.buf.buffer());
+    }
+
+    /// Bump count of the underlying GPU buffer since construction — grows
+    /// only at [`Self::flush`] (or [`Self::reserve`]), never at
+    /// [`Self::mark_dirty`] itself, so this is a direct measure of how many
+    /// times the actual `wgpu::Buffer` has been reallocated. Compare against
+    /// a previously observed value to know whether a bind group built
+    /// against this column needs rebuilding, same as
+    /// [`super::GrowableSceneBuffer::epoch`].
+    pub fn epoch(&self) -> u64 {
+        self.state.read().expect("DirtyTrackedSceneBuffer lock poisoned").buf.epoch()
     }
 }
 
@@ -362,6 +490,10 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedGpuBufferDispatch for DirtyTrac
 
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
         DirtyTrackedSceneBuffer::with_buffer(self, f)
+    }
+
+    fn epoch(&self) -> u64 {
+        DirtyTrackedSceneBuffer::epoch(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -538,5 +670,83 @@ mod tests {
             let got = u32::from_ne_bytes(bytes[(row * 4) as usize..(row * 4 + 4) as usize].try_into().unwrap());
             assert_eq!(got, row * 7, "row {row} must have survived concurrent marking from whichever thread owned it, uncorrupted by any other thread's marks");
         }
+    }
+
+    /// SceneDB#39: scattered rows (well above `SCATTER_RUN_THRESHOLD`, no
+    /// two adjacent) must take the GPU-side scatter path and land every
+    /// value at exactly the right row, with every untouched row still
+    /// reading zero — the real-device correctness proof for
+    /// `gpu::scatter_write`, not just the run-count/threshold logic.
+    #[test]
+    fn scattered_dirty_rows_use_the_scatter_path_and_land_at_the_right_rows() {
+        let (device, queue) = test_device();
+        let capacity = 1000u32;
+        let buf: DirtyTrackedSceneBuffer<u32> = DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", capacity);
+
+        // 40 rows, no two adjacent, spread across the whole capacity --
+        // 40 runs, comfortably above SCATTER_RUN_THRESHOLD (4).
+        let dirty_rows: Vec<u32> = (0..40u32).map(|i| i * 23 + 1).collect();
+        for &row in &dirty_rows {
+            buf.mark_dirty(row, row * 1000 + 7);
+        }
+
+        let stats = buf.flush(&queue);
+        assert_eq!(stats.ranges, 1, "scatter path reports one GPU operation regardless of how many rows were scattered");
+        assert_eq!(stats.bytes, dirty_rows.len() as u64 * 4);
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, capacity as u64 * 4));
+        let at = |row: u32| u32::from_ne_bytes(bytes[(row * 4) as usize..(row * 4 + 4) as usize].try_into().unwrap());
+        let dirty_set: std::collections::HashSet<u32> = dirty_rows.iter().copied().collect();
+        for row in 0..capacity {
+            if dirty_set.contains(&row) {
+                assert_eq!(at(row), row * 1000 + 7, "scattered row {row} must land at exactly its own offset, not a neighbor's");
+            } else {
+                assert_eq!(at(row), 0, "row {row} was never marked -- must stay zero, not leak a neighboring scattered write");
+            }
+        }
+    }
+
+    /// Same as above but for a wide, multi-word element type
+    /// (`[f32; 16]`, 64 bytes = 16 `u32` words) — the scatter shader's
+    /// per-element copy loop (`words_per_element` iterations) is untested
+    /// by every other test in this file, which all use plain `u32`
+    /// (`words_per_element == 1`, which can't catch an off-by-one in that
+    /// loop).
+    #[test]
+    fn scatter_path_copies_every_word_of_a_wide_multi_word_element() {
+        let (device, queue) = test_device();
+        let capacity = 200u32;
+        let buf: DirtyTrackedSceneBuffer<[f32; 16]> = DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", capacity);
+
+        let dirty_rows: Vec<u32> = (0..30u32).map(|i| i * 5 + 2).collect();
+        let value_for = |row: u32| -> [f32; 16] { core::array::from_fn(|w| row as f32 * 100.0 + w as f32) };
+        for &row in &dirty_rows {
+            buf.mark_dirty(row, value_for(row));
+        }
+        let stats = buf.flush(&queue);
+        assert_eq!(stats.ranges, 1, "scatter path (40 runs's worth of isolation exceeds the threshold)");
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, capacity as u64 * 64));
+        let dirty_set: std::collections::HashSet<u32> = dirty_rows.iter().copied().collect();
+        for row in 0..capacity {
+            let row_bytes = &bytes[(row as usize) * 64..(row as usize) * 64 + 64];
+            let got: [f32; 16] = core::array::from_fn(|w| f32::from_ne_bytes(row_bytes[w * 4..w * 4 + 4].try_into().unwrap()));
+            let expected = if dirty_set.contains(&row) { value_for(row) } else { [0.0; 16] };
+            assert_eq!(got, expected, "row {row}: every one of the 16 words must match, not just the first");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 4 bytes")]
+    fn element_size_not_a_multiple_of_4_bytes_panics_at_construction() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct ThreeBytes([u8; 3]);
+        unsafe impl Pod for ThreeBytes {}
+
+        let (device, _queue) = test_device();
+        let _buf: DirtyTrackedSceneBuffer<ThreeBytes> = DirtyTrackedSceneBuffer::new(device, "test", 4);
     }
 }

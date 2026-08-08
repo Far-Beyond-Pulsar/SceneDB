@@ -7,6 +7,12 @@
 //! 2. `#[gpu]` (`DirtyTracked`, the default) fields defer their write --
 //!    `World::insert` alone does not reach the GPU; `World::flush_gpu_mirror`
 //!    does, coalesced.
+//!
+//! As of SceneDB#39, (1) also defers: `Once`-mode fields are queued on
+//! insert and uploaded by the next `flush_gpu_mirror` call, the same as
+//! `DirtyTracked` fields, instead of writing immediately inline with
+//! `insert`. "Never touched again after the first insert" still holds --
+//! only *when* that one write actually reaches the GPU changed.
 
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
 use pulsar_scenedb::World;
@@ -82,17 +88,21 @@ fn once_mode_field_never_rewrites_after_the_first_insert() {
     let mesh_id_field_id = mesh_id_col.field_token.id();
 
     world.insert(entity, MixedModeComponent { mesh_id: 42, hp: 100 });
+    // SceneDB#39: Once-mode writes are now queued, not immediate -- a flush
+    // is required before this reaches the GPU, same as DirtyTracked fields.
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
     let mut got = 0u32;
-    store.with_growable_buffer_for_id(mesh_id_field_id, &mut |buf| got = readback_u32(&ctx, buf, row));
-    assert_eq!(got, 42, "Once field must write on the first insert");
+    store.with_dirty_tracked_buffer_for_id(mesh_id_field_id, &mut |buf| got = readback_u32(&ctx, buf, row));
+    assert_eq!(got, 42, "Once field must have written by the first flush after its first insert");
 
     // Re-insert (an in-place update -- entity already has this component):
     // mesh_id changes in the CPU-side value, but the GPU buffer must NOT
-    // reflect it -- Once means "uploaded once at registration and never
-    // touched again."
+    // reflect it -- Once means "queued once at the first insert and never
+    // touched again," not "immune to flush timing."
     world.insert(entity, MixedModeComponent { mesh_id: 999, hp: 50 });
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
     let mut got_after = 0u32;
-    store.with_growable_buffer_for_id(mesh_id_field_id, &mut |buf| got_after = readback_u32(&ctx, buf, row));
+    store.with_dirty_tracked_buffer_for_id(mesh_id_field_id, &mut |buf| got_after = readback_u32(&ctx, buf, row));
     assert_eq!(got_after, 42, "Once field must NOT re-write on a later update, even though the CPU value changed");
 }
 
@@ -156,7 +166,19 @@ fn dirty_tracked_writes_across_multiple_entities_coalesce_on_flush() {
         entities.push(e);
     }
     let stats = world.flush_gpu_mirror(ctx.queue()).unwrap();
-    assert_eq!(stats.ranges, 1, "5 adjacent dirty rows must coalesce into exactly one upload range");
+    // 2, not 1: `flush_gpu_mirror`'s returned `SyncStats` is a combined total
+    // across every deferred World-mirrored column (SceneDB#39), and
+    // `MixedModeComponent` has two -- `hp` (DirtyTracked) AND `mesh_id`
+    // (Once, batched since #39). The 5 adjacent rows coalesce into exactly
+    // one range EACH: one for `hp`'s DirtyTracked flush, one for `mesh_id`'s
+    // batched-once flush (every one of the 5 inserts below is each entity's
+    // first, so `mesh_id` queues a write for every row too). Asserting on
+    // the combined total here is what actually exercises coalescing across
+    // BOTH deferred paths at once, not a looser check.
+    assert_eq!(
+        stats.ranges, 2,
+        "5 adjacent dirty rows must coalesce into exactly one upload range per deferred column (hp + mesh_id)"
+    );
 
     for (i, e) in entities.iter().enumerate() {
         let mut got = 0u32;

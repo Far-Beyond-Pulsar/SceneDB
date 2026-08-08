@@ -1,9 +1,18 @@
-//! Proves the growable World-mirror path end-to-end: a `#[gpu]`-tagged
-//! component registered via the derive's generated
-//! `register_gpu_columns_growable` (a small initial capacity, no
-//! `max_capacity` ceiling) survives `World::insert`s at entity indices far
+//! Proves growth end-to-end through the World-mirror `Once`-mode path: a
+//! `#[gpu(mirror = Once)]`-tagged component, registered via the derive's
+//! generated `register_gpu_columns_growable` (a small initial capacity, no
+//! `max_capacity` ceiling), survives `World::insert`s at entity indices far
 //! past that initial capacity -- the exact scenario `SceneBuffer`'s
 //! fixed-capacity contract guarantees eventually panics on, without this.
+//!
+//! As of SceneDB#39, `Once`-mode fields are registered through the SAME
+//! dirty-tracked path `#[gpu]` (`DirtyTracked`) fields use (see
+//! `gpu::world_mirror::GenerationMirror`'s doc for why) -- so growth here is
+//! `DirtyTrackedSceneBuffer`'s growth, verified through
+//! `with_dirty_tracked_buffer_for_id`, not `growable_capacity_for_id`/
+//! `with_growable_buffer_for_id` (those stay accurate for columns registered
+//! via `register_growable_gpu_buffer` directly, which `Once`-mode fields no
+//! longer are).
 
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
 use pulsar_scenedb::World;
@@ -53,11 +62,11 @@ fn scene_cfg() -> SceneGpuConfig {
     }
 }
 
-// #[gpu(mirror = Once)], not the plain #[gpu] (DirtyTracked) default --
-// this test is specifically about buffer GROWTH (register_gpu_columns_growable
-// + write-past-capacity), which the immediate write path exercises
-// directly. The DirtyTracked + deferred-flush path has its own dedicated
-// test in tests/world_gpu_mirror_dirty_tracked.rs.
+// #[gpu(mirror = Once)], not the plain #[gpu] (DirtyTracked) default -- this
+// test is specifically about growth through the Once path end-to-end. The
+// underlying growth mechanism is shared with DirtyTracked fields (both go
+// through DirtyTrackedSceneBuffer as of #39); DirtyTracked's own dedicated
+// coverage lives in tests/world_gpu_mirror_dirty_tracked.rs.
 #[derive(SceneStore, Clone, Copy)]
 struct GrowableTagComponent {
     #[gpu(mirror = Once)]
@@ -65,7 +74,7 @@ struct GrowableTagComponent {
 }
 
 #[test]
-fn world_insert_past_initial_growable_capacity_does_not_panic_and_reads_back_correctly() {
+fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() {
     let ctx = test_context();
     let mut store = SceneGpuStore::new(&ctx, scene_cfg());
     // Deliberately tiny initial capacity -- this test's whole point is that
@@ -84,20 +93,32 @@ fn world_insert_past_initial_growable_capacity_does_not_panic_and_reads_back_cor
         entities.push(e);
     }
 
+    // SceneDB#39: Once-mode writes (and the growth they can trigger) are now
+    // deferred to `flush_gpu_mirror`, not immediate on `insert` -- same as
+    // DirtyTracked fields.
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+
     let columns = GrowableTagComponent::gpu_columns();
     assert_eq!(columns.len(), 1);
     let id = columns[0].field_token.id();
 
-    let capacity = store.growable_capacity_for_id(id).expect("registered growable");
+    // Growth verified by the underlying wgpu::Buffer's actual byte size
+    // (capacity in elements = size / 4 for this u32 field) rather than a
+    // dedicated epoch/capacity accessor -- `Once`-mode columns live in the
+    // dirty-tracked map now, which (deliberately) exposes buffer access the
+    // same lock-safe way growable columns do, but doesn't duplicate every
+    // introspection accessor growable columns happen to have.
+    let mut buf_bytes = Vec::new();
+    let mut capacity_bytes = 0u64;
+    store.with_dirty_tracked_buffer_for_id(id, &mut |buf| {
+        capacity_bytes = buf.size();
+        buf_bytes = readback(&ctx, buf, 0, capacity_bytes);
+    });
+    let capacity = capacity_bytes / 4;
     assert!(capacity > 2, "must have grown past the initial capacity of 2, got {capacity}");
-    assert!(store.growable_epoch_for_id(id).unwrap() >= 1, "at least one reallocation must have happened");
 
     // Every entity's value must still be correct after however many
     // reallocations happened along the way.
-    let mut buf_bytes = Vec::new();
-    store.with_growable_buffer_for_id(id, &mut |buf| {
-        buf_bytes = readback(&ctx, buf, 0, (capacity as u64) * 4);
-    });
     for (i, entity) in entities.iter().enumerate() {
         let row = entity.index() as usize;
         let got = u32::from_ne_bytes(buf_bytes[row * 4..row * 4 + 4].try_into().unwrap());

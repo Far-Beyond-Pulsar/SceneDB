@@ -230,6 +230,17 @@ pub struct SceneGpuStore {
     /// writes are marked dirty ([`Self::mark_gpu_row_dirty`]) rather than
     /// uploaded immediately; [`Self::flush_gpu_mirror`] performs the actual
     /// coalesced upload.
+    /// `#[gpu(mirror = Once)]` World-mirrored fields (SceneDB#39) are ALSO
+    /// registered here, not in `growable_gpu_buffers` — Once-mode's "never
+    /// re-write after the first insert" behavior is enforced one layer up,
+    /// at the call site that decides whether to mark a row dirty at all
+    /// (`world_mirror::write_gpu_columns_at_row`'s early `continue` on a
+    /// non-first insert), not by which map the column lives in. Reusing
+    /// this proven, read-lock-first, mostly-lock-free path instead of a
+    /// separate immediate-write or hand-rolled pending-queue mechanism is
+    /// deliberate — see `GenerationMirror`'s doc (`gpu::world_mirror`) for
+    /// why an earlier, more "obviously cheap" alternative measured worse in
+    /// practice.
     dirty_tracked_gpu_buffers: HashMap<ComponentId, Box<dyn DirtyTrackedGpuBufferDispatch>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
@@ -1143,7 +1154,10 @@ impl SceneGpuStore {
     /// path's own boundary-phase `sync_all`. A no-op, zero-cost beyond one
     /// empty-map iteration, if nothing was registered dirty-tracked (e.g. no
     /// `#[gpu]` field anywhere used the default `DirtyTracked` mode through
-    /// this registration path).
+    /// this registration path). As of SceneDB#39, `#[gpu(mirror = Once)]`
+    /// fields are ALSO registered here (see the `dirty_tracked_gpu_buffers`
+    /// field doc for why), so this same loop covers both modes — nothing
+    /// extra needed here to make `Once` deferred/batched too.
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
         let mut total = SyncStats { ranges: 0, bytes: 0 };
         for buf in self.dirty_tracked_gpu_buffers.values() {
@@ -1161,6 +1175,13 @@ impl SceneGpuStore {
         if let Some(buf) = self.dirty_tracked_gpu_buffers.get(&id) {
             buf.with_buffer(f);
         }
+    }
+
+    /// `epoch()` of a dirty-tracked column's buffer, by `ComponentId` — the
+    /// dirty-tracked counterpart to [`Self::growable_epoch_for_id`]. `None`
+    /// if `id` isn't registered dirty-tracked.
+    pub fn dirty_tracked_epoch_for_id(&self, id: ComponentId) -> Option<u64> {
+        self.dirty_tracked_gpu_buffers.get(&id).map(|buf| buf.epoch())
     }
 
     /// Reserves capacity `n` on every World-mirrored buffer registered so

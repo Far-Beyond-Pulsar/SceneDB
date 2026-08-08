@@ -133,27 +133,28 @@ pub fn generate_gpu_column_set(
         })
         .collect();
 
-    // Per field, registered through whichever of the two growable paths
-    // matches its declared `#[gpu(mirror = ...)]` mode: `Once` fields go
-    // through the plain growable registration (write-once-ish data, no
-    // benefit from dirty-tracking); `DirtyTracked` fields (the default)
-    // through the dirty-tracked registration, so `World::flush_gpu_mirror`
-    // actually has something registered to flush. Both never set a
-    // `max_capacity` ceiling -- see `register_gpu_columns_growable`'s own
-    // doc for why that's deliberate for World-mirrored columns.
+    // Per field, registered through the dirty-tracked path regardless of
+    // its declared `#[gpu(mirror = ...)]` mode (SceneDB#39): `Once` and
+    // `DirtyTracked` fields both need `World::flush_gpu_mirror` to actually
+    // have something registered to flush -- they differ only in HOW OFTEN
+    // `write_gpu_columns_at_row` marks a row dirty at all (`Once`: just the
+    // first insert; `DirtyTracked`: every insert), not in which map they
+    // live in or how the flush itself works. Reusing one proven,
+    // read-lock-first write path for both, instead of a separate immediate
+    // or hand-rolled-pending-queue mechanism for `Once`, is deliberate --
+    // see `GenerationMirror`'s doc (`gpu::world_mirror`, SceneDB crate) for
+    // why an earlier, more "obviously cheap" alternative measured worse in
+    // practice. Never sets a `max_capacity` ceiling -- see
+    // `register_gpu_columns_growable`'s own doc for why that's deliberate
+    // for World-mirrored columns.
     let register_growable_calls: Vec<_> = gpu_fields
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
             let buffer_label = format!("{}::{}", name, field_name);
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
-            match f.mirror_mode {
-                MirrorModeAttr::Once => quote! {
-                    store.register_growable_gpu_buffer::<#wrapper>(initial_capacity, None, device, #buffer_label);
-                },
-                MirrorModeAttr::DirtyTracked => quote! {
-                    store.register_dirty_tracked_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
-                },
+            quote! {
+                store.register_dirty_tracked_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
             }
         })
         .collect();
@@ -204,44 +205,29 @@ pub fn generate_gpu_column_set(
         unsafe impl ::pulsar_scenedb::page::Pod for #packed_view_ident {}
     };
 
+    // SceneDB#39: registered through the dirty-tracked path regardless of
+    // `packed_is_once` -- see the non-packed `register_growable_calls`'s
+    // comment above for why both modes share one registration + write path
+    // now.
     let register_growable_calls_packed = {
         let buffer_label = format!("{}::packed", name);
-        if packed_is_once {
-            quote! {
-                store.register_growable_gpu_buffer::<#packed_view_ident>(initial_capacity, None, device, #buffer_label);
-            }
-        } else {
-            quote! {
-                store.register_dirty_tracked_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
-            }
+        quote! {
+            store.register_dirty_tracked_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
         }
     };
 
-    // Packed write body: either immediate (Once -- skip entirely on a later
-    // update, matching the non-packed Once behavior exactly) or
-    // mark-dirty-and-defer (DirtyTracked -- picked up by the next
-    // `World::flush_gpu_mirror`), never both -- `packed_is_once` was
-    // validated uniform across every #[gpu] field on this struct above.
+    // Packed write body: `Once` marks dirty only on the first insert (skips
+    // entirely on a later update, matching the non-packed Once behavior
+    // exactly) and never again; `DirtyTracked` marks dirty on every insert.
+    // Both then flush identically via `World::flush_gpu_mirror` --
+    // `packed_is_once` was validated uniform across every #[gpu] field on
+    // this struct above.
     let packed_write_body = if packed_is_once {
         quote! {
             if !is_new_insert {
                 return;
             }
-            if store.write_row_bytes(id, queue, bytes, row) {
-                return;
-            }
-            match store.write_row_bytes_growing(id, queue, bytes, row) {
-                None => {} // not registered at all -- bring-up, not an error
-                Some(Ok(())) => {}
-                Some(Err(cap_err)) => panic!(
-                    "World-mirrored packed GPU column for {} hit its configured \
-                     max_capacity ({}) at row {row} (requested {}) -- packed columns \
-                     registered via register_gpu_columns_growable never set a ceiling, \
-                     so this should be unreachable unless this type's packed buffer was \
-                     registered by hand with an explicit max_capacity",
-                    stringify!(#name), cap_err.max, cap_err.requested,
-                ),
-            }
+            store.mark_gpu_row_dirty(id, row, bytes);
         }
     } else {
         quote! {
@@ -284,7 +270,6 @@ pub fn generate_gpu_column_set(
             };
             let id = ::pulsar_scenedb::component::component_id::<#packed_view_ident>();
             let store = mirror.store();
-            let queue = mirror.queue();
             #packed_write_body
         }
 
