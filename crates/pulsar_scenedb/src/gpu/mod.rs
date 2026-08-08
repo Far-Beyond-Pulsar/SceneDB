@@ -53,7 +53,7 @@ pub use scene_store::{
 };
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;
-pub use world_mirror::{write_gpu_columns_at_row, GpuMirrorHandle, GpuMirrorRegistration};
+pub use world_mirror::{write_gpu_columns_at_row, GenerationMirror, GpuMirrorHandle, GpuMirrorRegistration};
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)
 // and already re-exported at the crate root; re-exported here too so GPU-
 // adjacent consumers (e.g. Helio's `helio-scenedb` seam reflection harness,

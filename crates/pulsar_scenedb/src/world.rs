@@ -90,6 +90,17 @@ impl World {
         self.gpu_mirror.is_some()
     }
 
+    /// The currently-attached GPU mirror, if any — e.g. to reach
+    /// [`crate::gpu::GpuMirrorHandle::generations`] for binding the
+    /// liveness/generation buffer into a shader. `GpuMirrorHandle` is cheap
+    /// to `Clone`, so callers that already kept their own copy from before
+    /// [`Self::attach_gpu_mirror`] don't need this — it exists for the case
+    /// where they didn't.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_mirror(&self) -> Option<&crate::gpu::GpuMirrorHandle> {
+        self.gpu_mirror.as_ref()
+    }
+
     /// Debug assertion: every archetype's column lengths must equal its entity
     /// count.  Panics on the first mismatch.  Compiled out in release builds
     /// (the loop body becomes a no-op).
@@ -160,6 +171,16 @@ impl World {
         empty.entities.push(entity);
         self.entity_slots[idx as usize].row = row;
 
+        // GPU liveness mirror: keep row `idx`'s generation on the GPU in
+        // lockstep with entity_slots[idx].generation, the same value
+        // is_alive checks against on the CPU side. See
+        // `crate::gpu::world_mirror::GenerationMirror`'s doc for the
+        // read-side contract this exists to support.
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            mirror.write_generation(idx, gen);
+        }
+
         if let Some(t) = tracker {
             t.record_spawn(entity);
         }
@@ -199,7 +220,20 @@ impl World {
         }
         let slot = &mut self.entity_slots[entity.index() as usize];
         slot.generation = slot.generation.wrapping_add(1);
+        let new_generation = slot.generation;
         self.free_slots.push(entity.index());
+
+        // GPU liveness mirror: write the FRESHLY-BUMPED generation, not
+        // `entity`'s own (now-dead) one -- a reader still holding `entity`
+        // must see a mismatch against this row going forward, exactly what
+        // CPU-side `is_alive` already guarantees for `entity.generation()`
+        // vs. `entity_slots[idx].generation`. Written immediately at
+        // despawn, not deferred to the slot's eventual reuse by a future
+        // spawn -- `is_alive` itself doesn't wait for that either.
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            mirror.write_generation(entity.index(), new_generation);
+        }
 
         if let Some(t) = tracker {
             t.record_despawn(entity);

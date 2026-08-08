@@ -1018,7 +1018,25 @@ StaticMeshComponent::register_gpu_columns_growable(&mut store, 1024, &device);
 
 `initial_capacity` only needs to be cheap to allocate — the buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time an insert's `entity.index()` doesn't fit, entirely inside `World::insert`'s automatic dispatch, with no caller-visible difference from the fixed path except that it never panics on capacity. `SceneGpuStore::register_growable_gpu_buffer` (the lower-level method this generated call wraps) can also take an explicit `max_capacity` ceiling for a deliberate VRAM budget, but the derive's generated `register_gpu_columns_growable` never sets one — a World-mirrored column hitting a capacity ceiling has no way to report that failure back through `world.insert()`, so the recommendation is to leave it unbounded and rely on `DynamicGpuBuffer`/`GrowableSceneBuffer`'s `epoch()` counter (see `SceneGpuStore::growable_epoch_for_id`) if you need to observe growth for bind-group invalidation purposes.
 
-**Staleness.** Despawning an entity does not clear its row in a mirrored GPU buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. A reader must gate on liveness (e.g. cross-reference against `World::is_alive`/a generation check) rather than trust an arbitrary row's contents.
+**Staleness / liveness.** Despawning an entity does not clear its row in a mirrored `#[gpu]` component buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. What DOES happen automatically: `World::spawn`/`despawn` (when a mirror is attached) keep a dedicated, GPU-resident generation buffer — `GpuMirrorHandle::generations()` — in lockstep with `entity_slots`' own generation for that row, exactly the value `World::is_alive` already checks on the CPU side. A GPU-side reader (a shader, a cull pass) that captured `(row, generation)` at some point — typically alongside the same visible-index/draw list it's iterating — should compare `generation` against `generations_buffer[row]` before trusting any other World-mirrored buffer's contents at `row`:
+
+```rust
+// Bind mirror.generations() alongside your other World-mirrored buffers:
+mirror.generations().with_buffer(&mut |buf| {
+    // bind `buf` as a read-only storage buffer, one u32 per row
+});
+```
+
+```wgsl
+// In the consuming shader, given `row` and a `generation` captured earlier
+// alongside it (e.g. from a CPU-side query snapshot, or another buffer
+// written at the same time):
+if (generations[row] != generation) {
+    return; // stale -- this row's other buffers no longer belong to what we think
+}
+```
+
+This mirrors `World::is_alive`'s exact CPU-side check, just GPU-resident. It does not, on its own, tell a shader which rows are *currently occupied at all* (that's still the consumer's responsibility, e.g. via a separate visible/active-row list) — it only tells it, for a row it already intends to read, whether the data there still belongs to the entity it thinks it does.
 
 **What `#[gpu]` component fields are *not* for.** They give a stable one-row-per-entity buffer, written by `World::insert`, with a lifetime tied to the entity. That shape does not fit every kind of GPU data a renderer built on `World` needs. Before reaching for `#[gpu]`, check:
 
