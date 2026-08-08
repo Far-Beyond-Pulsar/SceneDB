@@ -1,10 +1,11 @@
 use proc_macro::TokenStream;
-use syn::{parse_macro_input, DeriveInput};
+use syn::{parse_macro_input, DeriveInput, ItemImpl};
 
 mod cell;
 mod gpu;
 mod replicate;
 mod scene_store;
+mod subsystem;
 
 /// Derive `HasTypeToken`, `Pod`, `SceneColumnSet`, and `GpuColumnSet` for a
 /// SceneDB component struct.
@@ -54,4 +55,44 @@ pub fn derive_replicate(input: TokenStream) -> TokenStream {
     replicate::expand(input)
         .unwrap_or_else(|err| err.to_compile_error().into())
         .into()
+}
+
+/// Mark an `impl Foo { .. }` block as a SceneDB subsystem, registering every
+/// `#[subsystem_method]`-marked method into Pulsar's reflection database
+/// (`pulsar_reflection::DYN_METHOD_REGISTRY`) at link time via
+/// `inventory::submit!`.
+///
+/// `name = "..."` sets the registry key subsystems are dispatched under
+/// (via [`pulsar_scenedb::SubsystemRegistry::dispatch`] /
+/// [`pulsar_scenedb::SceneDb::dispatch`]); defaults to the type's name.
+///
+/// # Example
+///
+/// ```ignore
+/// #[scenedb_subsystem(name = "physics")]
+/// impl PhysicsSubsystem {
+///     #[subsystem_method]
+///     pub fn apply_impulse(&mut self, entity: Handle, impulse: [f32; 3]) {
+///         // ...
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn scenedb_subsystem(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let impl_block = parse_macro_input!(item as ItemImpl);
+    subsystem::expand(attr.into(), impl_block)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
+}
+
+/// Marks a method inside a `#[scenedb_subsystem]` impl block as
+/// dynamically dispatchable by name. A real (identity) attribute macro —
+/// not a bare marker `#[scenedb_subsystem]` has to strip — so it's valid
+/// syntax on its own even before `#[scenedb_subsystem]` processes it.
+///
+/// `#[subsystem_method(category = "...")]` optionally sets a display
+/// category, mirroring `engine_class_derive`'s `#[method(...)]`.
+#[proc_macro_attribute]
+pub fn subsystem_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
 }

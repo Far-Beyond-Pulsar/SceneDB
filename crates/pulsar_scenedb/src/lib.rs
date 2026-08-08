@@ -76,6 +76,7 @@ pub mod liveness;
 pub mod page;
 pub mod query;
 pub mod registry;
+pub mod relation;
 pub mod replication;
 
 pub mod schedule;
@@ -92,6 +93,9 @@ pub mod gpu;
 #[cfg(feature = "gpu")]
 pub mod subsystem;
 
+#[cfg(feature = "gpu")]
+pub mod scene_db;
+
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 
@@ -106,6 +110,8 @@ pub use entity::Entity;
 pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
 #[cfg(feature = "gpu")]
 pub use subsystem::{Subsystem, SubsystemRegistry};
+#[cfg(feature = "gpu")]
+pub use scene_db::SceneDb;
 pub use handle::Handle;
 pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
@@ -123,6 +129,7 @@ pub use page::{
 };
 pub use query::{QueryIter, WorldQuery};
 pub use registry::{HandleRegistry, NULL_ROW};
+pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
 pub use schedule::Schedule;
 pub use snapshot::{LivenessSnapshot, RevocationFlag};
 pub use spatial::{

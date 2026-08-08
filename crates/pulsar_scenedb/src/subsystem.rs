@@ -118,6 +118,29 @@ impl SubsystemRegistry {
         self.instances.get_mut(&type_id).map(|b| b.as_mut())
     }
 
+    /// Dynamic path (scripts/events): look up `subsystem_name` and invoke
+    /// `method_name` on it by string, routed through Pulsar's central
+    /// reflection database (`pulsar_reflection::DYN_METHOD_REGISTRY`).
+    ///
+    /// This is genuinely Pulsar's reflection DB, not a parallel one: the
+    /// method table itself lives in `pulsar_reflection` (populated at link
+    /// time via `inventory::submit!`, same mechanism `EngineClassRegistry`
+    /// uses for components), keyed by the subsystem's registered name —
+    /// SceneDB's only job here is producing the `&mut dyn Any` receiver.
+    pub fn dispatch(
+        &mut self,
+        subsystem_name: &str,
+        method_name: &str,
+        args: pulsar_reflection::DynMethodArgs,
+    ) -> Result<pulsar_reflection::DynMethodReturnValue, SubsystemDispatchError> {
+        let subsystem = self
+            .get_by_name_mut(subsystem_name)
+            .ok_or_else(|| SubsystemDispatchError::UnknownSubsystem(subsystem_name.to_string()))?;
+        pulsar_reflection::DYN_METHOD_REGISTRY
+            .invoke(subsystem_name, method_name, subsystem.as_any_mut(), args)
+            .map_err(SubsystemDispatchError::Reflection)
+    }
+
     /// Runs every registered subsystem's `simulate_a` hook, in registration
     /// order is NOT guaranteed (`HashMap` iteration) — subsystems that need
     /// ordering against each other should say so explicitly; SceneDB's own
@@ -155,6 +178,27 @@ impl SubsystemRegistry {
         self.instances.is_empty()
     }
 }
+
+/// Errors from [`SubsystemRegistry::dispatch`].
+#[derive(Debug)]
+pub enum SubsystemDispatchError {
+    /// No subsystem is registered under this name.
+    UnknownSubsystem(String),
+    /// The subsystem exists but `pulsar_reflection`'s method table has no
+    /// entry for it, or no entry for the requested method name.
+    Reflection(pulsar_reflection::DynDispatchError),
+}
+
+impl std::fmt::Display for SubsystemDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSubsystem(name) => write!(f, "no subsystem registered as '{name}'"),
+            Self::Reflection(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SubsystemDispatchError {}
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +247,72 @@ mod tests {
         assert_eq!(registry.get::<Counter>().unwrap().simulate_a_calls, 1);
         assert!(registry.get_by_name_mut("counter").is_some());
         assert!(registry.get_by_name_mut("missing").is_none());
+    }
+
+    // Real end-to-end dispatch through `pulsar_reflection::DYN_METHOD_REGISTRY`
+    // (link-time `inventory::submit!`, the same mechanism `#[subsystem_method]`
+    // will generate — see `pulsar_scenedb_derive`).
+    struct Adder {
+        total: i64,
+    }
+
+    impl Subsystem for Adder {
+        fn name(&self) -> &'static str {
+            "adder"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    fn adder_methods() -> Vec<pulsar_reflection::DynMethodMetadata> {
+        vec![pulsar_reflection::DynMethodMetadata {
+            name: "add",
+            display_name: "Add".to_string(),
+            category: None,
+            params: Vec::new(),
+            return_type: None,
+            method_type: pulsar_reflection::MethodType::Fn,
+            caller: Box::new(|target: &mut dyn Any, args: pulsar_reflection::DynMethodArgs| {
+                let adder = target.downcast_mut::<Adder>().expect("downcast");
+                let delta = *args[0].downcast_ref::<i64>().expect("i64 arg");
+                adder.total += delta;
+                None
+            }),
+        }]
+    }
+
+    pulsar_reflection::inventory::submit! {
+        pulsar_reflection::DynMethodRegistration {
+            receiver_name: "adder",
+            methods: adder_methods,
+        }
+    }
+
+    #[test]
+    fn dispatch_reaches_the_real_subsystem_instance_by_name() {
+        let mut registry = SubsystemRegistry::new();
+        registry.register(Adder { total: 0 });
+
+        registry
+            .dispatch("adder", "add", vec![Box::new(5i64)])
+            .expect("dispatch succeeds");
+        registry
+            .dispatch("adder", "add", vec![Box::new(3i64)])
+            .expect("dispatch succeeds");
+
+        assert_eq!(registry.get::<Adder>().unwrap().total, 8);
+
+        assert!(matches!(
+            registry.dispatch("missing", "add", vec![]),
+            Err(SubsystemDispatchError::UnknownSubsystem(_))
+        ));
+        assert!(matches!(
+            registry.dispatch("adder", "missing_method", vec![]),
+            Err(SubsystemDispatchError::Reflection(_))
+        ));
     }
 }
