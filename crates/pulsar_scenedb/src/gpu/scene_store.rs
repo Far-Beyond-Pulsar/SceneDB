@@ -10,8 +10,9 @@
 //! dirty tracking.
 
 use super::{
-    DirtyMask, EngineGpuContext, GenerationBuffer, GpuBufferDispatch, RegionError, RegionPool,
-    SceneBuffer, SimulateWitness, SubmissionTracker, SyncStats,
+    CapacityError, DirtyMask, EngineGpuContext, GenerationBuffer, GpuBufferDispatch,
+    GrowableGpuBufferDispatch, GrowableSceneBuffer, RegionError, RegionPool, SceneBuffer,
+    SimulateWitness, SubmissionTracker, SyncStats,
 };
 use crate::page::Pod;
 use crate::cell::{CellStorage, PendingRetire};
@@ -206,13 +207,20 @@ pub struct CellSlot<'a> {
 /// and the retirement drain — generalizing M2a's single-cell `GpuStore` to
 /// N cells sharing one set of buffers via `RegionPool` (§7).
 pub struct SceneGpuStore {
-    #[allow(dead_code)]
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     /// Type-erased GPU buffers keyed by `ComponentId`.  Replaces the old
     /// concrete `transforms` / `instance_infos` fields (pre-work item 3).
     /// Registered via [`Self::register_gpu_buffer`].
     gpu_buffers: HashMap<ComponentId, Box<dyn GpuBufferDispatch>>,
+    /// Growable counterpart to `gpu_buffers`, disjoint from it — a given
+    /// `ComponentId` is registered in exactly one of the two maps, never
+    /// both. Registered via [`Self::register_growable_gpu_buffer`]; see
+    /// `gpu::growable_scene_buffer`'s module docs for why this needs its own
+    /// map/trait rather than living in `gpu_buffers` (`GpuBufferDispatch::
+    /// buffer(&self) -> &wgpu::Buffer` can't be implemented soundly once the
+    /// buffer lives behind the `RwLock` growth requires).
+    growable_gpu_buffers: HashMap<ComponentId, Box<dyn GrowableGpuBufferDispatch>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -274,6 +282,7 @@ impl SceneGpuStore {
             device: Arc::clone(ctx.device()),
             queue: Arc::clone(ctx.queue()),
             gpu_buffers: HashMap::new(),
+            growable_gpu_buffers: HashMap::new(),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -317,6 +326,42 @@ impl SceneGpuStore {
         let id = <T as HasTypeToken>::type_token().id();
         let buffer = SceneBuffer::<T>::new(device, label, capacity);
         self.gpu_buffers.insert(id, Box::new(buffer));
+    }
+
+    /// Growable counterpart to [`Self::register_gpu_buffer`] — for
+    /// World-mirrored `#[gpu]` columns, whose required capacity isn't known
+    /// ahead of time (`World`'s entity count has no ceiling). `initial_capacity`
+    /// only needs to be cheap to allocate, not sized for the eventual world —
+    /// the buffer grows (doubling, GPU-to-GPU copy) transparently on writes
+    /// past its current capacity, via [`Self::write_row_bytes_growing`].
+    ///
+    /// `max_capacity: None` (the recommendation for World-mirrored columns,
+    /// and what `#[derive(SceneStore)]`'s generated `register_gpu_columns_growable`
+    /// always passes) means growth can never fail — exactly the property
+    /// that makes this safe to call from `World::insert`'s automatic
+    /// dispatch path with no `Result` to propagate through `insert` itself.
+    /// Pass `Some(max)` only for a deliberate, caller-managed VRAM ceiling
+    /// (not recommended for World-mirrored columns specifically, since
+    /// hitting it turns an ordinary `world.insert()` call into one that can
+    /// fail with no way to report that failure back to the caller — see
+    /// [`Self::write_row_bytes_growing`]'s doc).
+    ///
+    /// A given `ComponentId` must be registered through exactly one of
+    /// [`Self::register_gpu_buffer`]/`Self::register_growable_gpu_buffer` —
+    /// registering the same id both ways leaves the growable one shadowed by
+    /// [`Self::write_row_bytes`]'s lookup order and is almost certainly not
+    /// what was intended; this is not currently asserted against (no test
+    /// covers the double-registration case), so avoid it by construction.
+    pub fn register_growable_gpu_buffer<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &mut self,
+        initial_capacity: u32,
+        max_capacity: Option<u32>,
+        device: &Arc<wgpu::Device>,
+        label: &str,
+    ) {
+        let id = <T as HasTypeToken>::type_token().id();
+        let buffer = GrowableSceneBuffer::<T>::new(Arc::clone(device), label, initial_capacity, max_capacity);
+        self.growable_gpu_buffers.insert(id, Box::new(buffer));
     }
 
     /// Mark a column's row as dirty for the next GPU sync.
@@ -982,6 +1027,58 @@ impl SceneGpuStore {
             }
             None => false,
         }
+    }
+
+    /// Growable counterpart to [`Self::write_row_bytes`], for `id`s
+    /// registered via [`Self::register_growable_gpu_buffer`] — grows the
+    /// buffer first if `row` doesn't fit the current capacity.
+    ///
+    /// Returns `None` if `id` was never registered as growable (mirrors
+    /// `write_row_bytes`'s "unregistered = no-op" contract exactly — the
+    /// caller can't tell "not registered" from "registered fixed instead"
+    /// from this alone, which is fine: [`crate::gpu::world_mirror`]'s
+    /// dispatch tries `write_row_bytes` first and only falls back to this
+    /// method when that returns `false`, so by the time this is called,
+    /// "not found here" really does mean "not registered at all").
+    ///
+    /// Returns `Some(Err(CapacityError))` only if the buffer was registered
+    /// with a `max_capacity` ceiling (via `register_growable_gpu_buffer`)
+    /// and `row` exceeds it — registrations made with `max_capacity: None`
+    /// (the recommendation for World-mirrored columns) can never reach this
+    /// case, since unbounded growth cannot fail.
+    pub fn write_row_bytes_growing(
+        &self,
+        id: ComponentId,
+        queue: &wgpu::Queue,
+        data: &[u8],
+        row: u32,
+    ) -> Option<Result<(), CapacityError>> {
+        self.growable_gpu_buffers.get(&id).map(|buf| buf.write_row_growing(queue, row, data))
+    }
+
+    /// Lock-safe access to a growable column's current buffer, by
+    /// `ComponentId` — the growable-buffer counterpart to
+    /// [`Self::buffer_for_id`]. See [`GrowableGpuBufferDispatch::with_buffer`]
+    /// for why this is callback-shaped rather than returning `&wgpu::Buffer`
+    /// directly. Silently does nothing if `id` isn't registered as growable.
+    pub fn with_growable_buffer_for_id(&self, id: ComponentId, f: &mut dyn FnMut(&wgpu::Buffer)) {
+        if let Some(buf) = self.growable_gpu_buffers.get(&id) {
+            buf.with_buffer(f);
+        }
+    }
+
+    /// `epoch()` of a growable column's buffer, by `ComponentId` — bump
+    /// count since registration; compare against a previously-observed value
+    /// to know whether a bind group built against this column needs
+    /// rebuilding. `None` if `id` isn't registered as growable.
+    pub fn growable_epoch_for_id(&self, id: ComponentId) -> Option<u64> {
+        self.growable_gpu_buffers.get(&id).map(|buf| buf.epoch())
+    }
+
+    /// Current capacity of a growable column's buffer, by `ComponentId`.
+    /// `None` if `id` isn't registered as growable.
+    pub fn growable_capacity_for_id(&self, id: ComponentId) -> Option<u32> {
+        self.growable_gpu_buffers.get(&id).map(|buf| buf.capacity())
     }
 
     /// Cull's token→mesh link (M3-α T4, C5 amendment): row-indexed beside
