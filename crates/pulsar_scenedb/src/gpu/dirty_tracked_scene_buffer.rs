@@ -32,14 +32,98 @@
 //! already perf-validated — to serve both this type and the cell-mirrored
 //! path wasn't judged worth the risk to land alongside this feature without
 //! its own benchmarking pass; a reasonable follow-up, not done here.
+//!
+//! # Concurrency (Helio#213)
+//!
+//! [`Self::mark_dirty`] used to take the outer `RwLock`'s **write** lock
+//! unconditionally, even when no growth was needed — serializing every
+//! concurrent mark against every other one regardless of which (disjoint)
+//! rows they targeted. Fixed via [`ShadowRow`]: the shadow is
+//! `Vec<ShadowRow<T>>` instead of `Vec<T>`, where each element supports
+//! `&self`-based get/set (an `UnsafeCell` under a hand-written `Sync`, not a
+//! `Mutex`/`Cell` — `Cell<T>` itself is never `Sync`, which is exactly why a
+//! plain `Vec<Cell<T>>` doesn't work here despite every `T` being `Copy`).
+//! `mark_dirty`'s common case (row already fits) now only needs the outer
+//! lock's **read** side — multiple threads marking *disjoint* rows proceed
+//! concurrently, matching [`super::GrowableSceneBuffer::write_row_growing`]'s
+//! already-correct read-lock-first shape. Growth still needs the write lock
+//! (reallocating `Vec<ShadowRow<T>>` requires exclusive access, same as any
+//! `Vec` resize).
+//!
+//! **Soundness contract** (see [`ShadowRow`]'s own doc for the full
+//! argument): two threads must never call `mark_dirty`/`reserve` for the
+//! *same* row concurrently — trivially satisfied by every real caller,
+//! since a row corresponds to exactly one `Entity`, and `World::insert`'s
+//! own `&mut self` signature already prevents two threads from inserting
+//! onto the same entity concurrently one layer up. [`Self::flush`] is
+//! unaffected by any of this — it holds the outer lock's **write** side for
+//! its whole duration, so it never runs concurrently with any `mark_dirty`
+//! call (read-path or write-path), and reads every `ShadowRow` through that
+//! exclusive access.
+//!
+//! **What this does NOT fix.** Helio#211's benchmark measured contention
+//! through `GrowableSceneBuffer::write_row_growing` (the growable map, not
+//! this dirty-tracked one) — a path that *already* used the same
+//! read-lock-first shape this fix brings to `mark_dirty`, and it *still*
+//! showed per-write cost increasing with thread count. That strongly
+//! suggests a meaningful share of the observed contention is `wgpu::Queue`'s
+//! own internal synchronization (a `Queue` is `Send + Sync` precisely
+//! because `wgpu` serializes submissions to it internally), not solely
+//! locking on SceneDB's own side — no amount of restructuring *this*
+//! crate's locks removes synchronization that lives inside `wgpu` itself.
+//! A genuinely lock-free (not just read-lock-first) redesign, or a
+//! batch-writes-per-thread-then-one-call scheme, remain open follow-ups if
+//! a future benchmark pass shows this fix + reservation (Helio#212,
+//! removing *growth* from the concurrent path entirely) aren't sufficient —
+//! deliberately not committed to speculatively here.
 use crate::gpu::dynamic_buffer::CapacityError;
 use crate::gpu::{DirtyMask, SyncStats};
 use crate::page::Pod;
+use std::cell::UnsafeCell;
 use std::sync::{Arc, RwLock};
+
+/// A single shadow row, readable/writable through `&self` — see this
+/// module's "Concurrency" doc section for the full soundness argument.
+/// Deliberately not `Cell<T>`: `Cell<T>` is never `Sync` for any `T`, which
+/// would make `DirtyTrackedState<T>` (and therefore `DirtyTrackedSceneBuffer<T>`)
+/// non-`Sync`, breaking the `Send + Sync` bound `DirtyTrackedGpuBufferDispatch`
+/// already requires (needed to store this behind `Box<dyn ...>` in
+/// `SceneGpuStore`, itself shared across threads via `Arc`).
+struct ShadowRow<T>(UnsafeCell<T>);
+
+// SAFETY: `T: Send` is enough for `ShadowRow<T>: Sync` under this module's
+// documented contract — no two threads ever call `get`/`set` on the SAME
+// `ShadowRow` concurrently (a row belongs to exactly one Entity; see the
+// module doc), so there is never a genuine data race on the `UnsafeCell`'s
+// contents, only ever-disjoint single-writer access per row, synchronized
+// against `flush()`'s reads by the outer `RwLock`'s write-side exclusivity.
+unsafe impl<T: Send> Sync for ShadowRow<T> {}
+
+impl<T: Copy> ShadowRow<T> {
+    fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    #[inline]
+    fn get(&self) -> T {
+        // SAFETY: single-writer-per-row contract (module doc) + `T: Copy`
+        // means this read never races a concurrent write to the same row,
+        // and never observes a partially-written value.
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, value: T) {
+        // SAFETY: same contract as `get`.
+        unsafe {
+            *self.0.get() = value;
+        }
+    }
+}
 
 struct DirtyTrackedState<T: Pod> {
     buf: crate::gpu::DynamicGpuBuffer<T>,
-    shadow: Vec<T>,
+    shadow: Vec<ShadowRow<T>>,
     dirty: DirtyMask,
 }
 
@@ -57,7 +141,7 @@ fn grow_shadow_to<T: Pod>(state: &mut DirtyTrackedState<T>, new_len: usize) {
     }
     // SAFETY: `T: Pod`'s own safety contract (`page.rs`) guarantees
     // all-zero bytes are a valid `T`.
-    state.shadow.resize(new_len, unsafe { std::mem::zeroed::<T>() });
+    state.shadow.resize_with(new_len, || ShadowRow::new(unsafe { std::mem::zeroed::<T>() }));
     let new_dirty = DirtyMask::new(new_len as u32);
     for r in 0..state.dirty.capacity() {
         if state.dirty.is_marked(r) {
@@ -109,12 +193,35 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
         // SAFETY: `T: Pod`'s own safety contract (`page.rs`) guarantees
         // all-zero bytes are a valid `T` -- the same invariant `CellStorage`
         // itself relies on for freshly-allocated, not-yet-written rows.
-        let shadow = vec![unsafe { std::mem::zeroed::<T>() }; initial_capacity as usize];
+        let shadow = (0..initial_capacity).map(|_| ShadowRow::new(unsafe { std::mem::zeroed::<T>() })).collect();
         let dirty = DirtyMask::new(initial_capacity);
         Self { device, state: RwLock::new(DirtyTrackedState { buf, shadow, dirty }) }
     }
 
+    /// Records `value` as row `row`'s new value and marks it dirty.
+    ///
+    /// Fast path (row already within the current shadow length — the
+    /// overwhelming common case once a buffer has warmed up): only the
+    /// outer lock's **read** side is needed, via [`ShadowRow`]'s `&self`
+    /// get/set — multiple threads marking *disjoint* rows proceed
+    /// concurrently. See this module's "Concurrency" doc section for the
+    /// full soundness argument and its one real precondition (never call
+    /// this for the same row from two threads at once).
+    ///
+    /// Slow path (growth needed): escalates to the write lock, same as
+    /// [`super::GrowableSceneBuffer::write_row_growing`]'s own
+    /// double-checked shape — re-checks under the write lock in case
+    /// another thread already grew far enough while this one was waiting
+    /// for it.
     pub fn mark_dirty(&self, row: u32, value: T) {
+        {
+            let state = self.state.read().expect("DirtyTrackedSceneBuffer lock poisoned");
+            if (row as usize) < state.shadow.len() {
+                state.shadow[row as usize].set(value);
+                state.dirty.mark(row);
+                return;
+            }
+        }
         let mut state = self.state.write().expect("DirtyTrackedSceneBuffer lock poisoned");
         if row as usize >= state.shadow.len() {
             let mut new_len = state.shadow.len().max(1);
@@ -123,7 +230,7 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             }
             grow_shadow_to(&mut state, new_len);
         }
-        state.shadow[row as usize] = value;
+        state.shadow[row as usize].set(value);
         state.dirty.mark(row);
     }
 
@@ -182,8 +289,16 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
         let DirtyTrackedState { buf, shadow, dirty } = &mut *state;
         let mut stats = SyncStats { ranges: 0, bytes: 0 };
         let mut run_start: Option<u32> = None;
-        let flush_run = |start: u32, end: u32, stats: &mut SyncStats| {
-            buf.write(queue, start, &shadow[start as usize..end as usize]);
+        // `shadow` is `[ShadowRow<T>]`, not `[T]` -- `flush` holds the outer
+        // lock's write (exclusive) side for its whole duration, so every
+        // `ShadowRow` in the run is guaranteed not to be concurrently
+        // written while these `.get()` calls materialize a plain `&[T]`
+        // `write` can pass straight through to `queue.write_buffer`.
+        let mut run_buf: Vec<T> = Vec::new();
+        let mut flush_run = |start: u32, end: u32, stats: &mut SyncStats| {
+            run_buf.clear();
+            run_buf.extend(shadow[start as usize..end as usize].iter().map(ShadowRow::get));
+            buf.write(queue, start, &run_buf);
             stats.ranges += 1;
             stats.bytes += ((end - start) as usize * std::mem::size_of::<T>()) as u64;
         };
@@ -369,5 +484,44 @@ mod tests {
         let mut bytes2 = Vec::new();
         buf.with_buffer(&mut |b| bytes2 = readback(&device, &queue, b, 1000 * 4));
         assert_eq!(u32::from_ne_bytes(bytes2[500 * 4..500 * 4 + 4].try_into().unwrap()), 777);
+    }
+
+    #[test]
+    fn concurrent_marks_to_disjoint_rows_are_all_correctly_recorded() {
+        // The whole point of #213's fix: many threads marking DISJOINT rows
+        // concurrently, none lost, none corrupted, via mark_dirty's
+        // read-lock-first fast path (ShadowRow's &self get/set) -- not
+        // serialized through a write lock for every single mark.
+        let (device, queue) = test_device();
+        let buf: Arc<DirtyTrackedSceneBuffer<u32>> = Arc::new(DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", 4096));
+        // Pre-reserve so every thread's marks land in the fast (read-lock)
+        // path -- this test is specifically about disjoint-row concurrency,
+        // not the (already write-lock-serialized, and already tested
+        // elsewhere) growth path.
+        buf.reserve(&queue, 4096).expect("reserve");
+
+        const THREADS: u32 = 16;
+        const PER_THREAD: u32 = 200;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let buf = Arc::clone(&buf);
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let row = t * PER_THREAD + i; // disjoint across threads by construction
+                        buf.mark_dirty(row, row * 7);
+                    }
+                });
+            }
+        });
+
+        let stats = buf.flush(&queue);
+        assert_eq!(stats.ranges, 1, "every row in [0, THREADS*PER_THREAD) was marked -- one contiguous run");
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, (THREADS * PER_THREAD) as u64 * 4));
+        for row in 0..(THREADS * PER_THREAD) {
+            let got = u32::from_ne_bytes(bytes[(row * 4) as usize..(row * 4 + 4) as usize].try_into().unwrap());
+            assert_eq!(got, row * 7, "row {row} must have survived concurrent marking from whichever thread owned it, uncorrupted by any other thread's marks");
+        }
     }
 }
