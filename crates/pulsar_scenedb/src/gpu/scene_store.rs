@@ -932,6 +932,19 @@ impl SceneGpuStore {
         self.gpu_buffers.get(&id).expect("transform buffer not registered").buffer()
     }
 
+    /// Generic counterpart to [`Self::transform_buffer`]/
+    /// [`Self::instance_info_buffer`] for a caller-registered type: the same
+    /// `ComponentId` lookup those two do by hand for their hardcoded types,
+    /// available for any `T` previously passed to
+    /// [`Self::register_gpu_buffer`]. `None` if `T` was never registered —
+    /// callers that know their type is a required built-in should keep using
+    /// the specific accessor (whose `.expect()` gives a clearer panic
+    /// message); this is for generic/optional columns.
+    pub fn buffer_for<T: HasTypeToken + 'static>(&self) -> Option<&wgpu::Buffer> {
+        let id = <T as HasTypeToken>::type_token().id();
+        self.gpu_buffers.get(&id).map(|b| b.buffer())
+    }
+
     /// Cull's token→mesh link (M3-α T4, C5 amendment): row-indexed beside
     /// `transform_buffer()`, mirrored via [`Self::write_instance_info`].
     ///
