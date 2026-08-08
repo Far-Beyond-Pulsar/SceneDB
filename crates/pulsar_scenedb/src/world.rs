@@ -425,7 +425,10 @@ impl World {
     ///
     /// Returns `None` (leaving the archetype registered but without the
     /// entity) if `row_ops` can't produce ops for one of `key`'s component
-    /// ids.
+    /// ids, **or** if placing `entity` would grow `entity_slots` by more
+    /// than `MAX_SLOT_GROWTH_PER_SPAWN` in this one call (see that local
+    /// constant's doc, below — a wire-supplied index near `u32::MAX` must
+    /// not be able to force a multi-gigabyte allocation).
     pub(crate) fn force_spawn_in_archetype(
         &mut self,
         entity: Entity,
@@ -434,6 +437,32 @@ impl World {
     ) -> Option<Entity> {
         let idx = entity.index();
         let gen = entity.generation();
+
+        // `idx` is wire-supplied (`Entity::index()` off a replicated,
+        // attacker-controlled `Delta::spawned` entry) and the loop below
+        // must grow `entity_slots`/`free_slots` to at least `idx + 1` to
+        // place the entity there. Unbounded, that lets a single spawn with
+        // an index near `u32::MAX` force a huge allocation before a single
+        // real entity has been created — confirmed by fuzzing
+        // (`delta_apply`'s `oom-*` crash artifacts): a wire index of
+        // ~4.06e9 drove `entity_slots`'s `Vec<EntitySlot>` (12 bytes/elem)
+        // to a real `malloc(6_442_450_944)` — a single ~6 GiB reallocation
+        // (`Vec`'s doubling growth landing on 2^29 elements) — before any
+        // of the earlier, smaller reallocations even had a chance to fail
+        // gracefully.
+        //
+        // Bounding *this call's* growth (not the world's total size) is
+        // the right invariant: a legitimately large, long-lived world
+        // still reaches millions of entity slots over its lifetime just
+        // fine, because that growth happens incrementally — one entity at
+        // a time, across many separate `Delta`s — never as one call
+        // demanding millions of new slots at once the way a single
+        // malicious spawn does.
+        const MAX_SLOT_GROWTH_PER_SPAWN: u32 = 1 << 20; // ~1M slots, ~12 MiB of EntitySlot
+        let current_len = self.entity_slots.len() as u32;
+        if idx > current_len && idx - current_len > MAX_SLOT_GROWTH_PER_SPAWN {
+            return None;
+        }
 
         while (self.entity_slots.len() as u32) <= idx {
             let new_idx = self.entity_slots.len() as u32;
