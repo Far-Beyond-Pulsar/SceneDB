@@ -71,6 +71,11 @@ name = "legacy_model_bench"
 harness = false
 required-features = ["gpu"]
 
+[[bench]]
+name = "world_mirror_scale"
+harness = false
+required-features = ["gpu"]
+
 [[test]]
 name = "gpu_store"
 required-features = ["gpu"]
