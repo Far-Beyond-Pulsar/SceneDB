@@ -32,17 +32,16 @@ jobs:
 
   gpu-feature:
     # Hosted runners have no physical GPU and no Vulkan/GL ICD installed at
-    # all (wgpu's own NotFound error confirms it: supported_backends VULKAN
-    # | GL, zero adapters). lavapipe (Mesa's CPU Vulkan implementation,
-    # shipped in mesa-vulkan-drivers) gives wgpu a real adapter to enumerate
-    # without any physical GPU -- the same mechanism wgpu's own CI and
-    # several downstream projects use for headless testing. Experimental:
-    # if this doesn't hold up (missing limits/features vs. what these tests
-    # assume, excessive runtime under software rasterization), fall back to
-    # marking the GPU-dependent tests informational (see this job's
-    # `continue-on-error`) rather than silently red on every PR.
+    # all -- wgpu's own error confirmed it: `NotFound { supported_backends:
+    # VULKAN | GL, ... }` with zero adapters found on either. lavapipe
+    # (Mesa's CPU Vulkan implementation, shipped in mesa-vulkan-drivers)
+    # gives wgpu a real adapter to enumerate without any physical GPU --
+    # the same mechanism wgpu's own CI and several downstream projects use
+    # for headless testing. Verified directly: `vulkaninfo` reports a real
+    # `PHYSICAL_DEVICE_TYPE_CPU` adapter once installed, and the functional/
+    # correctness GPU test suite (lib tests + every integration test below
+    # except `alloc_gate_gpu`) passes under it.
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v4
     - name: Install lavapipe (software Vulkan) for headless GPU testing
@@ -51,7 +50,28 @@ jobs:
         sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
         vulkaninfo --summary || true
     - name: Test pulsar_scenedb with the gpu feature
-      run: cargo test -p pulsar_scenedb --features gpu --verbose --no-fail-fast
+      run: >
+        cargo test -p pulsar_scenedb --features gpu --verbose
+        --lib
+        --test gpu_assets
+        --test gpu_derive_field_collision
+        --test gpu_generic_column
+        --test gpu_harvest
+        --test gpu_layout
+        --test gpu_store
+        --test stress_gpu
+        --test subsystem_reflection_test
+    - name: Test allocation-count assertions (informational)
+      # alloc_gate_gpu.rs asserts EXACT GPU allocation counts (e.g. "N=32 ->
+      # 9 allocs, N=64 -> 8 allocs" must be equal) -- observed to differ
+      # under lavapipe vs. real hardware, because a software rasterizer's
+      # internal buffer suballocation pattern doesn't reproduce a real
+      # driver's bit-for-bit. Real GPU hardware stays the source of truth
+      # for this file; this step keeps it running in CI for visibility
+      # without blocking merges on an environment difference that isn't a
+      # SceneDB bug.
+      continue-on-error: true
+      run: cargo test -p pulsar_scenedb --features gpu --test alloc_gate_gpu --verbose
 
   transport:
     # Explicit, separate job for the real-socket replication transport
