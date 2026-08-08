@@ -13,6 +13,7 @@ pub struct GpuAttr {
     pub mirror_mode: Option<MirrorModeAttr>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MirrorModeAttr {
     DirtyTracked,
     Once,

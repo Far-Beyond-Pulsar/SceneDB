@@ -101,6 +101,18 @@ impl World {
         self.gpu_mirror.as_ref()
     }
 
+    /// Uploads every row marked dirty since the last call, across every
+    /// `#[gpu(mirror = DirtyTracked)]` World-mirrored field (the default
+    /// `#[gpu]` mode), coalesced into as few GPU writes as row adjacency
+    /// allows. Call once per frame — the World-mirror analogue of the
+    /// cell-mirrored path's own boundary-phase sync. `None` if no mirror is
+    /// attached; `Some(SyncStats::default()-shaped)` (zero ranges/bytes) if
+    /// one is attached but nothing was dirty.
+    #[cfg(feature = "gpu")]
+    pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> Option<crate::gpu::SyncStats> {
+        self.gpu_mirror.as_ref().map(|m| m.store().flush_gpu_mirror(queue))
+    }
+
     /// Debug assertion: every archetype's column lengths must equal its entity
     /// count.  Panics on the first mismatch.  Compiled out in release builds
     /// (the loop body becomes a no-op).
@@ -331,6 +343,12 @@ impl World {
         let cid = crate::component::component_id::<T>();
         assert!(self.is_alive(entity), "insert on dead entity {entity}");
 
+        let (old_arch_id, old_row) = {
+            let s = &self.entity_slots[entity.index() as usize];
+            (s.archetype, s.row as usize)
+        };
+        let is_new_insert = !Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid);
+
         // GPU mirror: automatic, via a link-time dispatch registry keyed by
         // `cid` (see `crate::gpu::world_mirror`'s module docs for why this
         // is a registry lookup and not compile-time specialization — the
@@ -341,24 +359,21 @@ impl World {
         // Must run before `value` is moved into a column below (both
         // branches move it), and covers BOTH the in-place-update and the
         // new-archetype-migration paths with one call, since either way
-        // this is the new authoritative value for `entity`'s `T`. A no-op
+        // this is the new authoritative value for `entity`'s `T`. Passes
+        // `is_new_insert` through so `Once`-mode `#[gpu]` fields know
+        // whether this is the one time they should actually write. A no-op
         // (one `Option::is_none()` check, then at most one `HashMap` lookup
         // that misses for any type `#[derive(SceneStore)]` never touched)
         // when no mirror is attached or `T` has no `#[gpu]` fields.
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
             if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
-                dispatch(mirror, entity.index(), &value as *const T as *const ());
+                dispatch(mirror, entity.index(), &value as *const T as *const (), is_new_insert);
             }
         }
 
-        let (old_arch_id, old_row) = {
-            let s = &self.entity_slots[entity.index() as usize];
-            (s.archetype, s.row as usize)
-        };
-
         // In-place update: entity already has this component in this archetype.
-        if Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid) {
+        if !is_new_insert {
             if let Some(t) = tracker.as_deref_mut() {
                 // Capture bytes before the value is moved into the column.
                 let len = std::mem::size_of::<T>();

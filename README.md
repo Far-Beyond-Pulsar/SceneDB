@@ -1018,6 +1018,23 @@ StaticMeshComponent::register_gpu_columns_growable(&mut store, 1024, &device);
 
 `initial_capacity` only needs to be cheap to allocate — the buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time an insert's `entity.index()` doesn't fit, entirely inside `World::insert`'s automatic dispatch, with no caller-visible difference from the fixed path except that it never panics on capacity. `SceneGpuStore::register_growable_gpu_buffer` (the lower-level method this generated call wraps) can also take an explicit `max_capacity` ceiling for a deliberate VRAM budget, but the derive's generated `register_gpu_columns_growable` never sets one — a World-mirrored column hitting a capacity ceiling has no way to report that failure back through `world.insert()`, so the recommendation is to leave it unbounded and rely on `DynamicGpuBuffer`/`GrowableSceneBuffer`'s `epoch()` counter (see `SceneGpuStore::growable_epoch_for_id`) if you need to observe growth for bind-group invalidation purposes.
 
+**Mirror mode.** `register_gpu_columns_growable` routes each `#[gpu]` field through one of two registrations, chosen by its declared `#[gpu(mirror = ...)]` mode — the same attribute documented earlier for the cell-mirrored path, now also honored here:
+
+- **`#[gpu(mirror = Once)]`** — written on the entity's first insert of this component, and never again, even if the component is later re-inserted (updating some other field). Registered via the plain growable path (`SceneGpuStore::register_growable_gpu_buffer`) — immediate, uncoalesced, since it only ever happens once.
+- **plain `#[gpu]` (`DirtyTracked`, the default)** — writes are *deferred*: `World::insert` marks the row dirty (pure CPU bookkeeping, no GPU work at all) instead of uploading immediately. Call `world.flush_gpu_mirror(queue)` once per frame to actually upload every row dirtied since the last flush, coalesced into as few `queue.write_buffer` calls as row adjacency allows — the World-mirror analogue of the cell-mirrored path's own boundary-phase sync:
+
+```rust
+// Every frame, after your simulation/gameplay step (which may call
+// world.insert() many times, on the same or different entities):
+world.flush_gpu_mirror(&queue);
+```
+
+Skipping the flush means `DirtyTracked` fields silently never reach the GPU — `World::insert` alone is not enough for them, unlike `Once` fields or anything registered through the non-growable `register_gpu_columns`. This is the one place World-mirrored fields require an explicit per-frame call; everything else in this section is fully automatic.
+
+Reading a `DirtyTracked` field's buffer goes through `SceneGpuStore::with_dirty_tracked_buffer_for_id` (the dirty-tracked counterpart to `with_growable_buffer_for_id`/`buffer_for_id`), keyed the same way — `GpuColumnDesc::field_token.id()` from `gpu_columns()`, or `Self::packed_gpu_component_id()` for a packed struct.
+
+`#[gpu(layout = packed)]` structs (above) require every `#[gpu]` field to share one mirror mode — mixing `Once` and `DirtyTracked` within one packed record is a compile error, since the whole record is written as a single unit and "half of this write is deferred" has no meaning.
+
 **Staleness / liveness.** Despawning an entity does not clear its row in a mirrored `#[gpu]` component buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. What DOES happen automatically: `World::spawn`/`despawn` (when a mirror is attached) keep a dedicated, GPU-resident generation buffer — `GpuMirrorHandle::generations()` — in lockstep with `entity_slots`' own generation for that row, exactly the value `World::is_alive` already checks on the CPU side. A GPU-side reader (a shader, a cull pass) that captured `(row, generation)` at some point — typically alongside the same visible-index/draw list it's iterating — should compare `generation` against `generations_buffer[row]` before trusting any other World-mirrored buffer's contents at `row`:
 
 ```rust

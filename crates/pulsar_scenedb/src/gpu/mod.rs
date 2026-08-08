@@ -15,6 +15,7 @@ mod assets;
 mod buffer;
 mod context;
 mod dirty;
+mod dirty_tracked_scene_buffer;
 mod dynamic_buffer;
 mod growable_scene_buffer;
 mod generation;
@@ -35,6 +36,7 @@ pub use assets::{
 pub use buffer::{GpuBufferDispatch, SceneBuffer, SyncStats, GAP_MERGE_THRESHOLD};
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
+pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer};
 pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
 pub use growable_scene_buffer::{GrowableGpuBufferDispatch, GrowableSceneBuffer};
 pub use generation::GenerationBuffer;
