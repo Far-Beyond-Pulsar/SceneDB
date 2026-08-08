@@ -10,9 +10,10 @@
 //! dirty tracking.
 
 use super::{
-    CapacityError, DirtyMask, EngineGpuContext, GenerationBuffer, GpuBufferDispatch,
-    GrowableGpuBufferDispatch, GrowableSceneBuffer, RegionError, RegionPool, SceneBuffer,
-    SimulateWitness, SubmissionTracker, SyncStats,
+    CapacityError, DirtyMask, DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer,
+    EngineGpuContext, GenerationBuffer, GpuBufferDispatch, GrowableGpuBufferDispatch,
+    GrowableSceneBuffer, RegionError, RegionPool, SceneBuffer, SimulateWitness, SubmissionTracker,
+    SyncStats,
 };
 use crate::page::Pod;
 use crate::cell::{CellStorage, PendingRetire};
@@ -221,6 +222,15 @@ pub struct SceneGpuStore {
     /// buffer(&self) -> &wgpu::Buffer` can't be implemented soundly once the
     /// buffer lives behind the `RwLock` growth requires).
     growable_gpu_buffers: HashMap<ComponentId, Box<dyn GrowableGpuBufferDispatch>>,
+    /// Dirty-tracked counterpart to `growable_gpu_buffers` -- disjoint from
+    /// both it and `gpu_buffers`; a given `ComponentId` lives in exactly one
+    /// of the three. Registered via
+    /// [`Self::register_dirty_tracked_gpu_buffer`], for `#[gpu(mirror =
+    /// DirtyTracked)]` World-mirrored fields (the default `#[gpu]` mode) --
+    /// writes are marked dirty ([`Self::mark_gpu_row_dirty`]) rather than
+    /// uploaded immediately; [`Self::flush_gpu_mirror`] performs the actual
+    /// coalesced upload.
+    dirty_tracked_gpu_buffers: HashMap<ComponentId, Box<dyn DirtyTrackedGpuBufferDispatch>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -294,6 +304,7 @@ impl SceneGpuStore {
             queue: Arc::clone(ctx.queue()),
             gpu_buffers: HashMap::new(),
             growable_gpu_buffers: HashMap::new(),
+            dirty_tracked_gpu_buffers: HashMap::new(),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -1090,6 +1101,66 @@ impl SceneGpuStore {
     /// `None` if `id` isn't registered as growable.
     pub fn growable_capacity_for_id(&self, id: ComponentId) -> Option<u32> {
         self.growable_gpu_buffers.get(&id).map(|buf| buf.capacity())
+    }
+
+    /// Registers a dirty-tracked, growable World-mirrored column — for
+    /// `#[gpu(mirror = DirtyTracked)]` fields (the default `#[gpu]` mode).
+    /// Writes go through [`Self::mark_gpu_row_dirty`] (CPU-side bookkeeping
+    /// only) instead of landing on the GPU immediately; [`Self::flush_gpu_mirror`]
+    /// performs the actual, coalesced upload. Like
+    /// [`Self::register_growable_gpu_buffer`], never bounded by a
+    /// `max_capacity` — a World-mirrored column with a capacity ceiling has
+    /// no `Result` to fail through on an ordinary `world.insert()` call.
+    pub fn register_dirty_tracked_gpu_buffer<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &mut self,
+        initial_capacity: u32,
+        device: &Arc<wgpu::Device>,
+        label: &str,
+    ) {
+        let id = <T as HasTypeToken>::type_token().id();
+        let buffer = DirtyTrackedSceneBuffer::<T>::new(Arc::clone(device), label, initial_capacity);
+        self.dirty_tracked_gpu_buffers.insert(id, Box::new(buffer));
+    }
+
+    /// Marks `row` dirty with `data`'s bytes, for a column registered via
+    /// [`Self::register_dirty_tracked_gpu_buffer`] — no GPU work happens
+    /// here at all; [`Self::flush_gpu_mirror`] does the actual upload.
+    /// Returns `false` if `id` isn't registered dirty-tracked (mirrors
+    /// [`Self::write_row_bytes`]'s "unregistered = no-op" contract).
+    pub fn mark_gpu_row_dirty(&self, id: ComponentId, row: u32, data: &[u8]) -> bool {
+        match self.dirty_tracked_gpu_buffers.get(&id) {
+            Some(buf) => {
+                buf.mark_dirty_bytes(row, data);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Uploads every row marked dirty (via [`Self::mark_gpu_row_dirty`])
+    /// across every dirty-tracked World-mirrored column, coalesced. Call
+    /// once per frame — the World-mirror analogue of the cell-mirrored
+    /// path's own boundary-phase `sync_all`. A no-op, zero-cost beyond one
+    /// empty-map iteration, if nothing was registered dirty-tracked (e.g. no
+    /// `#[gpu]` field anywhere used the default `DirtyTracked` mode through
+    /// this registration path).
+    pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
+        let mut total = SyncStats { ranges: 0, bytes: 0 };
+        for buf in self.dirty_tracked_gpu_buffers.values() {
+            let stats = buf.flush(queue);
+            total.ranges += stats.ranges;
+            total.bytes += stats.bytes;
+        }
+        total
+    }
+
+    /// Lock-safe access to a dirty-tracked column's current buffer, by
+    /// `ComponentId` — the dirty-tracked counterpart to
+    /// [`Self::with_growable_buffer_for_id`]/[`Self::buffer_for_id`].
+    pub fn with_dirty_tracked_buffer_for_id(&self, id: ComponentId, f: &mut dyn FnMut(&wgpu::Buffer)) {
+        if let Some(buf) = self.dirty_tracked_gpu_buffers.get(&id) {
+            buf.with_buffer(f);
+        }
     }
 
     /// Cull's token→mesh link (M3-α T4, C5 amendment): row-indexed beside

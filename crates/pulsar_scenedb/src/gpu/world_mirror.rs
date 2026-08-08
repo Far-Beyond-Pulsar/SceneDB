@@ -161,9 +161,27 @@ impl GpuMirrorHandle {
 }
 
 /// Writes every `#[gpu]` field of `data` into its registered GPU buffer at
-/// `row`, using each field's byte offset (`GpuColumnDesc::field_offset`,
-/// computed by the derive at macro-expansion time) and
-/// [`SceneGpuStore::write_row_bytes`].
+/// `row`, honoring each field's declared [`crate::gpu::MirrorMode`]
+/// (`GpuColumnDesc::mode`):
+///
+/// - **`Once`**: written only when `is_new_insert` is `true` — i.e. the
+///   first time this entity gets this component, never again on a later
+///   in-place update. Matches the mode's own documented meaning ("uploaded
+///   once at registration and never touched again").
+/// - **`DirtyTracked`** (the default): marked dirty
+///   ([`SceneGpuStore::mark_gpu_row_dirty`]) instead of written immediately.
+///   [`crate::world::World::flush_gpu_mirror`] performs the actual,
+///   coalesced upload — call it once per frame, analogous to the
+///   cell-mirrored path's own boundary-phase sync.
+///
+/// Each field's `ComponentId` is looked up in whichever of the three
+/// registration maps it was actually registered through (fixed
+/// [`SceneGpuStore::write_row_bytes`], growable
+/// [`SceneGpuStore::write_row_bytes_growing`], or dirty-tracked
+/// [`SceneGpuStore::mark_gpu_row_dirty`]) — a given field lives in exactly
+/// one, so this is at most a few cheap map lookups, not redundant work. A
+/// field whose buffer was never registered through any of them is silently
+/// skipped, not an error — legitimate during bring-up.
 ///
 /// Works for *any* `T: GpuColumnSet` with no per-type code beyond what
 /// `#[derive(SceneStore)]` already generates — this walks `T::gpu_columns()`,
@@ -171,16 +189,6 @@ impl GpuMirrorHandle {
 /// directly (by anything that already has a concrete `T: GpuColumnSet` in
 /// hand) and indirectly, through each type's generated
 /// [`GpuMirrorRegistration::dispatch`] function, by [`crate::world::World::insert`].
-///
-/// Each field's `ComponentId` is looked up first in the fixed-capacity
-/// registration ([`SceneGpuStore::write_row_bytes`]) and, only if not found
-/// there, in the growable registration
-/// ([`SceneGpuStore::write_row_bytes_growing`]) — a given field is
-/// registered through exactly one of `register_gpu_buffer`/
-/// `register_growable_gpu_buffer`, never both, so this is a cheap two-map
-/// check, not redundant work. A field whose buffer was never registered
-/// through either path is silently skipped, not an error — legitimate
-/// during bring-up.
 ///
 /// # Panics
 ///
@@ -197,8 +205,12 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
     queue: &wgpu::Queue,
     row: u32,
     data: &T,
+    is_new_insert: bool,
 ) {
     for col in T::gpu_columns() {
+        if col.mode == crate::gpu::MirrorMode::Once && !is_new_insert {
+            continue; // Once fields never re-write after the first insert
+        }
         let size = col.field_token.desc().size as usize;
         // SAFETY: `field_offset`/`size` describe a field within `T`, computed
         // by the derive from `T`'s own layout (`offset_of!` + `size_of`) at
@@ -213,11 +225,19 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
             )
         };
         let id = col.field_token.id();
+
+        if col.mode == crate::gpu::MirrorMode::DirtyTracked && store.mark_gpu_row_dirty(id, row, bytes) {
+            continue;
+        }
+        // Either `Once`-mode, or `DirtyTracked` but registered through one
+        // of the immediate paths instead of `register_dirty_tracked_gpu_buffer`
+        // (an older/simpler registration choice this function still honors
+        // rather than requiring) -- write immediately.
         if store.write_row_bytes(id, queue, bytes, row) {
             continue;
         }
         match store.write_row_bytes_growing(id, queue, bytes, row) {
-            None => {} // not registered through either path -- bring-up, not an error
+            None => {} // not registered through any path -- bring-up, not an error
             Some(Ok(())) => {}
             Some(Err(cap_err)) => panic!(
                 "World-mirrored GPU column (ComponentId {id:?}) hit its configured max_capacity \
@@ -246,6 +266,12 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
 /// field. Types with none don't submit a registration at all, so they
 /// never appear in [`registry_map`] and cost nothing beyond the one
 /// `HashMap` miss `World::insert` already pays when a mirror is attached.
+/// `data`: as documented on [`GpuMirrorRegistration::dispatch`]. `bool`:
+/// `is_new_insert`, forwarded to [`write_gpu_columns_at_row`] — `true` on
+/// the first insert of this component onto this entity, `false` on a later
+/// in-place update, so `Once`-mode fields know whether to (re-)write at all.
+pub type DispatchFn = fn(&GpuMirrorHandle, u32, *const (), bool);
+
 pub struct GpuMirrorRegistration {
     pub component_id: fn() -> ComponentId,
     /// `data` must point to a live, correctly-aligned `T` for the
@@ -253,13 +279,13 @@ pub struct GpuMirrorRegistration {
     /// `World::insert_inner`, the only caller, which passes `&value as *const
     /// T as *const ()` for the exact `T` this registration's `component_id`
     /// resolved from.
-    pub dispatch: fn(&GpuMirrorHandle, row: u32, data: *const ()),
+    pub dispatch: DispatchFn,
 }
 
 pulsar_reflection::inventory::collect!(GpuMirrorRegistration);
 
-fn registry_map() -> &'static HashMap<ComponentId, fn(&GpuMirrorHandle, u32, *const ())> {
-    static MAP: OnceLock<HashMap<ComponentId, fn(&GpuMirrorHandle, u32, *const ())>> = OnceLock::new();
+fn registry_map() -> &'static HashMap<ComponentId, DispatchFn> {
+    static MAP: OnceLock<HashMap<ComponentId, DispatchFn>> = OnceLock::new();
     MAP.get_or_init(|| {
         pulsar_reflection::inventory::iter::<GpuMirrorRegistration>()
             .map(|r| ((r.component_id)(), r.dispatch))
@@ -274,7 +300,7 @@ fn registry_map() -> &'static HashMap<ComponentId, fn(&GpuMirrorHandle, u32, *co
 /// of GPU mirroring, so this adds exactly one `HashMap` lookup on top, not
 /// a second `TypeId` resolution.
 #[inline]
-pub(crate) fn dispatch_for(id: ComponentId) -> Option<fn(&GpuMirrorHandle, u32, *const ())> {
+pub(crate) fn dispatch_for(id: ComponentId) -> Option<DispatchFn> {
     registry_map().get(&id).copied()
 }
 
@@ -317,9 +343,9 @@ mod tests {
         }
     }
 
-    fn test_dispatch(mirror: &GpuMirrorHandle, row: u32, data: *const ()) {
+    fn test_dispatch(mirror: &GpuMirrorHandle, row: u32, data: *const (), is_new_insert: bool) {
         let data = unsafe { &*(data as *const TestComponent) };
-        write_gpu_columns_at_row(mirror.store(), mirror.queue(), row, data);
+        write_gpu_columns_at_row(mirror.store(), mirror.queue(), row, data, is_new_insert);
     }
 
     pulsar_reflection::inventory::submit! {

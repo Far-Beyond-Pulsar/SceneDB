@@ -102,10 +102,16 @@ fn packed_fields_land_in_one_buffer_in_gpu_field_declaration_order() {
             flags: 7,
         },
     );
+    // Every #[gpu] field here is the DirtyTracked default (no #[gpu(mirror =
+    // Once)] anywhere), so the packed write is deferred -- marked dirty, not
+    // uploaded -- until flush_gpu_mirror runs. This is the exact scenario
+    // #29 exists for: the buffer must NOT reflect the insert yet at this
+    // point.
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
 
     let id = PackedInstance::packed_gpu_component_id();
     let mut bytes = Vec::new();
-    store.with_growable_buffer_for_id(id, &mut |buf| {
+    store.with_dirty_tracked_buffer_for_id(id, &mut |buf| {
         bytes = readback(&ctx, buf, row * PACKED_ROW_BYTES, PACKED_ROW_BYTES);
     });
     assert_eq!(bytes.len(), PACKED_ROW_BYTES as usize, "packed_gpu_component_id must resolve to a registered buffer");

@@ -65,6 +65,7 @@ jobs:
         --test world_gpu_mirror_growable
         --test gpu_packed_layout
         --test world_gpu_mirror_liveness
+        --test world_gpu_mirror_dirty_tracked
     - name: Test allocation-count assertions (informational)
       # alloc_gate_gpu.rs asserts EXACT GPU allocation counts (e.g. "N=32 ->
       # 9 allocs, N=64 -> 8 allocs" must be equal) -- observed to differ

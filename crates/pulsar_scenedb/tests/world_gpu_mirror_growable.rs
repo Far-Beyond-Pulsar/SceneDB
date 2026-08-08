@@ -53,9 +53,14 @@ fn scene_cfg() -> SceneGpuConfig {
     }
 }
 
+// #[gpu(mirror = Once)], not the plain #[gpu] (DirtyTracked) default --
+// this test is specifically about buffer GROWTH (register_gpu_columns_growable
+// + write-past-capacity), which the immediate write path exercises
+// directly. The DirtyTracked + deferred-flush path has its own dedicated
+// test in tests/world_gpu_mirror_dirty_tracked.rs.
 #[derive(SceneStore, Clone, Copy)]
 struct GrowableTagComponent {
-    #[gpu]
+    #[gpu(mirror = Once)]
     tag: u32,
 }
 
