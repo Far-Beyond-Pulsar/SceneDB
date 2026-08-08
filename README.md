@@ -974,6 +974,28 @@ The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type w
 
 **Staleness.** Despawning an entity does not clear its row in a mirrored GPU buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. A reader must gate on liveness (e.g. cross-reference against `World::is_alive`/a generation check) rather than trust an arbitrary row's contents.
 
+**What `#[gpu]` component fields are *not* for.** They give a stable one-row-per-entity buffer, written by `World::insert`, with a lifetime tied to the entity. That shape does not fit every kind of GPU data a renderer built on `World` needs. Before reaching for `#[gpu]`, check:
+
+- **Does this data have exactly one meaningful value per entity, for as long as the entity is alive?** A mesh handle, a material index, a light's color — yes. A frame's visible-instance list, a compacted index buffer, indirect draw args — no: their length varies frame to frame and has no entity-stable meaning (`row 7` of a visibility list isn't "entity 7").
+- **Is this data written by `World::insert`, or produced by a compute pass?** `#[gpu]` fields are written CPU-side, on insert. Cull/visibility/compaction outputs are written GPU-side, by a shader, every frame — a completely different producer and a completely different capacity model (sized to visible/drawn count, not entity count).
+
+If the answer to either is "no," the data belongs in a plain `gpu::DynamicGpuBuffer<T>` instead — a row-count-agnostic growable SSBO with no `Entity`/`ComponentId` coupling at all, meant exactly for this case (cull-pass outputs, draw batches, anything pipeline-owned):
+
+```rust
+use pulsar_scenedb::gpu::DynamicGpuBuffer;
+
+let mut visible_indices: DynamicGpuBuffer<u32> = DynamicGpuBuffer::new(&device, "visible-indices", 4096);
+
+// Each frame, after the cull pass reports how many instances are visible:
+visible_indices.ensure_capacity(&device, &queue, visible_count)?; // grows (GPU-to-GPU copy) if needed
+// ... bind visible_indices.buffer() into the cull/draw pass's bind group ...
+
+// If a growth happened this frame, visible_indices.epoch() changed — any
+// cached bind group referencing the old buffer identity needs rebuilding.
+```
+
+Reallocation preserves existing bytes via a `copy_buffer_to_buffer`, and bumps `epoch()` by exactly one so callers holding a bind group built against `buffer()` know when they need to rebuild it, without re-querying or comparing buffer identity by hand.
+
 ## Layer reference
 
 | Layer | Location | Types | Responsibility |

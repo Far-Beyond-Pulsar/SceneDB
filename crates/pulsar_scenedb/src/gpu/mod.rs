@@ -15,6 +15,7 @@ mod assets;
 mod buffer;
 mod context;
 mod dirty;
+mod dynamic_buffer;
 mod generation;
 mod grid;
 mod harvest;
@@ -33,6 +34,7 @@ pub use assets::{
 pub use buffer::{GpuBufferDispatch, SceneBuffer, SyncStats, GAP_MERGE_THRESHOLD};
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
+pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
 pub use generation::GenerationBuffer;
 pub use grid::{
     execute_transitions, BudgetError, CellCoord, Domain, GridConfig, StreamingBudget,
