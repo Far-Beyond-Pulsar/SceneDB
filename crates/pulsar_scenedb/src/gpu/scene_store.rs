@@ -945,6 +945,45 @@ impl SceneGpuStore {
         self.gpu_buffers.get(&id).map(|b| b.buffer())
     }
 
+    /// `ComponentId`-keyed counterpart to [`Self::buffer_for`], for callers
+    /// that only have the id (e.g. from `GpuColumnDesc::field_token.id()`)
+    /// and not the concrete registered type — notably, `#[derive(SceneStore)]`
+    /// `#[gpu]` fields, whose per-field wrapper type is deliberately
+    /// unnameable from outside the macro's own generated code (see
+    /// `pulsar_scenedb_derive`'s `FieldInfo::gpu_wrapper` doc). Reading a
+    /// derive-mirrored field's buffer back — in a test, in editor tooling,
+    /// or in `Self::write_row_bytes`'s own caller, [`crate::gpu::world_mirror`]
+    /// — goes through this, not `buffer_for::<Wrapper>()`.
+    pub fn buffer_for_id(&self, id: ComponentId) -> Option<&wgpu::Buffer> {
+        self.gpu_buffers.get(&id).map(|b| b.buffer())
+    }
+
+    /// Raw, `ComponentId`-keyed counterpart to [`Self::register_gpu_buffer`]
+    /// + [`GpuBufferDispatch::write_rows_raw`], for callers that only have a
+    /// `ComponentId` at hand (not the concrete `T`) — e.g. a generic helper
+    /// walking `GpuColumnSet::gpu_columns()`'s per-field metadata, which
+    /// carries each field's `TypeToken`/`ComponentId` but not its Rust type.
+    ///
+    /// Bypasses dirty tracking, `CellStorage`, and `Handle` entirely, same as
+    /// `write_rows_raw` itself — an unconditional `queue.write_buffer` at
+    /// `row`. This is the primitive [`crate::gpu::world_mirror`] builds on to
+    /// mirror `World`-owned (`Entity`-indexed, cell-free) component fields:
+    /// `row` there is `Entity::index()`, which needs no `CellId`/region
+    /// concept at all.
+    ///
+    /// Returns `false` (a no-op, not a panic) if `id` was never registered
+    /// via `register_gpu_buffer` — a caller inserting a component before its
+    /// GPU buffer is wired up is expected during bring-up, not a bug.
+    pub fn write_row_bytes(&self, id: ComponentId, queue: &wgpu::Queue, data: &[u8], row: u32) -> bool {
+        match self.gpu_buffers.get(&id) {
+            Some(buf) => {
+                buf.write_rows_raw(queue, data, row);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Cull's token→mesh link (M3-α T4, C5 amendment): row-indexed beside
     /// `transform_buffer()`, mirrored via [`Self::write_instance_info`].
     ///

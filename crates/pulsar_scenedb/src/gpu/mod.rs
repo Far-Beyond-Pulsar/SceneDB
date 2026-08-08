@@ -23,6 +23,7 @@ mod region;
 mod scene_store;
 mod tracker;
 mod view_upload;
+pub mod world_mirror;
 
 pub use assets::{
     ArenaError, ClusterBuffer, ClusterError, ClusterNode, GeometryArena, MaterialError,
@@ -48,6 +49,7 @@ pub use scene_store::{
 };
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;
+pub use world_mirror::{write_gpu_columns_at_row, GpuMirrorHandle, GpuMirrorRegistration};
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)
 // and already re-exported at the crate root; re-exported here too so GPU-
 // adjacent consumers (e.g. Helio's `helio-scenedb` seam reflection harness,

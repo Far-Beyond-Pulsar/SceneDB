@@ -930,6 +930,50 @@ let view = index.view();
 
 `build` takes a link-extractor closure rather than assuming a fixed `PortalComponent` type — SceneDB stays agnostic to what a "portal" is, it only knows how to ask a caller-supplied component for the `Entity` it points at. Pairs are `Entity` (the CPU `World`'s identity), not `Handle` (this crate's GPU-cell identity) — a relation built by scanning `World` components has no `Handle` in scope to produce one from. Rebuild the index whenever the underlying links might have changed (typically once per boundary); reads via `view()` borrow the already-built buffers with zero further allocation.
 
+### GPU-native fields on `World` entities
+
+Everything in [Macro system](#macro-system) above ties a `#[gpu]` field to `CellStorage`/`Handle` — the paged storage layer, not the archetype ECS `World` uses. That's a real gap: a component like `StaticMeshComponent { mesh: MeshHandle }` attached to a `World` entity has no path to the GPU at all through `write_gpu`, which requires a `Handle` `World` doesn't have.
+
+`World::attach_gpu_mirror` closes that gap. Once attached, `World::insert`/`insert_tracked` automatically mirrors any `#[gpu]` field of the inserted component to its registered GPU buffer, at row = `entity.index()` — no `CellStorage`, no `Handle`, no separate mirror-aware insert call:
+
+```rust
+use pulsar_scenedb::{World, Entity};
+use pulsar_scenedb::gpu::{SceneGpuStore, GpuMirrorHandle};
+use pulsar_scenedb_derive::SceneStore;
+use std::sync::Arc;
+
+#[derive(SceneStore, Clone, Copy)]
+struct StaticMeshComponent {
+    #[gpu]
+    mesh: u32,       // e.g. a packed index into a mesh registry
+    lod_bias: f32,   // plain CPU field — untouched by the mirror
+}
+
+// Setup, once:
+let mut store = SceneGpuStore::new(&ctx, cfg);
+StaticMeshComponent::register_gpu_columns(&mut store, world_capacity, ctx.device());
+let store = Arc::new(store);
+
+let mut world = World::new();
+world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+
+// Usage — an ordinary insert, nothing mirror-specific about the call site:
+let entity = world.spawn();
+world.insert(entity, StaticMeshComponent { mesh: 42, lod_bias: 0.0 });
+// `mesh` is now on the GPU, in its own dense buffer, at row = entity.index().
+// Re-inserting (updating) the component re-mirrors the new value the same way.
+```
+
+Nothing about the macro surface changes: `#[derive(SceneStore)]` and `#[gpu]` are exactly what they are everywhere else in this document. Skip `attach_gpu_mirror` and `World` behaves exactly as it always has — this is opt-in, and a `--no-default-features` build never sees any of it (CONTRACTS C0).
+
+**Why this needs a link-time registry, not compile-time generics.** The obvious-looking design — have `World::insert<T: Component>` itself decide, per `T`, whether to call into the GPU path — doesn't work in stable Rust for a subtle but hard reason: `insert`'s body is generic and unconstrained (`T: Component` only), and Rust resolves method calls inside a generic function body once, using only `T`'s *declared* bounds, never per-monomorphization. A specialization trick (e.g. "autoref specialization", competing an inherent method against a blanket trait method) can't observe whether the *substituted* `T` additionally implements `GpuColumnSet` from inside that shared generic body — only code where `T` is already concrete can. (This was verified empirically, not assumed: a minimal repro of the compile-time approach silently no-op'd for every type when called through a generic wrapper, confirmed by a real-device buffer readback coming back all zero, before this design replaced it.)
+
+The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type with at least one `#[gpu]` field, a small **non-generic** dispatch function (`T` already concrete at macro-expansion time) and submits it — via `inventory::submit!`, the same link-time registration mechanism `SubsystemRegistry`/`DynMethodRegistry` already use elsewhere in this document — keyed by the type's `ComponentId`. `World::insert` looks that registration up using the `ComponentId` it already computes for archetype indexing (no extra `TypeId` resolution over what `insert` already pays today), and calls the dispatch function if one was found. A type with no `#[gpu]` fields never submits a registration, so its insert path costs exactly one `HashMap` miss when a mirror is attached, and nothing at all when it isn't.
+
+**Capacity.** GPU buffers registered via `register_gpu_columns` are fixed-capacity at creation (never reallocated, matching `SceneBuffer`'s own contract) — pass a capacity that covers every `Entity::index()` the world will ever reach, not just its current size. Growable World-mirrored buffers are a documented future enhancement, not yet implemented.
+
+**Staleness.** Despawning an entity does not clear its row in a mirrored GPU buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. A reader must gate on liveness (e.g. cross-reference against `World::is_alive`/a generation check) rather than trust an arbitrary row's contents.
+
 ## Layer reference
 
 | Layer | Location | Types | Responsibility |
