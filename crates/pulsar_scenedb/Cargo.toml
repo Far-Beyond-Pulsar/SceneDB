@@ -98,3 +98,11 @@ required-features = ["gpu"]
 [[test]]
 name = "subsystem_reflection_test"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_generic_column"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_derive_field_collision"
+required-features = ["gpu"]
