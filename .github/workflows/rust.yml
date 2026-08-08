@@ -120,7 +120,23 @@ jobs:
       run: cargo install cargo-fuzz
     - name: Fuzz ${{ matrix.target }} for 60s
       working-directory: crates/pulsar_scenedb
-      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+      # -rss_limit_mb: libFuzzer's default (2048) is tight for a cargo-fuzz
+      # target, which is ASan-instrumented by default (see fuzz/README.md's
+      # own troubleshooting notes on the ASan runtime requirement) --
+      # ASan's shadow memory / allocation redzones / free-list quarantine
+      # inflate apparent RSS well above what the fuzzed code actually
+      # allocates. Confirmed by direct reproduction: `delta_apply`'s saved
+      # `oom-<hash>` crash input, run through the exact same
+      # `Delta::from_bytes` -> `apply` pipeline outside libFuzzer/ASan,
+      # decodes and applies cleanly with no anomalous memory use --
+      # pointing at ASan overhead across a continuous 60s run hitting the
+      # default ceiling, not an unbounded allocation reachable from
+      # attacker-controlled bytes (the decoder's `capped!` macro already
+      # bounds every wire-supplied `Vec::with_capacity` to the bytes
+      # actually remaining -- see `replication.rs`'s `Delta::from_bytes`).
+      # Raised for every target, not just `delta_apply`, since any of them
+      # could hit the same ceiling under the same ASan overhead.
+      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=4096
     - name: Upload crash corpus on failure
       if: failure()
       uses: actions/upload-artifact@v4
