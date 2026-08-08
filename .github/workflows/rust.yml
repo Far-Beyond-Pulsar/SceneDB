@@ -51,7 +51,7 @@ jobs:
         sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
         vulkaninfo --summary || true
     - name: Test pulsar_scenedb with the gpu feature
-      run: cargo test -p pulsar_scenedb --features gpu --verbose
+      run: cargo test -p pulsar_scenedb --features gpu --verbose --no-fail-fast
 
   transport:
     # Explicit, separate job for the real-socket replication transport
