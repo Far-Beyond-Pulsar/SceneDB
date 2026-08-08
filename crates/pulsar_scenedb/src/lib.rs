@@ -89,6 +89,9 @@ pub mod world;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+#[cfg(feature = "gpu")]
+pub mod subsystem;
+
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 
@@ -101,6 +104,8 @@ pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, MirrorMode};
+#[cfg(feature = "gpu")]
+pub use subsystem::{Subsystem, SubsystemRegistry};
 pub use handle::Handle;
 pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
