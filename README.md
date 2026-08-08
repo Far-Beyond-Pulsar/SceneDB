@@ -222,6 +222,36 @@ pub struct Material {
 }
 ```
 
+#### Registering GPU columns at store construction
+
+`#[gpu]`-marked fields don't get a GPU buffer for free just by being written —
+each one needs a call to `register_gpu_buffer` before `write_gpu` has anywhere
+to sync to. The derive generates that call for you as
+`YourType::register_gpu_columns(&mut store, capacity, device)`; invoke it once
+per `#[derive(SceneStore)]` type, at `SceneGpuStore` construction time, with
+the same row `capacity` every other column on the store uses:
+
+```rust
+let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+Material::register_gpu_columns(&mut store, row_capacity, ctx.device());
+StaticMeshInstance::register_gpu_columns(&mut store, row_capacity, ctx.device());
+```
+
+Skip it and `write_gpu` still "succeeds" — `mark_column_dirty` silently
+no-ops when it can't find a matching buffer, so the data just never reaches
+VRAM, with no error telling you why. This isn't a footgun you can trigger by
+forgetting a step correctly, though: each `#[gpu]` field is backed by its own
+generated, uniquely-typed column internally, so registering the wrong
+type isn't representable — either you call the type's own
+`register_gpu_columns` or you don't.
+
+That per-field uniqueness is also what makes same-shaped fields safe across
+(and *within*) types — `StaticMeshInstance` below has two `#[gpu(mirror =
+Once)] u32` fields, and `Material` above has three `#[gpu]` fields of
+overlapping shapes; none of them alias each other's GPU buffer, because each
+field's column identity is keyed by (struct, field), not by the field's raw
+type alone.
+
 #### GPU-native fields with `#[gpu(mirror = Once)]`
 
 For data that never changes after initial upload:
