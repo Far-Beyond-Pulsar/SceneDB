@@ -970,7 +970,15 @@ Nothing about the macro surface changes: `#[derive(SceneStore)]` and `#[gpu]` ar
 
 The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type with at least one `#[gpu]` field, a small **non-generic** dispatch function (`T` already concrete at macro-expansion time) and submits it — via `inventory::submit!`, the same link-time registration mechanism `SubsystemRegistry`/`DynMethodRegistry` already use elsewhere in this document — keyed by the type's `ComponentId`. `World::insert` looks that registration up using the `ComponentId` it already computes for archetype indexing (no extra `TypeId` resolution over what `insert` already pays today), and calls the dispatch function if one was found. A type with no `#[gpu]` fields never submits a registration, so its insert path costs exactly one `HashMap` miss when a mirror is attached, and nothing at all when it isn't.
 
-**Capacity.** GPU buffers registered via `register_gpu_columns` are fixed-capacity at creation (never reallocated, matching `SceneBuffer`'s own contract) — pass a capacity that covers every `Entity::index()` the world will ever reach, not just its current size. Growable World-mirrored buffers are a documented future enhancement, not yet implemented.
+**Capacity.** `register_gpu_columns(store, capacity, device)` (fixed) is never reallocated, matching `SceneBuffer`'s own contract — `capacity` must cover every `Entity::index()` the world will ever reach, and a write past it panics. For World-mirrored columns, whose eventual entity count is rarely known ahead of time, use `register_gpu_columns_growable(store, initial_capacity, device)` instead — same generated method, growable buffer, same `world.insert()` call site:
+
+```rust
+// Note the &Arc<wgpu::Device>, not &wgpu::Device -- the growable buffer
+// owns the device handle so it can grow later, on its own.
+StaticMeshComponent::register_gpu_columns_growable(&mut store, 1024, &device);
+```
+
+`initial_capacity` only needs to be cheap to allocate — the buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time an insert's `entity.index()` doesn't fit, entirely inside `World::insert`'s automatic dispatch, with no caller-visible difference from the fixed path except that it never panics on capacity. `SceneGpuStore::register_growable_gpu_buffer` (the lower-level method this generated call wraps) can also take an explicit `max_capacity` ceiling for a deliberate VRAM budget, but the derive's generated `register_gpu_columns_growable` never sets one — a World-mirrored column hitting a capacity ceiling has no way to report that failure back through `world.insert()`, so the recommendation is to leave it unbounded and rely on `DynamicGpuBuffer`/`GrowableSceneBuffer`'s `epoch()` counter (see `SceneGpuStore::growable_epoch_for_id`) if you need to observe growth for bind-group invalidation purposes.
 
 **Staleness.** Despawning an entity does not clear its row in a mirrored GPU buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. A reader must gate on liveness (e.g. cross-reference against `World::is_alive`/a generation check) rather than trust an arbitrary row's contents.
 

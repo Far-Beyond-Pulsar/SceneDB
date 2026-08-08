@@ -109,7 +109,8 @@ pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
     CapacityError, DynamicGpuBuffer, GpuBufferDispatch, GpuColumnDesc, GpuColumnSet,
-    GpuMirrorHandle, GpuMirrorRegistration, MirrorMode,
+    GpuMirrorHandle, GpuMirrorRegistration, GrowableGpuBufferDispatch, GrowableSceneBuffer,
+    MirrorMode,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`

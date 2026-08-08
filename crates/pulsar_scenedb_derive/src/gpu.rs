@@ -36,6 +36,14 @@ pub fn generate_gpu_column_set(
                     _device: &::wgpu::Device,
                 ) {
                 }
+
+                /// No `#[gpu]` fields on this type -- nothing to register.
+                pub fn register_gpu_columns_growable(
+                    _store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                    _initial_capacity: u32,
+                    _device: &::std::sync::Arc<::wgpu::Device>,
+                ) {
+                }
             }
         };
     }
@@ -99,6 +107,22 @@ pub fn generate_gpu_column_set(
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
             quote! {
                 store.register_gpu_buffer::<#wrapper>(capacity, device, #buffer_label);
+            }
+        })
+        .collect();
+
+    let register_growable_calls: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let field_name = f.ident.to_string();
+            let buffer_label = format!("{}::{}", name, field_name);
+            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            quote! {
+                // max_capacity is always None here -- see
+                // register_gpu_columns_growable's own doc for why a hard
+                // ceiling on a World-mirrored column isn't offered through
+                // this generated entry point.
+                store.register_growable_gpu_buffer::<#wrapper>(initial_capacity, None, device, #buffer_label);
             }
         })
         .collect();
@@ -191,6 +215,24 @@ pub fn generate_gpu_column_set(
                 device: &::wgpu::Device,
             ) {
                 #(#register_calls)*
+            }
+
+            /// Growable counterpart to [`Self::register_gpu_columns`] --
+            /// for World-mirrored use (`World::attach_gpu_mirror`), where
+            /// the eventual entity count isn't known ahead of time.
+            /// `initial_capacity` only needs to be cheap, not sized for the
+            /// eventual world; buffers grow transparently on writes past
+            /// their current capacity (`SceneGpuStore::write_row_bytes_growing`,
+            /// called automatically by `World::insert`'s dispatch path).
+            /// Never sets a `max_capacity` ceiling -- see
+            /// `SceneGpuStore::register_growable_gpu_buffer`'s doc for why
+            /// that's deliberate for World-mirrored columns specifically.
+            pub fn register_gpu_columns_growable(
+                store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                initial_capacity: u32,
+                device: &::std::sync::Arc<::wgpu::Device>,
+            ) {
+                #(#register_growable_calls)*
             }
         }
 

@@ -107,11 +107,26 @@ impl GpuMirrorHandle {
 /// hand) and indirectly, through each type's generated
 /// [`GpuMirrorRegistration::dispatch`] function, by [`crate::world::World::insert`].
 ///
-/// A field whose buffer hasn't been registered yet (`T::register_gpu_columns`
-/// not called, or called with a device/capacity that predates this field)
-/// is silently skipped, not an error — legitimate during bring-up, and
-/// `write_row_bytes` itself already treats "unregistered" as a no-op for
-/// the same reason.
+/// Each field's `ComponentId` is looked up first in the fixed-capacity
+/// registration ([`SceneGpuStore::write_row_bytes`]) and, only if not found
+/// there, in the growable registration
+/// ([`SceneGpuStore::write_row_bytes_growing`]) — a given field is
+/// registered through exactly one of `register_gpu_buffer`/
+/// `register_growable_gpu_buffer`, never both, so this is a cheap two-map
+/// check, not redundant work. A field whose buffer was never registered
+/// through either path is silently skipped, not an error — legitimate
+/// during bring-up.
+///
+/// # Panics
+///
+/// Only if a field was registered growable with an explicit `max_capacity`
+/// ceiling (via `register_growable_gpu_buffer`, not through the derive's
+/// generated `register_gpu_columns_growable`, which never sets one) and
+/// `row` exceeds it. This is deliberate, not an oversight: `World::insert`
+/// has no `Result` to propagate a capacity failure through, so a caller who
+/// opts into a hard ceiling on a World-mirrored column is opting into this
+/// panic as the price of that ceiling — documented at
+/// [`SceneGpuStore::register_growable_gpu_buffer`].
 pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
     store: &SceneGpuStore,
     queue: &wgpu::Queue,
@@ -132,7 +147,21 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
                 size,
             )
         };
-        store.write_row_bytes(col.field_token.id(), queue, bytes, row);
+        let id = col.field_token.id();
+        if store.write_row_bytes(id, queue, bytes, row) {
+            continue;
+        }
+        match store.write_row_bytes_growing(id, queue, bytes, row) {
+            None => {} // not registered through either path -- bring-up, not an error
+            Some(Ok(())) => {}
+            Some(Err(cap_err)) => panic!(
+                "World-mirrored GPU column (ComponentId {id:?}) hit its configured max_capacity \
+                 ({}) at row {row} (requested {}) -- see SceneGpuStore::register_growable_gpu_buffer's \
+                 doc: World-mirrored columns should be registered with max_capacity: None precisely \
+                 to make this unreachable",
+                cap_err.max, cap_err.requested,
+            ),
+        }
     }
 }
 
