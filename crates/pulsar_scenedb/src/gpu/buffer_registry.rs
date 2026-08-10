@@ -345,6 +345,30 @@ impl GpuBufferRegistry {
         Ok(())
     }
 
+    /// Refresh `key`'s live buffer/epoch snapshot without re-validating
+    /// compatibility — for a caller (namely [`super::SceneGpuStore`]) that
+    /// already gates registration/growth compatibility itself via its own
+    /// owner-tracking and just needs this registry's copy to stop going
+    /// stale after the first registration.
+    ///
+    /// Unlike [`Self::register_row`]/[`Self::register_resource`], `epoch` is
+    /// set to the caller-supplied ABSOLUTE value (not bumped by one), because
+    /// the caller here already knows the true epoch from the buffer's real
+    /// owner (e.g. `DynamicGpuBuffer::epoch()`), which increments exactly
+    /// once per reallocation regardless of how many times this is called in
+    /// between. A no-op if `epoch` hasn't advanced past what's stored, so
+    /// calling this on every resolve is cheap and idempotent. Also a no-op if
+    /// `key` was never registered — this never creates an entry.
+    pub fn sync(&self, key: BufferKey, buffer: wgpu::Buffer, epoch: u64) {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let Some(entry) = entries.get(&key) else { return };
+        let mut inner = entry.inner.write().expect("GpuBufferRegistry lock poisoned");
+        if epoch != inner.epoch {
+            inner.epoch = epoch;
+            inner.buffer = buffer;
+        }
+    }
+
     /// Resolve `key` to its current [`BufferHandle`] (owned buffer + epoch).
     /// `None` if the key was never registered.
     ///
@@ -477,6 +501,40 @@ mod tests {
 
         // Unresolved key.
         assert!(registry.resolve(BufferKey::of("missing")).is_none());
+    }
+
+    #[test]
+    fn sync_refreshes_buffer_and_epoch_to_the_caller_supplied_absolute_value() {
+        let registry = GpuBufferRegistry::new();
+        let device = test_device();
+        let first = make_buffer(&device, "first", 64);
+        registry
+            .register_row::<u32>(BufferKey::of("k"), first, BufferAccess::ReadWrite, MirrorMode::DirtyTracked)
+            .expect("register");
+        assert_eq!(registry.resolve(BufferKey::of("k")).unwrap().epoch, 0);
+
+        // A grow that happened entirely outside `insert`/`register_row` (the
+        // real-world case: a `DynamicGpuBuffer` reallocating on its own) is
+        // reflected by `sync`, which sets the ABSOLUTE epoch the caller
+        // already knows is current — not a blind bump.
+        let grown = make_buffer(&device, "grown", 256);
+        registry.sync(BufferKey::of("k"), grown.clone(), 3);
+        let h = registry.resolve(BufferKey::of("k")).expect("still registered");
+        assert_eq!(h.epoch, 3, "sync adopts the caller-supplied epoch");
+        assert_eq!(h.buffer.size(), 256, "sync adopts the caller-supplied buffer");
+
+        // Idempotent: calling `sync` again with the SAME epoch (e.g. two
+        // resolves in one frame, no growth in between) must not perturb the
+        // stored buffer, even if a different buffer value is passed in.
+        let stale = make_buffer(&device, "stale", 64);
+        registry.sync(BufferKey::of("k"), stale, 3);
+        let h2 = registry.resolve(BufferKey::of("k")).expect("still registered");
+        assert_eq!(h2.epoch, 3);
+        assert_eq!(h2.buffer.size(), 256, "same-epoch sync is a no-op, buffer unchanged");
+
+        // Unregistered key: `sync` must not create an entry.
+        registry.sync(BufferKey::of("never-registered"), make_buffer(&device, "x", 4), 1);
+        assert!(!registry.contains_key(BufferKey::of("never-registered")));
     }
 
     #[test]

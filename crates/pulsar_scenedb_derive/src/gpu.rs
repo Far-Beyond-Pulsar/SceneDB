@@ -11,6 +11,7 @@ pub fn generate_gpu_column_set(
     where_clause: Option<&syn::WhereClause>,
     gpu_fields: &[&FieldInfo],
     is_packed: bool,
+    packed_buffer_key: Option<&str>,
 ) -> TokenStream {
     if gpu_fields.is_empty() {
         return quote! {
@@ -70,6 +71,20 @@ pub fn generate_gpu_column_set(
     }
     let packed_is_once = is_packed && gpu_fields.iter().all(|f| f.mirror_mode == MirrorModeAttr::Once);
 
+    // Element-type bounds for the generated registration methods: the raw
+    // field type (not the per-field wrapper) is what a shared buffer's
+    // element identity is validated against, so `register_gpu_columns(_growable)`
+    // requires each `#[gpu]` field's type to be Pod + HasTypeToken -- the
+    // same requirements the struct's own generated `Pod` impl carries, so
+    // this is never the binding constraint for a real (Pod) component.
+    let register_field_ty_bounds: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let ty = &f.ty;
+            quote! { #ty: ::pulsar_scenedb::page::Pod + ::pulsar_scenedb::token::HasTypeToken }
+        })
+        .collect();
+
     // Every `#[gpu]` field is stored (and registered as a GPU buffer) under
     // its own generated wrapper type, not its raw field type -- see
     // `FieldInfo::gpu_wrapper`'s doc for why: `TypeToken`/`ComponentId` are
@@ -125,10 +140,31 @@ pub fn generate_gpu_column_set(
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
-            let buffer_label = format!("{}::{}", name, field_name);
+            let field_ident = &f.ident;
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let ty = &f.ty;
+            // Effective buffer key: the declared `#[gpu(buffer = "...")]`
+            // key if present, else a key unique to this (struct, field)
+            // pair (identical to the old per-field buffer label). Two
+            // fields that declare the SAME key share one physical buffer —
+            // validated (element type, stride, access, mirror mode) by
+            // `SceneGpuStore::register_gpu_buffer` at registration.
+            let key = f.buffer_key.clone().unwrap_or_else(|| format!("{name}::{field_name}"));
+            let mirror_mode = match f.mirror_mode {
+                MirrorModeAttr::DirtyTracked => {
+                    quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
+                }
+                MirrorModeAttr::Once => {
+                    quote! { ::pulsar_scenedb::MirrorMode::Once }
+                }
+            };
             quote! {
-                store.register_gpu_buffer::<#wrapper>(capacity, device, #buffer_label);
+                store.register_gpu_buffer::<#wrapper, #ty>(
+                    capacity,
+                    device,
+                    ::pulsar_scenedb::gpu::BufferKey::of(#key),
+                    #mirror_mode,
+                );
             }
         })
         .collect();
@@ -151,10 +187,24 @@ pub fn generate_gpu_column_set(
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
-            let buffer_label = format!("{}::{}", name, field_name);
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let ty = &f.ty;
+            let key = f.buffer_key.clone().unwrap_or_else(|| format!("{name}::{field_name}"));
+            let mirror_mode = match f.mirror_mode {
+                MirrorModeAttr::DirtyTracked => {
+                    quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
+                }
+                MirrorModeAttr::Once => {
+                    quote! { ::pulsar_scenedb::MirrorMode::Once }
+                }
+            };
             quote! {
-                store.register_dirty_tracked_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
+                store.register_dirty_tracked_gpu_buffer::<#wrapper, #ty>(
+                    initial_capacity,
+                    device,
+                    ::pulsar_scenedb::gpu::BufferKey::of(#key),
+                    #mirror_mode,
+                );
             }
         })
         .collect();
@@ -210,9 +260,28 @@ pub fn generate_gpu_column_set(
     // comment above for why both modes share one registration + write path
     // now.
     let register_growable_calls_packed = {
-        let buffer_label = format!("{}::packed", name);
+        let default_packed_key = format!("{}::packed", name);
+        let packed_key = packed_buffer_key.unwrap_or(&default_packed_key);
+        // The registered ELEMENT type is the packed view itself
+        // (`#packed_view_ident`), NOT `#name`: the buffer's element size is
+        // the packed record's size (what the dispatch fn assembles and
+        // `mark_gpu_row_dirty` writes), and `#name` may carry non-`#[gpu]`
+        // fields that aren't part of that record. Two packed structs sharing
+        // one buffer key would have to be the exact same type -- and since
+        // each struct's packed view has a unique name, element-type-identity
+        // naturally forbids cross-struct sharing; document, don't special-case.
+        let packed_mirror_mode = if packed_is_once {
+            quote! { ::pulsar_scenedb::MirrorMode::Once }
+        } else {
+            quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
+        };
         quote! {
-            store.register_dirty_tracked_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
+            store.register_dirty_tracked_gpu_buffer::<#packed_view_ident, #packed_view_ident>(
+                initial_capacity,
+                device,
+                ::pulsar_scenedb::gpu::BufferKey::of(#packed_key),
+                #packed_mirror_mode,
+            );
         }
     };
 
@@ -382,11 +451,27 @@ pub fn generate_gpu_column_set(
             /// uses (the row-region-partitioned row count -- see
             /// `SceneGpuStore::new`'s own `register_gpu_buffer` calls for
             /// its two built-ins, which this mirrors).
+            ///
+            /// A field that declares `#[gpu(buffer = "key")]` shares `key`'s
+            /// physical buffer with every other field/component that declared
+            /// the same key (compat-validated at registration, see
+            /// `SceneGpuStore::register_gpu_buffer`); fields without the
+            /// attribute each get their own buffer under a key unique to this
+            /// (struct, field) pair.
+            ///
+            /// The `#gpu_ty: ...` bounds are the registration target's
+            /// element type requirements (shared-buffer compatibility is
+            /// keyed by the field's raw type, not the per-field wrapper) --
+            /// only satisfiable when this struct is itself `Pod`, which is
+            /// what `#[derive(SceneStore)]`'s generated `Pod` impl requires
+            /// anyway.
             pub fn register_gpu_columns(
                 store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                 capacity: u32,
                 device: &::wgpu::Device,
-            ) {
+            ) where
+                #(#register_field_ty_bounds),*
+            {
                 #(#register_calls)*
             }
 
@@ -400,11 +485,15 @@ pub fn generate_gpu_column_set(
             /// Never sets a `max_capacity` ceiling -- see
             /// `SceneGpuStore::register_growable_gpu_buffer`'s doc for why
             /// that's deliberate for World-mirrored columns specifically.
+            /// Same shared-key semantics as [`Self::register_gpu_columns`],
+            /// applied through the dirty-tracked World-mirror path.
             pub fn register_gpu_columns_growable(
                 store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                 initial_capacity: u32,
                 device: &::std::sync::Arc<::wgpu::Device>,
-            ) {
+            ) where
+                #(#register_field_ty_bounds),*
+            {
                 #(#register_growable_calls)*
             }
         }
