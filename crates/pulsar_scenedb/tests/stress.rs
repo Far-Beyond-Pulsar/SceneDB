@@ -1708,7 +1708,7 @@ fn stress_schedule_50_systems() {
     let mut schedule = Schedule::new();
     for i in 0..50 {
         schedule.add_system(format!("sys_{i}"), move |world, _time| {
-            if let Some(acc) = world.get_mut::<Accum>(e) {
+            if let Some(mut acc) = world.get_mut::<Accum>(e) {
                 acc.0 += 1;
             }
         });

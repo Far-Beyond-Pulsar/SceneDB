@@ -15,6 +15,14 @@ pub struct GpuAttr {
     /// the field uses the default one-buffer-per-field split (the derive then
     /// derives a key unique to this (struct, field) pair).
     pub buffer_key: Option<String>,
+    /// `#[gpu(mirror = Once, heavy)]` -- a bare flag (no `= value`). Declares
+    /// that this field's type implements `GpuUploadSource`: the CPU column
+    /// stores the field's own (lightweight handle) type, but the GPU buffer's
+    /// element is `<FieldTy as GpuUploadSource>::Element` instead, populated
+    /// via the trait's `upload_element`. Only valid alongside `mirror = Once`
+    /// -- checked at macro-expansion time, not here (this struct doesn't see
+    /// the field's default mirror mode when `mirror` is omitted).
+    pub heavy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,11 +35,12 @@ impl Parse for GpuAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut mirror_mode = None;
         let mut buffer_key = None;
+        let mut heavy = false;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _: syn::Token![=] = input.parse()?;
             match key.to_string().as_str() {
                 "mirror" => {
+                    let _: syn::Token![=] = input.parse()?;
                     let mode: Ident = input.parse()?;
                     let mode = match mode.to_string().as_str() {
                         "DirtyTracked" => MirrorModeAttr::DirtyTracked,
@@ -46,13 +55,18 @@ impl Parse for GpuAttr {
                     mirror_mode = Some(mode);
                 }
                 "buffer" => {
+                    let _: syn::Token![=] = input.parse()?;
                     let lit: syn::LitStr = input.parse()?;
                     buffer_key = Some(lit.value());
+                }
+                "heavy" => {
+                    // Bare flag -- no `= value`, unlike `mirror`/`buffer`.
+                    heavy = true;
                 }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown #[gpu] option `{other}` (expected `mirror` or `buffer`)"),
+                        format!("unknown #[gpu] option `{other}` (expected `mirror`, `buffer`, or `heavy`)"),
                     ))
                 }
             }
@@ -62,7 +76,7 @@ impl Parse for GpuAttr {
                 break;
             }
         }
-        Ok(GpuAttr { mirror_mode, buffer_key })
+        Ok(GpuAttr { mirror_mode, buffer_key, heavy })
     }
 }
 
@@ -166,6 +180,13 @@ pub struct FieldInfo {
     /// `GpuBufferRegistry` doc for what sharing a key means and the
     /// compatibility rules that apply to it.
     pub buffer_key: Option<String>,
+    /// `#[gpu(mirror = Once, heavy)]` -- see [`GpuAttr::heavy`]'s doc.
+    /// Validated (macro-expansion-time `compile_error!`, not a runtime
+    /// panic) to only appear alongside `mirror_mode == Once` in
+    /// `generate_gpu_column_set`, since `FieldInfo` itself doesn't know
+    /// whether `mirror_mode` came from an explicit `mirror = ...` or the
+    /// default.
+    pub heavy: bool,
     /// Present iff `is_gpu`. `ComponentId`/`TypeToken` (this crate's GPU
     /// buffer + CPU-column keys) are derived from a Rust `TypeId`, globally
     /// — keyed by the field's own raw type, they carry no notion of which
@@ -225,6 +246,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let mut is_gpu = false;
         let mut mirror_mode = MirrorModeAttr::DirtyTracked;
         let mut buffer_key: Option<String> = None;
+        let mut heavy = false;
 
         for attr in &field.attrs {
             if attr.path().is_ident("gpu") {
@@ -236,6 +258,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     if let Some(key) = gpu_attr.buffer_key {
                         buffer_key = Some(key);
                     }
+                    heavy = gpu_attr.heavy;
                 }
             }
         }
@@ -261,6 +284,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             is_gpu,
             mirror_mode,
             buffer_key,
+            heavy,
             gpu_wrapper,
         });
     }

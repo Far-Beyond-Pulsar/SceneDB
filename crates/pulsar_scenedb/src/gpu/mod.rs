@@ -55,8 +55,8 @@ pub use harvest::{
 pub use phase::{BoundaryPhase, CompactedPhase, FrameDriver, HarvestPhase, RetiredPhase, SimulateA, SimulateB, SimulateWitness};
 pub use region::{RegionPool, RegionError};
 pub use scene_store::{
-    CellId, CellSlot, GpuColumnDesc, GpuColumnSet, MirrorMode, RegionClassConfig, SceneGpuConfig,
-    SceneGpuStore,
+    CellId, CellSlot, GpuColumnDesc, GpuColumnSet, GpuUploadSource, MirrorMode, RegionClassConfig,
+    SceneGpuConfig, SceneGpuStore, UploadMapperFn,
 };
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;

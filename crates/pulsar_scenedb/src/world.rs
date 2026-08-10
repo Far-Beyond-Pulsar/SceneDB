@@ -3,6 +3,7 @@ use crate::component::{Column, Component, ComponentId, ErasedColumn};
 use crate::entity::{Entity, EntitySlot};
 use crate::replication::ChangeTracker;
 use ahash::AHashMap;
+use std::ops::{Deref, DerefMut};
 
 /// The central ECS store: owns all entities, their component data, and the
 /// archetype graph.
@@ -36,6 +37,74 @@ pub struct World {
     /// `--no-default-features` never depends on `wgpu`).
     #[cfg(feature = "gpu")]
     gpu_mirror: Option<crate::gpu::GpuMirrorHandle>,
+}
+
+/// A mutable borrow of component `T` on some entity, returned by
+/// [`World::get_mut`]. `Deref`/`DerefMut` to `T`, so every existing call
+/// site (`*guard = value`, `guard.field += 1`, method calls) keeps working
+/// unchanged — the only observable difference from the old `&mut T` is that
+/// dropping this guard, not the mutation itself, is when a `#[gpu]`-bearing
+/// component's fields reach the GPU mirror (see the struct's field doc).
+///
+/// This exists to close a real gap: before this type, `World::insert` had a
+/// GPU dispatch hook but `get_mut` had none at all — mutating a `#[gpu]`
+/// field through `get_mut` silently never reached the GPU, for EITHER
+/// `MirrorMode`, not just `Once`. `Mut` gives `get_mut` the same hook
+/// `insert_inner` already has, reusing the identical link-time dispatch
+/// registry (`crate::gpu::world_mirror::dispatch_for`) — no new registration
+/// mechanism.
+pub struct Mut<'a, T> {
+    value: &'a mut T,
+    /// Precomputed at [`World::get_mut`] time (not resolved again in
+    /// [`Drop::drop`]): `None` whenever the `gpu` feature is off, no mirror
+    /// is attached, or `T` has no `#[gpu]` fields — the exact same
+    /// short-circuit `insert_inner` already applies, so a `get_mut` on a
+    /// plain (non-GPU) component costs one `Option`/`HashMap`-miss check on
+    /// construction and nothing at all on drop.
+    #[cfg(feature = "gpu")]
+    gpu_hook: Option<GpuMutHook>,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuMutHook {
+    mirror: crate::gpu::GpuMirrorHandle,
+    row: u32,
+    dispatch: crate::gpu::world_mirror::DispatchFn,
+}
+
+impl<'a, T> Deref for Mut<'a, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<'a, T> DerefMut for Mut<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<'a, T> Drop for Mut<'a, T> {
+    fn drop(&mut self) {
+        if let Some(hook) = &self.gpu_hook {
+            // `is_new_insert = true`: from `write_gpu_columns_at_row`'s
+            // perspective this bool means "write `Once` fields too, don't
+            // skip them" — exactly right here. `Once`'s "never re-write
+            // after the first insert" pinning is specifically an
+            // INSERT-path behavior (a routine re-insert of the same
+            // component shouldn't silently re-upload static data); an
+            // explicit `get_mut` mutation is, by construction, the caller
+            // deliberately changing the value, so `Once` fields re-upload
+            // here exactly like `DirtyTracked` ones do (see the module doc
+            // on `MirrorMode::Once` / `GpuUploadSource` for the full
+            // contract this is the write-side half of).
+            (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+        }
+    }
 }
 
 impl World {
@@ -564,9 +633,16 @@ impl World {
         })
     }
 
-    /// Returns a mutable reference to component `T` on `entity`, if present.
+    /// Returns a mutable borrow of component `T` on `entity`, if present.
+    ///
+    /// The returned [`Mut<T>`] derefs to `&mut T` exactly like the old raw
+    /// `&mut T` this used to return — every ordinary call site keeps working
+    /// unchanged. The difference is what happens when it drops: if `T` has
+    /// `#[gpu]` fields and a mirror is attached, the mutated value is written
+    /// through to the GPU mirror then, the same way `World::insert` already
+    /// does on every insert. See [`Mut`]'s doc for why this exists.
     #[inline]
-    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<Mut<'_, T>> {
         if !self.is_alive(entity) {
             return None;
         }
@@ -575,10 +651,25 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
-        Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
+        let value = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
             c.as_any_mut()
                 .downcast_mut::<Column<T>>()
                 .map(|col| &mut col.data[row])
+        })?;
+
+        #[cfg(feature = "gpu")]
+        let gpu_hook = self.gpu_mirror.as_ref().and_then(|mirror| {
+            crate::gpu::world_mirror::dispatch_for(cid).map(|dispatch| GpuMutHook {
+                mirror: mirror.clone(),
+                row: entity.index(),
+                dispatch,
+            })
+        });
+
+        Some(Mut {
+            value,
+            #[cfg(feature = "gpu")]
+            gpu_hook,
         })
     }
 

@@ -108,6 +108,7 @@ impl GpuColumnSet for TestMaterial {
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-materials",
+            upload: None,
         }]
     }
 
@@ -148,6 +149,7 @@ impl GpuColumnSet for TestLight {
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-lights",
+            upload: None,
         }]
     }
 

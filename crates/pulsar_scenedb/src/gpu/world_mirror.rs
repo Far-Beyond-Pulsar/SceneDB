@@ -339,18 +339,27 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
         if col.mode == crate::gpu::MirrorMode::Once && !is_new_insert {
             continue; // Once fields never re-write after the first insert
         }
-        let size = col.field_token.desc().size as usize;
-        // SAFETY: `field_offset`/`size` describe a field within `T`, computed
-        // by the derive from `T`'s own layout (`offset_of!` + `size_of`) at
-        // macro-expansion time, so the byte range is in-bounds of `data` and
-        // fully initialized. `T: GpuColumnSet: Pod` guarantees every bit
-        // pattern in that range is a valid read (no padding-UB, no enum
-        // niches to violate).
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (data as *const T as *const u8).add(col.field_offset),
-                size,
-            )
+        // SAFETY: `field_offset` describes a field within `T`, computed by
+        // the derive from `T`'s own layout (`offset_of!`) at macro-expansion
+        // time, so this pointer is in-bounds of `data` and correctly aligned
+        // for the field's own type.
+        let field_ptr = unsafe { (data as *const T as *const u8).add(col.field_offset) };
+        // A `heavy` field's `upload` mapper produces freshly-computed,
+        // Element-sized bytes from the handle at `field_ptr` (see
+        // `GpuUploadSource`) — an owned allocation, since the mapped bytes
+        // don't live anywhere else. Every other field (the overwhelming
+        // majority) reads its own bytes directly, zero-copy, exactly as
+        // before `upload` existed.
+        let mapped;
+        let bytes: &[u8] = if let Some(upload) = col.upload {
+            mapped = upload(field_ptr as *const ());
+            &mapped
+        } else {
+            let size = col.field_token.desc().size as usize;
+            // SAFETY: `size` is this field's own type's size (`T:
+            // GpuColumnSet: Pod` guarantees every bit pattern in that range
+            // is a valid read — no padding-UB, no enum niches to violate).
+            unsafe { std::slice::from_raw_parts(field_ptr, size) }
         };
         let id = col.field_token.id();
 
@@ -467,6 +476,7 @@ mod tests {
                 field_offset: std::mem::offset_of!(TestComponent, value),
                 mode: MirrorMode::DirtyTracked,
                 buffer_name: "value",
+                upload: None,
             }]
         }
         fn write_gpu(

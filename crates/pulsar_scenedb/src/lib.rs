@@ -111,7 +111,8 @@ pub use gpu::{
     BufferAccess, BufferHandle, BufferKey, BufferRegistrationError, CapacityError,
     DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror,
     GpuBufferDispatch, GpuBufferRegistry, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
-    GpuMirrorRegistration, GrowableGpuBufferDispatch, GrowableSceneBuffer, MirrorMode,
+    GpuMirrorRegistration, GpuUploadSource, GrowableGpuBufferDispatch, GrowableSceneBuffer,
+    MirrorMode, UploadMapperFn,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`
@@ -149,7 +150,7 @@ pub use spatial::{
 };
 pub use time::GameTime;
 pub use token::{HasTypeToken, TypeToken};
-pub use world::World;
+pub use world::{Mut, World};
 
 #[cfg(feature = "telemetry")]
 pub use telemetry::{TelemetryServer, TelemetrySnapshot};
