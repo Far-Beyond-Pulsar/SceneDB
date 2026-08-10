@@ -13,6 +13,7 @@
 
 mod assets;
 mod buffer;
+mod buffer_registry;
 mod context;
 mod dirty;
 mod dirty_tracked_scene_buffer;
@@ -35,6 +36,9 @@ pub use assets::{
     MeshletEntry, MeshletError, TextureError, TextureStore, MAX_TEXTURE_SLOTS,
 };
 pub use buffer::{GpuBufferDispatch, SceneBuffer, SyncStats, GAP_MERGE_THRESHOLD};
+pub use buffer_registry::{
+    BufferAccess, BufferHandle, BufferKey, BufferRegistrationError, GpuBufferRegistry,
+};
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
 pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer};

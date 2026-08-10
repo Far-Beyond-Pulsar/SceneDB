@@ -108,8 +108,9 @@ pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    CapacityError, DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer,
-    GenerationMirror, GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
+    BufferAccess, BufferHandle, BufferKey, BufferRegistrationError, CapacityError,
+    DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror,
+    GpuBufferDispatch, GpuBufferRegistry, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
     GpuMirrorRegistration, GrowableGpuBufferDispatch, GrowableSceneBuffer, MirrorMode,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
