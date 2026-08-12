@@ -57,6 +57,47 @@ impl SceneGpuConfig {
     }
 }
 
+/// Keyed-registry identity for the store's always-present built-in buffers
+/// (issue #41's "Collapse map": "Store builtins (transform, generation) →
+/// `GpuBuffer<...>` @ `"builtin_transform"` / `"builtin_generation"`"). The
+/// transform/instance-info buffers already register under
+/// `"scenedb-instances"`/`"scenedb-instance-info"` at construction (see
+/// [`SceneGpuStore::new`]); these three cover the remaining built-ins that
+/// were previously reachable only through their dedicated accessors
+/// ([`SceneGpuStore::generation_buffer`], [`SceneGpuStore::slot_mirror_buffer`],
+/// [`SceneGpuStore::cell_metadata_buffer`]) and NOT through the keyed
+/// registry — a renderer/tooling consumer had no `Buffer<"key">`-style path
+/// to them. Registered once at [`SceneGpuStore::new`] (all three are fixed
+/// capacity, allocated once, never reallocated — no epoch/growth sync
+/// needed after that single registration).
+pub const GENERATION_BUFFER_KEY: BufferKey = BufferKey::of("builtin_generation");
+pub const SLOT_MIRROR_BUFFER_KEY: BufferKey = BufferKey::of("builtin_slot_mirror");
+pub const CELL_METADATA_BUFFER_KEY: BufferKey = BufferKey::of("builtin_cell_metadata");
+
+/// The 8-byte per-cell metadata record `StreamingGrid::write_cell_metadata`
+/// packs directly by hand (`f32` alpha + `u32` domain code) — defined here
+/// purely so [`CELL_METADATA_BUFFER_KEY`] can be registered as a proper `T:
+/// Pod` row buffer instead of an opaque byte-range resource. Not a new wire
+/// format: `write_cell_metadata` still writes the same two `to_le_bytes()`
+/// calls it always did: this type documents that layout for the registry,
+/// it does not change it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetadataRow {
+    pub alpha: f32,
+    pub domain: u32,
+}
+const _: () = assert!(std::mem::size_of::<CellMetadataRow>() == 8);
+// SAFETY: `#[repr(C)]`, `Copy`, both fields are themselves POD (f32/u32),
+// and the const assert pins the layout to exactly 8 bytes with no hidden
+// padding — matching `write_cell_metadata`'s byte-for-byte packing.
+unsafe impl crate::page::Pod for CellMetadataRow {}
+// SAFETY: a bare marker impl (`HasTypeToken` derives its `TypeToken` purely
+// from `Self`'s `TypeId`/layout via the blanket impl this crate provides for
+// every `Pod` type elsewhere) — see `token.rs`. `CellMetadataRow` needs no
+// bespoke reflection metadata beyond what registering it as a row-buffer
+// element requires (`Pod + HasTypeToken + 'static`).
+
 /// How a GPU-mirrored field is synced to the GPU buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MirrorMode {
@@ -472,7 +513,59 @@ impl SceneGpuStore {
             BufferKey::of("scenedb-instance-info"),
             MirrorMode::DirtyTracked,
         );
+        // Remaining store builtins (issue #41 collapse map): reachable by
+        // key through the SAME registry the shared/`#[gpu(buffer=...)]`
+        // fields resolve through, alongside their existing dedicated
+        // accessors (`generation_buffer()`/`slot_mirror_buffer()`/
+        // `cell_metadata_buffer()`, unchanged). All three are fixed-capacity
+        // and allocated exactly once, right here — never reallocated, so
+        // one `register_row` call each is the complete registration; no
+        // `sync` call site is needed anywhere else in this store for them.
         store
+            .registry
+            .register_row::<u32>(GENERATION_BUFFER_KEY, store.generations.buffer().clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("GENERATION_BUFFER_KEY is a fresh key on every new store");
+        store
+            .registry
+            .register_row::<u32>(SLOT_MIRROR_BUFFER_KEY, store.slot_mirror.buffer().clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("SLOT_MIRROR_BUFFER_KEY is a fresh key on every new store");
+        store
+            .registry
+            .register_row::<CellMetadataRow>(CELL_METADATA_BUFFER_KEY, store.cell_metadata.clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("CELL_METADATA_BUFFER_KEY is a fresh key on every new store");
+        store
+    }
+
+    /// The Tier 1 keyed buffer registry this store registers every built-in
+    /// and `#[gpu(buffer = "...")]`-shared buffer into (issue #41's single
+    /// namespace: "the registry — the single namespace resource entries...
+    /// will eventually share"). Exposed so external, non-`SceneGpuStore`-
+    /// owned GPU asset stores (`MeshRegistry`, `ClusterBuffer`,
+    /// `MaterialRegistry`, `GeometryArena`, `TextureStore`, and friends) can
+    /// register their OWN buffers into the SAME registry this store already
+    /// builds — see each type's `register_key`/`register_into` method. Read-
+    /// only: registration into it still goes through `GpuBufferRegistry`'s
+    /// own `register_row`/`register_resource`/`register_texture_array`,
+    /// which validate compatibility exactly the same way whether the caller
+    /// is this store or an external asset registry.
+    pub fn buffer_registry(&self) -> &GpuBufferRegistry {
+        &self.registry
+    }
+
+    /// Diagnostic-only convenience: [`super::readback_row`] for a key
+    /// registered as a row buffer in this store's [`Self::buffer_registry`]
+    /// (a store builtin, or any `#[gpu(buffer = "...")]`-shared key). `None`
+    /// if `key` isn't registered as a row buffer at all (unregistered,
+    /// registered as a resource, or registered as a texture array — see
+    /// [`GpuBufferRegistry::resolve`]).
+    ///
+    /// Like every function in [`super::readback`], this is explicit,
+    /// decoupled, diagnostic-only VRAM readback: it blocks the calling
+    /// thread on `device.poll`, and nothing in the `get`/`get_mut`/query
+    /// path ever calls it. See that module's doc for the full rationale.
+    pub fn readback_row<T: Pod>(&self, device: &wgpu::Device, key: BufferKey, row: u32) -> Option<T> {
+        let handle = self.registry.resolve(key)?;
+        Some(super::readback_row::<T>(device, &self.queue, &handle.buffer, row))
     }
 
     pub fn tracker(&self) -> &SubmissionTracker {

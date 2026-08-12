@@ -155,8 +155,12 @@ pub enum BufferRegistrationError {
         existing: Option<MirrorMode>,
         incoming: Option<MirrorMode>,
     },
-    /// The key already exists as a row buffer and was re-registered as a
-    /// resource (or vice versa).
+    /// The key already exists under a different entry KIND (row buffer,
+    /// byte-range resource, or texture array) than the incoming
+    /// registration — e.g. a row buffer re-registered as a resource, or a
+    /// texture-array key claimed by a row buffer. Any two of the three kinds
+    /// colliding on one key is this variant; which two is not distinguished
+    /// (the fix is always "pick a different key").
     RowResourceCollision { key: BufferKey },
 }
 
@@ -187,7 +191,8 @@ impl fmt::Display for BufferRegistrationError {
             ),
             BufferRegistrationError::RowResourceCollision { key } => write!(
                 f,
-                "buffer {:?} is registered both as a row buffer and as a resource entry",
+                "buffer {:?} is registered under a different entry kind (row buffer / resource / \
+                 texture array) than this registration declares",
                 key,
             ),
         }
@@ -196,23 +201,66 @@ impl fmt::Display for BufferRegistrationError {
 
 impl std::error::Error for BufferRegistrationError {}
 
-/// A single keyed registration: the current buffer + epoch, plus the
-/// compatibility metadata registration validated. Internal to the registry;
-/// callers interact with it through [`BufferHandle`] and `resolve`.
+/// Which of the registry's three entry shapes a [`BufferKey`] was claimed
+/// under. A key belongs to exactly one kind for its lifetime — a second
+/// registration under a different kind is a
+/// [`BufferRegistrationError::RowResourceCollision`], never a silent
+/// overwrite.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EntryKind {
+    /// A `T: Pod` row buffer — [`GpuBufferRegistry::register_row`].
+    Row,
+    /// A byte-range resource (e.g. `GeometryArena`'s vertex/index arenas) —
+    /// [`GpuBufferRegistry::register_resource`]. Still backed by one
+    /// `wgpu::Buffer`, just not a dense `T` row array.
+    Resource,
+    /// A texture-array slot table (e.g. `TextureStore`) — has NO single
+    /// `wgpu::Buffer` (it is N independent `wgpu::Texture` objects), so this
+    /// entry reserves the key's namespace and records its slot capacity
+    /// without holding a buffer handle at all. See
+    /// [`GpuBufferRegistry::register_texture_array`].
+    TextureArray,
+}
+
+/// A single keyed registration: the current buffer + epoch (for
+/// buffer-backed kinds) or just the slot capacity (for a texture array),
+/// plus the compatibility metadata registration validated. Internal to the
+/// registry; callers interact with it through [`BufferHandle`] and
+/// `resolve`.
 struct RegistryEntry {
     key: BufferKey,
+    kind: EntryKind,
     /// Element type identity for row buffers; `None` for resource entries
-    /// (byte-range suballocator, texture-array).
+    /// and texture arrays.
     element_type_id: Option<TypeId>,
+    /// Row stride for `Row`; total byte size for `Resource`; slot capacity
+    /// for `TextureArray` (documented per-variant — not bytes in that case).
     element_size: usize,
     access: BufferAccess,
     mirror_mode: Option<MirrorMode>,
-    inner: RwLock<EntryInner>,
+    /// `Some` for `Row`/`Resource` (buffer-backed); `None` for
+    /// `TextureArray`, which has no `wgpu::Buffer` to hold.
+    inner: Option<RwLock<EntryInner>>,
 }
 
 struct EntryInner {
     buffer: wgpu::Buffer,
     epoch: u64,
+}
+
+/// Bundles [`GpuBufferRegistry::insert`]'s parameters — a private helper
+/// struct purely to keep that function's argument count readable
+/// (`register_row`/`register_resource` are the only two callers, both of
+/// which already have every field in hand from their own public
+/// signatures).
+struct InsertSpec {
+    key: BufferKey,
+    kind: EntryKind,
+    element_type_id: Option<TypeId>,
+    element_size: usize,
+    access: BufferAccess,
+    mirror_mode: Option<MirrorMode>,
+    buffer: wgpu::Buffer,
 }
 
 /// The single keyed buffer registry (Tier 1). Maps [`BufferKey`] → the
@@ -251,25 +299,25 @@ impl GpuBufferRegistry {
         access: BufferAccess,
         mode: MirrorMode,
     ) -> Result<(), BufferRegistrationError> {
-        let element_type_id = Some(TypeId::of::<T>());
-        let element_size = std::mem::size_of::<T>();
-        self.insert(
+        self.insert(InsertSpec {
             key,
-            element_type_id,
-            element_size,
+            kind: EntryKind::Row,
+            element_type_id: Some(TypeId::of::<T>()),
+            element_size: std::mem::size_of::<T>(),
             access,
-            Some(mode),
+            mirror_mode: Some(mode),
             buffer,
-        )
+        })
     }
 
     /// Register a *resource* entry (not a `T: Pod` row buffer) under `key`:
     /// the byte-range suballocator `GeometryArena` (`"builtin_mesh_vertex"`,
-    /// `"builtin_mesh_index"`) or the texture-array `TextureStore`
-    /// (`"builtin_texture"`). `size` is the entry's total size in bytes —
+    /// `"builtin_mesh_index"`). `size` is the entry's total size in bytes —
     /// stored for introspection, not bounds-checked by this registry.
     ///
-    /// A resource entry and a row buffer can never share a key.
+    /// A resource entry, a row buffer, and a texture array can never share a
+    /// key. For a texture array specifically (no single `wgpu::Buffer` to
+    /// register here), use [`Self::register_texture_array`] instead.
     pub fn register_resource(
         &self,
         key: BufferKey,
@@ -277,21 +325,96 @@ impl GpuBufferRegistry {
         buffer: wgpu::Buffer,
         access: BufferAccess,
     ) -> Result<(), BufferRegistrationError> {
-        self.insert(key, None, size, access, None, buffer)
+        self.insert(InsertSpec {
+            key,
+            kind: EntryKind::Resource,
+            element_type_id: None,
+            element_size: size,
+            access,
+            mirror_mode: None,
+            buffer,
+        })
     }
 
-    fn insert(
+    /// Register a *texture array* slot table under `key` — e.g.
+    /// `TextureStore` (`"builtin_texture"`). Unlike [`Self::register_row`]/
+    /// [`Self::register_resource`], this reserves the key's namespace
+    /// (blocking a row buffer or byte-range resource from ever claiming the
+    /// same key) WITHOUT storing a `wgpu::Buffer` — a texture array is N
+    /// independent `wgpu::Texture` objects, which this `wgpu::Buffer`-keyed
+    /// registry has no slot for. [`Self::resolve`] always returns `None` for
+    /// a texture-array key; texture access stays entirely through the
+    /// owning `TextureStore`'s own API (`texture(slot)`) — see the module
+    /// doc's "Resource entries" paragraph and issue #41's "What legitimately
+    /// stays bespoke" section.
+    ///
+    /// `slot_capacity` is the array's current slot-table extent (e.g.
+    /// `TextureStore::slot_count()`) — stored for introspection via
+    /// [`Self::texture_array_slot_capacity`], not bounds-checked here. Safe
+    /// to call again with a larger `slot_capacity` as the table grows (a
+    /// compatible re-registration, same as a row buffer's growth) — smaller
+    /// or equal is also accepted (never shrinks the stored value below what
+    /// growth already recorded is not enforced; callers should pass the
+    /// current true extent each time, matching `TextureStore::slot_count`'s
+    /// own monotonically-nondecreasing contract).
+    pub fn register_texture_array(
         &self,
         key: BufferKey,
-        element_type_id: Option<TypeId>,
-        element_size: usize,
+        slot_capacity: u32,
         access: BufferAccess,
-        mirror_mode: Option<MirrorMode>,
-        buffer: wgpu::Buffer,
     ) -> Result<(), BufferRegistrationError> {
         let mut entries = self.entries.write().expect("GpuBufferRegistry lock poisoned");
+        if let Some(existing) = entries.get_mut(&key) {
+            if existing.kind != EntryKind::TextureArray {
+                return Err(BufferRegistrationError::RowResourceCollision { key });
+            }
+            if existing.access != access {
+                return Err(BufferRegistrationError::AccessMismatch {
+                    key,
+                    existing: existing.access,
+                    incoming: access,
+                });
+            }
+            existing.element_size = slot_capacity as usize;
+            return Ok(());
+        }
+        entries.insert(
+            key,
+            RegistryEntry {
+                key,
+                kind: EntryKind::TextureArray,
+                element_type_id: None,
+                element_size: slot_capacity as usize,
+                access,
+                mirror_mode: None,
+                inner: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether `key` is registered as a texture array (see
+    /// [`Self::register_texture_array`]). `false` for an unregistered key or
+    /// one registered as a row buffer / resource.
+    pub fn is_texture_array(&self, key: BufferKey) -> bool {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        entries.get(&key).is_some_and(|e| e.kind == EntryKind::TextureArray)
+    }
+
+    /// The slot capacity last recorded for a texture-array key (see
+    /// [`Self::register_texture_array`]). `None` if `key` isn't registered
+    /// as a texture array.
+    pub fn texture_array_slot_capacity(&self, key: BufferKey) -> Option<u32> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let entry = entries.get(&key)?;
+        (entry.kind == EntryKind::TextureArray).then_some(entry.element_size as u32)
+    }
+
+    fn insert(&self, spec: InsertSpec) -> Result<(), BufferRegistrationError> {
+        let InsertSpec { key, kind, element_type_id, element_size, access, mirror_mode, buffer } = spec;
+        let mut entries = self.entries.write().expect("GpuBufferRegistry lock poisoned");
         if let Some(existing) = entries.get(&key) {
-            if existing.element_type_id.is_some() != element_type_id.is_some() {
+            if existing.kind != kind {
                 return Err(BufferRegistrationError::RowResourceCollision { key });
             }
             if existing.element_type_id != element_type_id {
@@ -326,7 +449,12 @@ impl GpuBufferRegistry {
             // bumping the epoch so consumers re-resolve and rebind. This is
             // how a growable buffer's owner keeps the registry in sync with
             // a reallocation.
-            let mut inner = existing.inner.write().expect("GpuBufferRegistry lock poisoned");
+            let mut inner = existing
+                .inner
+                .as_ref()
+                .expect("Row/Resource entries always carry a buffer")
+                .write()
+                .expect("GpuBufferRegistry lock poisoned");
             inner.epoch = inner.epoch.wrapping_add(1);
             inner.buffer = buffer;
             return Ok(());
@@ -335,11 +463,12 @@ impl GpuBufferRegistry {
             key,
             RegistryEntry {
                 key,
+                kind,
                 element_type_id,
                 element_size,
                 access,
                 mirror_mode,
-                inner: RwLock::new(EntryInner { buffer, epoch: 0 }),
+                inner: Some(RwLock::new(EntryInner { buffer, epoch: 0 })),
             },
         );
         Ok(())
@@ -359,10 +488,13 @@ impl GpuBufferRegistry {
     /// between. A no-op if `epoch` hasn't advanced past what's stored, so
     /// calling this on every resolve is cheap and idempotent. Also a no-op if
     /// `key` was never registered — this never creates an entry.
+    /// A no-op if `key` is registered as a texture array (see
+    /// [`Self::register_texture_array`]) — there is no buffer slot to sync.
     pub fn sync(&self, key: BufferKey, buffer: wgpu::Buffer, epoch: u64) {
         let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
         let Some(entry) = entries.get(&key) else { return };
-        let mut inner = entry.inner.write().expect("GpuBufferRegistry lock poisoned");
+        let Some(inner) = entry.inner.as_ref() else { return };
+        let mut inner = inner.write().expect("GpuBufferRegistry lock poisoned");
         if epoch != inner.epoch {
             inner.epoch = epoch;
             inner.buffer = buffer;
@@ -370,7 +502,11 @@ impl GpuBufferRegistry {
     }
 
     /// Resolve `key` to its current [`BufferHandle`] (owned buffer + epoch).
-    /// `None` if the key was never registered.
+    /// `None` if the key was never registered, OR if it was registered as a
+    /// texture array ([`Self::register_texture_array`]) — a texture array
+    /// has no single `wgpu::Buffer` to hand back; use
+    /// [`Self::is_texture_array`]/[`Self::texture_array_slot_capacity`] plus
+    /// the owning `TextureStore`'s own API for that case.
     ///
     /// The returned buffer is an owned clone captured atomically with the
     /// epoch it belongs to, so a growth between this call and the consumer's
@@ -379,21 +515,23 @@ impl GpuBufferRegistry {
     pub fn resolve(&self, key: BufferKey) -> Option<BufferHandle> {
         let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
         let entry = entries.get(&key)?;
-        let inner = entry.inner.read().expect("GpuBufferRegistry lock poisoned");
+        let inner = entry.inner.as_ref()?.read().expect("GpuBufferRegistry lock poisoned");
         Some(BufferHandle {
             buffer: inner.buffer.clone(),
             epoch: inner.epoch,
         })
     }
 
-    /// The current epoch of `key`'s buffer, or `None` if never registered.
+    /// The current epoch of `key`'s buffer, or `None` if never registered or
+    /// registered as a texture array (no epoch concept — see
+    /// [`Self::resolve`]).
     /// `Some` does not guarantee `resolve` will succeed (a concurrent
     /// compatible re-registration can't remove a key, but nothing here
     /// removes keys today).
     pub fn epoch(&self, key: BufferKey) -> Option<u64> {
         let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
         let entry = entries.get(&key)?;
-        let epoch = entry.inner.read().expect("GpuBufferRegistry lock poisoned").epoch;
+        let epoch = entry.inner.as_ref()?.read().expect("GpuBufferRegistry lock poisoned").epoch;
         Some(epoch)
     }
 
@@ -623,5 +761,92 @@ mod tests {
             .register_row::<u32>(BufferKey::of("builtin_mesh_vertex"), make_buffer(&device, "b", 64), BufferAccess::ReadOnly, MirrorMode::Once)
             .expect_err("a row buffer must not be able to squat on a resource key");
         assert_eq!(err, BufferRegistrationError::RowResourceCollision { key: BufferKey::of("builtin_mesh_vertex") });
+    }
+
+    #[test]
+    fn texture_array_reserves_its_key_without_a_buffer_and_resolve_returns_none() {
+        let registry = GpuBufferRegistry::new();
+        registry
+            .register_texture_array(BufferKey::of("builtin_texture"), 4, BufferAccess::ReadOnly)
+            .expect("texture-array registration");
+        assert!(registry.is_texture_array(BufferKey::of("builtin_texture")));
+        assert_eq!(registry.texture_array_slot_capacity(BufferKey::of("builtin_texture")), Some(4));
+        assert!(
+            registry.resolve(BufferKey::of("builtin_texture")).is_none(),
+            "a texture array has no wgpu::Buffer to resolve"
+        );
+        assert!(registry.epoch(BufferKey::of("builtin_texture")).is_none());
+        assert!(registry.contains_key(BufferKey::of("builtin_texture")));
+    }
+
+    #[test]
+    fn texture_array_slot_capacity_updates_on_re_registration_growth() {
+        let registry = GpuBufferRegistry::new();
+        registry
+            .register_texture_array(BufferKey::of("tex"), 4, BufferAccess::ReadOnly)
+            .expect("first registration");
+        registry
+            .register_texture_array(BufferKey::of("tex"), 9, BufferAccess::ReadOnly)
+            .expect("grown re-registration");
+        assert_eq!(registry.texture_array_slot_capacity(BufferKey::of("tex")), Some(9));
+    }
+
+    #[test]
+    fn texture_array_cannot_collide_with_a_row_buffer_or_a_resource_key() {
+        let registry = GpuBufferRegistry::new();
+        let device = test_device();
+        registry
+            .register_texture_array(BufferKey::of("tex"), 4, BufferAccess::ReadOnly)
+            .expect("texture-array registration");
+
+        let err = registry
+            .register_row::<u32>(BufferKey::of("tex"), make_buffer(&device, "b", 64), BufferAccess::ReadOnly, MirrorMode::Once)
+            .expect_err("a row buffer must not squat on a texture-array key");
+        assert_eq!(err, BufferRegistrationError::RowResourceCollision { key: BufferKey::of("tex") });
+
+        let err2 = registry
+            .register_resource(BufferKey::of("tex"), 64, make_buffer(&device, "c", 64), BufferAccess::ReadOnly)
+            .expect_err("a resource must not squat on a texture-array key");
+        assert_eq!(err2, BufferRegistrationError::RowResourceCollision { key: BufferKey::of("tex") });
+
+        let device2 = test_device();
+        let arena = make_buffer(&device2, "arena", 64);
+        registry.register_resource(BufferKey::of("other"), 64, arena, BufferAccess::ReadOnly).expect("distinct key ok");
+        let err3 = registry
+            .register_texture_array(BufferKey::of("other"), 4, BufferAccess::ReadOnly)
+            .expect_err("a texture array must not squat on a resource key");
+        assert_eq!(err3, BufferRegistrationError::RowResourceCollision { key: BufferKey::of("other") });
+    }
+
+    #[test]
+    fn texture_array_access_mismatch_is_rejected() {
+        let registry = GpuBufferRegistry::new();
+        registry
+            .register_texture_array(BufferKey::of("tex"), 4, BufferAccess::ReadOnly)
+            .expect("first registration");
+        let err = registry
+            .register_texture_array(BufferKey::of("tex"), 4, BufferAccess::ReadWrite)
+            .expect_err("access is part of the compatibility contract for texture arrays too");
+        assert_eq!(
+            err,
+            BufferRegistrationError::AccessMismatch {
+                key: BufferKey::of("tex"),
+                existing: BufferAccess::ReadOnly,
+                incoming: BufferAccess::ReadWrite,
+            }
+        );
+    }
+
+    #[test]
+    fn sync_is_a_no_op_on_a_texture_array_key() {
+        let registry = GpuBufferRegistry::new();
+        let device = test_device();
+        registry
+            .register_texture_array(BufferKey::of("tex"), 4, BufferAccess::ReadOnly)
+            .expect("registration");
+        // Must not panic, and must not turn the key into a resolvable buffer.
+        registry.sync(BufferKey::of("tex"), make_buffer(&device, "x", 4), 7);
+        assert!(registry.resolve(BufferKey::of("tex")).is_none());
+        assert!(registry.is_texture_array(BufferKey::of("tex")));
     }
 }
