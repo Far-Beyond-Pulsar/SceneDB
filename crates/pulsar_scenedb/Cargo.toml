@@ -140,3 +140,39 @@ required-features = ["gpu"]
 [[test]]
 name = "world_gpu_mirror_reservation_shrink"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_store_builtin_registry"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_assets_registry_collapse"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_buffer_registry_epoch"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_heavy_once"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_shared_buffer"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_system_binding_end_to_end"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_view_upload_registry"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_zero_manual_steps"
+required-features = ["gpu"]
+
+[[test]]
+name = "world_gpu_mirror_get_mut"
+required-features = ["gpu"]
