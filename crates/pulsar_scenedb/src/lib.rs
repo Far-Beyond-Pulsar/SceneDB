@@ -122,6 +122,15 @@ pub use gpu::{
 // needing its own direct `pulsar_reflection` dependency — same reasoning
 // `wgpu` re-exports work by for `#[gpu]` field types.
 pub use pulsar_reflection;
+// Facade re-export: any crate that already depends on `pulsar_scenedb` gets
+// `#[derive(::pulsar_scenedb::SceneStore)]` for free, without also needing a
+// direct `pulsar_scenedb_derive` dependency of its own — the same pattern
+// `serde` uses for `serde_derive`. This is what lets other proc-macros
+// (e.g. Pulsar-Native's `engine_class_derive`) *delegate* to this derive by
+// emitting `::pulsar_scenedb::SceneStore` as one more `#[derive(...)]` entry
+// in their own generated token stream, instead of hand-rolling equivalent
+// `Pod`/`HasTypeToken`/`SceneColumnSet`/`GpuColumnSet` codegen themselves.
+pub use pulsar_scenedb_derive::SceneStore;
 #[cfg(feature = "gpu")]
 pub use subsystem::{Subsystem, SubsystemRegistry};
 #[cfg(feature = "gpu")]

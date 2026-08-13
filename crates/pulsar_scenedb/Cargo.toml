@@ -23,6 +23,15 @@ ahash             = "0.8"
 profiling         = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "12424a5f75166332f9f1d2741281f6fc4847b44d" }
 tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
+# Real (non-dev) dependency so `pub use pulsar_scenedb_derive::SceneStore`
+# below can re-export it -- downstream crates that already depend on
+# `pulsar_scenedb` (which is every real consumer) get `#[derive(SceneStore)]`
+# for free instead of also needing a direct `pulsar_scenedb_derive`
+# dependency of their own, the same facade pattern `serde`/`serde_derive`
+# use. Was a dev-dependency only (this crate's own benches/examples/tests
+# used it directly, pre-re-export); still exercised by those, so this is a
+# promotion, not a new relationship.
+pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
 
 [dev-dependencies]
 rand = "0.8"
@@ -31,7 +40,6 @@ pollster = "1.0"
 naga = { version = "30", features = ["wgsl-in"] }
 ratatui = "0.29"
 crossterm = "0.28"
-pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
 bevy_ecs = { version = "0.19.1", default-features = false, features = ["std"] }
 
 [[example]]
