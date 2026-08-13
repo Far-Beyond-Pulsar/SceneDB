@@ -40,7 +40,16 @@ pub trait WorldQuery<'w>: Sized {
     /// Per-archetype resolved fetch state — e.g. a raw base pointer into a
     /// column's backing storage. Computed once per archetype by
     /// [`Self::init_fetch`], then reused for every row via [`Self::fetch`].
-    type Fetch;
+    ///
+    /// `Copy` (always a raw pointer or a tuple thereof for every
+    /// implementation in this crate) so [`Self::fetch`] takes it BY VALUE,
+    /// not by reference: [`QueryIter::next`] calls `Q::fetch` once per row,
+    /// and passing the state by reference would mean re-reading it out of
+    /// `QueryIter`'s own memory on every single call. By value, the
+    /// compiler can (and, per this change's own before/after benchmark,
+    /// does) hoist that load out of the per-row loop entirely once
+    /// `next()`'s body is inlined into its caller.
+    type Fetch: Copy;
 
     /// Returns `true` if the given archetype contains all the components
     /// required by this query.
@@ -60,7 +69,7 @@ pub trait WorldQuery<'w>: Sized {
     /// - `fetch` must have come from [`Self::init_fetch`] called on the
     ///   same archetype `row` belongs to.
     /// - `row` must be `<` that archetype's entity count.
-    unsafe fn fetch(fetch: &Self::Fetch, row: usize) -> Self::Item;
+    unsafe fn fetch(fetch: Self::Fetch, row: usize) -> Self::Item;
 }
 
 impl<'w, T: Component> WorldQuery<'w> for &'w T {
@@ -99,7 +108,7 @@ impl<'w, T: Component> WorldQuery<'w> for &'w T {
     // archetype and `row` is in bounds -- `fetch.add(row)` is therefore a
     // valid, initialized `T`.
     #[inline]
-    unsafe fn fetch(fetch: &Self::Fetch, row: usize) -> &'w T {
+    unsafe fn fetch(fetch: Self::Fetch, row: usize) -> &'w T {
         unsafe { &*fetch.add(row) }
     }
 }
@@ -142,7 +151,7 @@ impl<'w, T: Component> WorldQuery<'w> for &'w mut T {
     // SAFETY: caller guarantees `fetch` came from `init_fetch` on this
     // archetype and `row` is in bounds.
     #[inline]
-    unsafe fn fetch(fetch: &Self::Fetch, row: usize) -> &'w mut T {
+    unsafe fn fetch(fetch: Self::Fetch, row: usize) -> &'w mut T {
         unsafe { &mut *fetch.add(row) }
     }
 }
@@ -159,7 +168,7 @@ impl<'w> WorldQuery<'w> for () {
     #[inline]
     unsafe fn init_fetch(_arch: &'w Archetype) -> Self::Fetch {}
     #[inline]
-    unsafe fn fetch(_fetch: &Self::Fetch, _row: usize) -> Self::Item {}
+    unsafe fn fetch(_fetch: Self::Fetch, _row: usize) -> Self::Item {}
 }
 
 // ── Tuple conbinator macro (1 to 8 components) ──────────────────────────
@@ -189,7 +198,7 @@ macro_rules! impl_world_query_tuple {
             // $Q::Fetch for that same archetype, satisfying $Q::fetch's
             // contract.
             #[inline]
-            unsafe fn fetch(fetch: &Self::Fetch, row: usize) -> Self::Item {
+            unsafe fn fetch(fetch: Self::Fetch, row: usize) -> Self::Item {
                 #[allow(non_snake_case)]
                 let ($($Q,)+) = fetch;
                 unsafe { ($($Q::fetch($Q, row),)+) }
@@ -232,6 +241,15 @@ pub struct QueryIter<'w, Q: WorldQuery<'w>> {
     /// archetype, cached at the last archetype transition. `0` once
     /// iteration is exhausted (`arch_idx` has run past the end).
     current_len: usize,
+    /// Base pointer into the CURRENT matching archetype's `entities: Vec<Entity>`,
+    /// cached at the same transition as `current_len`/`fetch`. Without this,
+    /// every single row would re-index through `self.archetypes[arch_idx].entities`
+    /// -- two extra pointer hops (archetype slot, then that archetype's own
+    /// `entities` `Vec`'s data pointer) an entity's `Vec<T>` column data
+    /// doesn't pay after `Q::init_fetch`'s equivalent caching. `entities`
+    /// is the SAME kind of "archetype-level fact, not a per-row one" as a
+    /// query column's base pointer, so it gets the identical treatment.
+    entities: *const Entity,
     /// `Q`'s resolved per-archetype fetch state (see [`WorldQuery::Fetch`]),
     /// cached at the same transition as `current_len`. `None` only before
     /// the first archetype is found and after iteration is exhausted --
@@ -248,6 +266,7 @@ impl<'w, Q: WorldQuery<'w>> QueryIter<'w, Q> {
             arch_idx: 0,
             row: 0,
             current_len: 0,
+            entities: std::ptr::null(),
             fetch: None,
             _marker: PhantomData,
         };
@@ -258,9 +277,10 @@ impl<'w, Q: WorldQuery<'w>> QueryIter<'w, Q> {
     /// Scans forward from the current `arch_idx` (inclusive) for the next
     /// archetype that both matches `Q` and has at least one entity, and
     /// positions the iterator there (`row = 0`, `current_len` = its entity
-    /// count, `fetch` = `Q::init_fetch` resolved against it). If none
-    /// remain, leaves `arch_idx == archetypes.len()`, `current_len = 0`,
-    /// `fetch = None` — [`Iterator::next`]'s exhaustion check.
+    /// count, `entities` = its entity-list base pointer, `fetch` =
+    /// `Q::init_fetch` resolved against it). If none remain, leaves
+    /// `arch_idx == archetypes.len()`, `current_len = 0`, `fetch = None` —
+    /// [`Iterator::next`]'s exhaustion check.
     ///
     /// This is the ONLY place `Q::matches`/`Q::init_fetch` are ever called
     /// — once per archetype visited, never once per entity.
@@ -272,6 +292,7 @@ impl<'w, Q: WorldQuery<'w>> QueryIter<'w, Q> {
             if !arch.entities.is_empty() && Q::matches(arch) {
                 self.current_len = arch.entities.len();
                 self.row = 0;
+                self.entities = arch.entities.as_ptr();
                 // SAFETY: just verified `Q::matches(arch)` on this exact
                 // archetype, immediately above.
                 self.fetch = Some(unsafe { Q::init_fetch(arch) });
@@ -280,6 +301,7 @@ impl<'w, Q: WorldQuery<'w>> QueryIter<'w, Q> {
             self.arch_idx += 1;
         }
         self.current_len = 0;
+        self.entities = std::ptr::null();
         self.fetch = None;
     }
 }
@@ -301,17 +323,17 @@ impl<'w, Q: WorldQuery<'w>> Iterator for QueryIter<'w, Q> {
             }
         }
         // SAFETY: `advance_to_next_matching_archetype` only ever leaves
-        // `arch_idx` pointing at an archetype that matches Q, with
-        // `current_len` equal to its entity count -- `arch_idx` is
-        // in-bounds and `row < current_len <= arch.entities.len()`.
-        let arch = unsafe { self.archetypes.get_unchecked(self.arch_idx) };
-        let entity = unsafe { *arch.entities.get_unchecked(self.row) };
+        // `self.entities` pointing at the CURRENT archetype's `entities`
+        // backing storage, with `current_len` equal to its length -- `row`
+        // is in bounds (checked above), so `entities.add(row)` is a valid,
+        // initialized `Entity`.
+        let entity = unsafe { *self.entities.add(self.row) };
         // SAFETY: `self.fetch` is `Some` whenever `current_len > 0` (the
         // invariant `advance_to_next_matching_archetype` maintains, and we
         // already returned `None` above if it were 0), and it was computed
         // via `Q::init_fetch` on THIS exact archetype at the last
         // transition. `row` is in bounds, checked above.
-        let fetch = unsafe { self.fetch.as_ref().unwrap_unchecked() };
+        let fetch = unsafe { self.fetch.unwrap_unchecked() };
         // SAFETY: `fetch` came from `Q::init_fetch` on this archetype (see
         // above) and `row` is in bounds.
         let item = unsafe { Q::fetch(fetch, self.row) };
@@ -326,6 +348,96 @@ impl<'w, Q: WorldQuery<'w>> Iterator for QueryIter<'w, Q> {
         // `Q::matches` -- exactly the per-call cost this iterator now
         // avoids -- so the upper bound stays `None` rather than paying for
         // it unconditionally on every `size_hint()` call.
+        (self.current_len.saturating_sub(self.row), None)
+    }
+}
+
+// ── QueryItemsIter ──────────────────────────────────────────────────────
+
+/// Like [`QueryIter`] but yields `Q::Item` alone, without the matching
+/// [`Entity`]. Created by [`World::query_items`].
+///
+/// Exists because [`QueryIter`] unconditionally reads and returns an
+/// `Entity` per row even when the caller has no use for it (most query
+/// loops care only about component data) -- that read is provably
+/// dead-code-eliminable when the caller drops it (as in `for (pos, vel) in
+/// ...`, where the tuple's first element is never bound), and optimizing
+/// compilers generally do eliminate it, but this type removes the field
+/// and the branch entirely rather than relying on that: one less pointer
+/// carried in `QueryIter`'s state, one less load on the hot per-row path,
+/// for the (common) case the caller only wants component data. Same
+/// per-archetype `Q::matches`/`Q::init_fetch` caching as `QueryIter` --
+/// this is purely "drop the entity plumbing," not a different iteration
+/// strategy.
+pub struct QueryItemsIter<'w, Q: WorldQuery<'w>> {
+    archetypes: &'w [crate::archetype::Archetype],
+    arch_idx: usize,
+    row: usize,
+    current_len: usize,
+    fetch: Option<Q::Fetch>,
+    _marker: PhantomData<Q>,
+}
+
+impl<'w, Q: WorldQuery<'w>> QueryItemsIter<'w, Q> {
+    pub(crate) fn new(world: &'w World) -> Self {
+        let mut iter = Self {
+            archetypes: &world.archetypes,
+            arch_idx: 0,
+            row: 0,
+            current_len: 0,
+            fetch: None,
+            _marker: PhantomData,
+        };
+        iter.advance_to_next_matching_archetype();
+        iter
+    }
+
+    /// Identical logic to [`QueryIter::advance_to_next_matching_archetype`]
+    /// minus the `entities` base-pointer bookkeeping (this iterator never
+    /// reads it).
+    #[inline]
+    fn advance_to_next_matching_archetype(&mut self) {
+        while self.arch_idx < self.archetypes.len() {
+            // SAFETY: bounds-checked by the loop condition.
+            let arch = unsafe { self.archetypes.get_unchecked(self.arch_idx) };
+            if !arch.entities.is_empty() && Q::matches(arch) {
+                self.current_len = arch.entities.len();
+                self.row = 0;
+                // SAFETY: just verified `Q::matches(arch)` on this exact
+                // archetype, immediately above.
+                self.fetch = Some(unsafe { Q::init_fetch(arch) });
+                return;
+            }
+            self.arch_idx += 1;
+        }
+        self.current_len = 0;
+        self.fetch = None;
+    }
+}
+
+impl<'w, Q: WorldQuery<'w>> Iterator for QueryItemsIter<'w, Q> {
+    type Item = Q::Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row >= self.current_len {
+            self.arch_idx += 1;
+            self.advance_to_next_matching_archetype();
+            if self.current_len == 0 {
+                return None;
+            }
+        }
+        // SAFETY: identical invariant to `QueryIter::next` -- `self.fetch`
+        // is `Some` whenever `current_len > 0`, computed via `Q::init_fetch`
+        // on this exact archetype at the last transition, and `row` is in
+        // bounds (checked above).
+        let fetch = unsafe { self.fetch.unwrap_unchecked() };
+        let item = unsafe { Q::fetch(fetch, self.row) };
+        self.row += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
         (self.current_len.saturating_sub(self.row), None)
     }
 }
@@ -350,5 +462,26 @@ impl World {
     /// all entities without fetching any component data.
     pub fn query<'w, Q: WorldQuery<'w>>(&'w self) -> QueryIter<'w, Q> {
         QueryIter::new(self)
+    }
+
+    /// Like [`query`](Self::query), but yields `Q::Item` alone instead of
+    /// `(Entity, Q::Item)` -- for the common case a query loop never
+    /// touches the entity handle. See [`QueryItemsIter`]'s doc for why this
+    /// is a distinct, slightly cheaper iterator rather than `query(..).map(|(_, item)| item)`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pulsar_scenedb::{World, WorldQuery};
+    ///
+    /// # struct Pos(f32, f32);
+    /// # struct Vel(f32, f32);
+    /// # let mut world = World::new();
+    /// for (pos, vel) in world.query_items::<(&Pos, &Vel)>() {
+    ///     // ...
+    /// }
+    /// ```
+    pub fn query_items<'w, Q: WorldQuery<'w>>(&'w self) -> QueryItemsIter<'w, Q> {
+        QueryItemsIter::new(self)
     }
 }

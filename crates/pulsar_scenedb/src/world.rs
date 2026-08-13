@@ -325,7 +325,7 @@ impl World {
         self.spawn_inner(Some(tracker))
     }
 
-    fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
+    pub(crate) fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
         let (idx, gen) = if let Some(idx) = self.free_slots.pop() {
             let slot = &mut self.entity_slots[idx as usize];
             slot.generation = slot.generation.wrapping_add(1);
@@ -894,6 +894,104 @@ impl World {
         self.archetypes.push(Archetype::new(id, key.clone()));
         self.archetype_index.insert(key, id);
         id
+    }
+
+    // â”€â”€ Bundle support â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Edge-cached "insert `T`" archetype-graph step -- the exact same
+    /// cache-or-rebuild-key logic `insert_inner` uses for a single
+    /// component, extracted so [`crate::bundle::Bundle`] impls can chain it
+    /// once per component without duplicating the branch. Each call after
+    /// the first for a given `(from, T)` pair is two `Vec` index reads, no
+    /// allocation, no hashing -- see [`Archetype::add_edges`]'s doc for why.
+    pub(crate) fn step_add_edge<T: Component>(&mut self, from: ArchetypeId) -> ArchetypeId {
+        let cid = crate::component::component_id::<T>();
+        match self.archetypes[from.0 as usize].add_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[from.0 as usize].key.with::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[from.0 as usize].set_add_edge(cid, id);
+                id
+            }
+        }
+    }
+
+    /// Push one [`crate::bundle::Bundle`] component's value as a BRAND NEW
+    /// column entry onto `arch_id`, at the row `entity` already occupies
+    /// there (the caller -- [`World::spawn_bundle_inner`] -- pushes `entity`
+    /// onto `arch_id.entities` before calling this for any of the bundle's
+    /// components, so every column's `Vec::push` here keeps that same row
+    /// index in sync across every column, exactly like `insert_inner`'s
+    /// "phase 1 migrate, phase 2 push new value" ordering does for a single
+    /// component).
+    ///
+    /// Ensures the destination column exists (creating an empty one on first
+    /// use, same as `insert_inner`), runs the identical GPU-mirror dispatch
+    /// and liveness-mirror bookkeeping `insert_inner` runs for a
+    /// new-component insert (`is_new_insert = true` unconditionally --
+    /// every component in a bundle handed to a freshly spawned entity is,
+    /// by construction, new to it), then records the change in `tracker`
+    /// if present.
+    pub(crate) fn push_new_component<T: Component>(
+        &mut self,
+        arch_id: ArchetypeId,
+        entity: Entity,
+        value: T,
+        tracker: &mut Option<&mut ChangeTracker>,
+    ) {
+        let cid = crate::component::component_id::<T>();
+
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+                mirror.generations().note_gpu_bearing_insert(entity.index(), entity.generation());
+                dispatch(mirror, entity.index(), &value as *const T as *const (), true);
+            }
+        }
+
+        let arch = &mut self.archetypes[arch_id.0 as usize];
+        let idx = cid.0 as usize;
+        if arch.columns.get(idx).and_then(|c| c.as_ref()).is_none() {
+            Self::set_column(arch, cid, Box::new(Column::<T>::new()));
+        }
+        self.archetypes[arch_id.0 as usize].columns[idx]
+            .as_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .unwrap()
+            .data
+            .push(value);
+
+        if let Some(t) = tracker.as_deref_mut() {
+            t.record_component_change(entity, cid, 0, Vec::new());
+        }
+    }
+
+    /// Reserve capacity for `additional` more `T` values in `arch_id`'s
+    /// column, creating the (empty) column first if this archetype doesn't
+    /// have one yet. Used by [`crate::bundle::Bundle::reserve_columns`]
+    /// (via [`World::reserve_bundle`]) so a tight `spawn_bundle` loop over a
+    /// known entity count doesn't pay for repeated `Vec` capacity-doubling
+    /// on every column the bundle touches -- the same reason
+    /// [`World::reserve_entities`] exists for the empty archetype's own
+    /// entity list.
+    pub(crate) fn reserve_component_column<T: Component>(&mut self, arch_id: ArchetypeId, additional: u32) {
+        let cid = crate::component::component_id::<T>();
+        let arch = &mut self.archetypes[arch_id.0 as usize];
+        let idx = cid.0 as usize;
+        if arch.columns.get(idx).and_then(|c| c.as_ref()).is_none() {
+            Self::set_column(arch, cid, Box::new(Column::<T>::new()));
+        }
+        self.archetypes[arch_id.0 as usize].columns[idx]
+            .as_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .unwrap()
+            .data
+            .reserve(additional as usize);
     }
 
     // â”€â”€ Archetype migration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

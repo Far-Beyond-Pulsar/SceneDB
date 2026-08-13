@@ -65,6 +65,7 @@
 
 pub mod actor;
 pub mod archetype;
+pub mod bundle;
 pub mod cell;
 pub mod cell_type;
 pub mod component;
@@ -101,6 +102,7 @@ pub mod telemetry;
 
 pub use actor::{Actor, ActorRegistry};
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
+pub use bundle::Bundle;
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use component::{component_id, Component, ComponentId};
@@ -139,7 +141,7 @@ pub use page::{
     Column, ColumnDesc, GenericColumn, LayoutError, Page, PageLayout, Pod, PodColumn,
     DEFAULT_PAGE_CAPACITY, MAX_PAGE_CAPACITY, MAX_STRIDE_BYTES,
 };
-pub use query::{QueryIter, WorldQuery};
+pub use query::{QueryItemsIter, QueryIter, WorldQuery};
 pub use registry::{HandleRegistry, NULL_ROW};
 pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
 pub use schedule::Schedule;

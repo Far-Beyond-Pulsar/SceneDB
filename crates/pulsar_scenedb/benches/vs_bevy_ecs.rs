@@ -52,12 +52,9 @@ fn spawn_4_components(c: &mut Criterion) {
             b.iter(|| {
                 let mut world = World::new();
                 world.reserve_entities(n as u32);
+                world.reserve_bundle::<(Pos, Vel, Health, Tag)>(n as u32);
                 for _ in 0..n {
-                    let e = world.spawn();
-                    world.insert(e, Pos(1.0, 2.0, 3.0));
-                    world.insert(e, Vel(0.0, 0.0, 0.0));
-                    world.insert(e, Health(100));
-                    world.insert(e, Tag(0));
+                    world.spawn_bundle((Pos(1.0, 2.0, 3.0), Vel(0.0, 0.0, 0.0), Health(100), Tag(0)));
                 }
             });
         });
@@ -144,7 +141,7 @@ fn query_two_components(c: &mut Criterion) {
             }
             b.iter(|| {
                 let mut sum = 0.0f32;
-                for (_e, (pos, vel)) in world.query::<(&Pos, &Vel)>() {
+                for (pos, vel) in world.query_items::<(&Pos, &Vel)>() {
                     sum += pos.0 + vel.0;
                 }
                 std::hint::black_box(sum);
@@ -190,7 +187,7 @@ fn query_four_components(c: &mut Criterion) {
         }
         b.iter(|| {
             let mut sum = 0.0f32;
-            for (_e, (pos, vel, hp, tag)) in world.query::<(&Pos, &Vel, &Health, &Tag)>() {
+            for (pos, vel, hp, tag) in world.query_items::<(&Pos, &Vel, &Health, &Tag)>() {
                 sum += pos.0 + vel.0 + hp.0 as f32 + tag.0 as f32;
             }
             std::hint::black_box(sum);
