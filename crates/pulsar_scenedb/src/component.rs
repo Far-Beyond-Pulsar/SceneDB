@@ -165,6 +165,38 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
 
     /// Size in bytes of a single element in this column.
     fn element_size(&self) -> usize;
+
+    /// Alignment (bytes) of a single element in this column. Used by the
+    /// archetype-migration fast path ([`swap_remove_into`](Self::swap_remove_into)/
+    /// [`push_from`](Self::push_from)) to decide whether an element fits a
+    /// fixed-capacity inline scratch buffer without a heap allocation.
+    fn element_align(&self) -> usize;
+
+    /// Zero-allocation counterpart to [`swap_remove_erased`](Self::swap_remove_erased):
+    /// removes the element at `row` (swap-remove semantics) and moves its
+    /// bytes directly into `dst` via `ptr::write` — no `Box`, no heap
+    /// allocation. `dst` takes logical ownership of the moved value (its
+    /// destructor does NOT run as part of this call); the caller must
+    /// eventually move it out via [`push_from`](Self::push_from) (or
+    /// otherwise drop it in place), exactly once.
+    ///
+    /// # Safety
+    /// - `row` must be `< self.len()`.
+    /// - `dst` must be valid for writes of `self.element_size()` bytes and
+    ///   aligned to at least `self.element_align()`.
+    unsafe fn swap_remove_into(&mut self, row: usize, dst: *mut u8);
+
+    /// Zero-allocation counterpart to [`push_erased`](Self::push_erased):
+    /// reads `self.element_size()` bytes from `src` via `ptr::read` (taking
+    /// logical ownership — `src`'s bytes must not be read, written, or
+    /// dropped again after this call) and pushes the resulting value onto
+    /// this column.
+    ///
+    /// # Safety
+    /// - `src` must point at a valid, initialized, properly-aligned
+    ///   instance of this column's element type, readable for
+    ///   `self.element_size()` bytes.
+    unsafe fn push_from(&mut self, src: *const u8);
 }
 
 pub(crate) struct Column<T: Component> {
@@ -239,5 +271,33 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     fn element_size(&self) -> usize {
         std::mem::size_of::<T>()
+    }
+
+    fn element_align(&self) -> usize {
+        std::mem::align_of::<T>()
+    }
+
+    // SAFETY: row < self.data.len() (caller guarantees); dst is valid for
+    // size_of::<T>() writes, aligned to align_of::<T>() (caller guarantees).
+    unsafe fn swap_remove_into(&mut self, row: usize, dst: *mut u8) {
+        // SAFETY: caller guarantees row is in bounds. This is an ordinary
+        // safe Vec::swap_remove -- `val` is a fully-owned, on-the-stack `T`.
+        let val = self.data.swap_remove(row);
+        // SAFETY: caller guarantees `dst` is valid + aligned for a `T`.
+        // `ptr::write` moves `val`'s bytes into `dst` and does NOT run
+        // `val`'s destructor -- exactly the "dst now owns this value"
+        // handoff the trait method's contract documents.
+        unsafe { std::ptr::write(dst as *mut T, val) };
+    }
+
+    // SAFETY: src points at a valid, initialized, properly-aligned T
+    // (caller guarantees).
+    unsafe fn push_from(&mut self, src: *const u8) {
+        // SAFETY: caller guarantees `src` is a valid, readable, aligned
+        // `T`. `ptr::read` copies it out by value (bitwise move semantics
+        // -- `src`'s bytes must never be read/dropped again, which is
+        // exactly the trait method's documented caller obligation).
+        let val = unsafe { std::ptr::read(src as *const T) };
+        self.data.push(val);
     }
 }

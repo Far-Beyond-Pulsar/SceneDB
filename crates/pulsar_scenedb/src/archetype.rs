@@ -93,6 +93,29 @@ pub struct Archetype {
     /// filtering during queries.  Bit `i` is set if component ID `i+1`
     /// is present.
     pub mask: u64,
+    /// Archetype-graph edges (Bevy/Flecs-style transition cache): "insert
+    /// component `cid` onto an entity in THIS archetype" migrates it to
+    /// `add_edges[cid.0 as usize]`, once known. Dense `Vec`, not a
+    /// `HashMap` -- same reasoning as `columns`/`CellGpuState::dirty_columns`
+    /// elsewhere in this crate (see that type's doc): a `Vec` index replaces
+    /// hashing on every single migration, which is the hottest repeated
+    /// operation an archetype-based ECS has. Populated lazily by
+    /// `World::insert_inner` the first time a given (archetype, component)
+    /// transition is taken; permanent thereafter (archetypes, once created,
+    /// are never removed or renumbered, so a cached edge never goes stale).
+    ///
+    /// Before this cache existed, EVERY `insert`/`remove` call on an
+    /// existing entity rebuilt the destination `ArchetypeKey` from scratch
+    /// (`ArchetypeKey::with`/`without`, a fresh heap-allocated `Vec<ComponentId>`
+    /// copy of the ENTIRE current key) and then hashed that whole `Vec` to
+    /// look it up in `World::archetype_index` -- for a transition already
+    /// taken thousands of times before (the common case: repeatedly
+    /// tagging/untagging an entity, e.g. a physics "Grounded" marker toggled
+    /// every frame). This cache turns a repeated transition into two `Vec`
+    /// index reads, zero allocation, zero hashing.
+    pub(crate) add_edges: Vec<Option<ArchetypeId>>,
+    /// "Remove component `cid`" counterpart to `add_edges` — see its doc.
+    pub(crate) remove_edges: Vec<Option<ArchetypeId>>,
 }
 
 impl Archetype {
@@ -104,6 +127,8 @@ impl Archetype {
             columns: Vec::new(),
             entities: Vec::new(),
             mask: 0,
+            add_edges: Vec::new(),
+            remove_edges: Vec::new(),
         }
     }
 
@@ -122,7 +147,50 @@ impl Archetype {
             columns: Vec::new(),
             entities: Vec::new(),
             mask,
+            add_edges: Vec::new(),
+            remove_edges: Vec::new(),
         }
+    }
+
+    /// Cached "insert `cid`" transition target, if this exact transition has
+    /// been taken from this archetype before. `None` on a cold edge (never
+    /// taken, or `cid` is past the current edge table's high-water mark) --
+    /// the caller falls back to the full key-rebuild path and populates the
+    /// edge via [`Self::set_add_edge`] for next time.
+    #[inline]
+    pub(crate) fn add_edge(&self, cid: ComponentId) -> Option<ArchetypeId> {
+        self.add_edges.get(cid.0 as usize).copied().flatten()
+    }
+
+    /// Records that inserting `cid` onto an entity in this archetype
+    /// migrates it to `target` — grows the dense edge table on demand
+    /// (`ComponentId`s are allocated from 1 and dense, so this is a rare,
+    /// small, amortized cost, not a per-migration one).
+    #[inline]
+    pub(crate) fn set_add_edge(&mut self, cid: ComponentId, target: ArchetypeId) {
+        let idx = cid.0 as usize;
+        if idx >= self.add_edges.len() {
+            self.add_edges.resize(idx + 1, None);
+        }
+        self.add_edges[idx] = Some(target);
+    }
+
+    /// Cached "remove `cid`" transition target — see [`Self::add_edge`]'s
+    /// doc for the shared rationale.
+    #[inline]
+    pub(crate) fn remove_edge(&self, cid: ComponentId) -> Option<ArchetypeId> {
+        self.remove_edges.get(cid.0 as usize).copied().flatten()
+    }
+
+    /// Records a "remove `cid`" transition target — see
+    /// [`Self::set_add_edge`]'s doc for the shared rationale.
+    #[inline]
+    pub(crate) fn set_remove_edge(&mut self, cid: ComponentId, target: ArchetypeId) {
+        let idx = cid.0 as usize;
+        if idx >= self.remove_edges.len() {
+            self.remove_edges.resize(idx + 1, None);
+        }
+        self.remove_edges[idx] = Some(target);
     }
 
     /// Number of entities in this archetype.

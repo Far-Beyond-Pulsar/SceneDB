@@ -36,7 +36,10 @@
 //! the GPU-side continuation of the same "grow like a Vec, then go quiet"
 //! discipline the §8.1 alloc gates already hold `HarvestStaging` to.
 
-use super::{EngineGpuContext, HarvestStaging, MeshClass};
+use super::{
+    BufferAccess, BufferKey, BufferRegistrationError, EngineGpuContext, GpuBufferRegistry,
+    HarvestStaging, MeshClass, MirrorMode,
+};
 
 /// Owns one class's per-view token buffer + its positionally-aligned
 /// expected-generation buffer (design §3.1): both `STORAGE | COPY_DST |
@@ -63,6 +66,13 @@ pub struct ViewTokenBuffers {
     /// convention this crate's other upload counters already follow).
     upload_count: u64,
     label: String,
+    /// Bumped by exactly one on every [`Self::ensure_capacity`] reallocation
+    /// — the same "epoch" concept `DynamicGpuBuffer`/`GrowableSceneBuffer`
+    /// already expose, added here so [`Self::register_keys`] can sync a
+    /// registered [`GpuBufferRegistry`] entry idempotently (bump the
+    /// registry's epoch only when a real reallocation happened, not on
+    /// every call).
+    growth_epoch: u64,
 }
 
 impl ViewTokenBuffers {
@@ -85,6 +95,7 @@ impl ViewTokenBuffers {
             count: 0,
             upload_count: 0,
             label: label.to_string(),
+            growth_epoch: 0,
         }
     }
 
@@ -117,6 +128,7 @@ impl ViewTokenBuffers {
         self.tokens = tokens;
         self.expected_gens = expected_gens;
         self.capacity = grown;
+        self.growth_epoch = self.growth_epoch.wrapping_add(1);
     }
 
     /// Upload `class`'s token + expected-gen columns from `staging` (§3.1's
@@ -184,5 +196,62 @@ impl ViewTokenBuffers {
     #[doc(hidden)]
     pub fn upload_count(&self) -> u64 {
         self.upload_count
+    }
+
+    /// Bump count since construction, incremented exactly once per
+    /// [`Self::ensure_capacity`] reallocation (i.e. per grow triggered by
+    /// [`Self::upload`]). Compare against a previously cached value to know
+    /// whether [`Self::tokens_buffer`]/[`Self::expected_gens_buffer`]
+    /// changed identity since the last observation.
+    pub fn epoch(&self) -> u64 {
+        self.growth_epoch
+    }
+
+    /// Issue #41 Tier-2 collapse ("grid/view-token... buffers reachable by
+    /// key through one registry"): register (first call) or idempotently
+    /// re-sync (every later call) this instance's token/expected-gens
+    /// buffers under caller-chosen keys in `registry`.
+    ///
+    /// Per-view/per-class instances have no single well-known key the way
+    /// the singleton asset stores in `gpu/assets.rs` do (module doc: this
+    /// type is deliberately per-`(view, class)` scratch, constructed
+    /// per-instance with a caller-supplied `label`), so — unlike
+    /// `MeshRegistry::register_key` etc. — the caller supplies both keys
+    /// (e.g. `BufferKey::of("builtin_view_token_traditional")` for a fixed
+    /// small set of well-known views/classes the integrator names ahead of
+    /// time).
+    ///
+    /// Safe and cheap to call every frame after [`Self::upload`]: the first
+    /// call registers; every later call is a `registry.sync` (idempotent,
+    /// no-op unless [`Self::epoch`] actually advanced since the last sync —
+    /// see [`GpuBufferRegistry::sync`]'s doc), so a caller that always calls
+    /// this right after `upload` keeps the registry's view current without
+    /// spuriously bumping the registry's own epoch on frames where nothing
+    /// grew.
+    pub fn register_keys(
+        &self,
+        registry: &GpuBufferRegistry,
+        tokens_key: BufferKey,
+        expected_gens_key: BufferKey,
+    ) -> Result<(), BufferRegistrationError> {
+        // `register_row`'s freshly-created entry always starts at epoch 0,
+        // regardless of `self.growth_epoch`'s value at first-registration
+        // time (a caller may register after this instance already grew a
+        // few times). Always following registration with a `sync` call
+        // brings the registry's epoch up to `self.growth_epoch` in that
+        // case too, so a SUBSEQUENT same-growth_epoch call is the no-op
+        // `sync` is documented to be — without this, the first post-
+        // registration `sync` would spuriously look like a "growth" (0 !=
+        // self.growth_epoch) even when nothing grew between the two calls.
+        if !registry.contains_key(tokens_key) {
+            registry.register_row::<u32>(tokens_key, self.tokens.clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)?;
+        }
+        registry.sync(tokens_key, self.tokens.clone(), self.growth_epoch);
+
+        if !registry.contains_key(expected_gens_key) {
+            registry.register_row::<u32>(expected_gens_key, self.expected_gens.clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)?;
+        }
+        registry.sync(expected_gens_key, self.expected_gens.clone(), self.growth_epoch);
+        Ok(())
     }
 }

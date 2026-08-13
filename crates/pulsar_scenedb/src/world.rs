@@ -3,6 +3,53 @@ use crate::component::{Column, Component, ComponentId, ErasedColumn};
 use crate::entity::{Entity, EntitySlot};
 use crate::replication::ChangeTracker;
 use ahash::AHashMap;
+use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
+
+/// Fixed-capacity, over-aligned scratch buffer for a single erased-component
+/// move (swap-remove -> push) during archetype migration
+/// ([`World::move_column_row`]), without a heap allocation.
+///
+/// `CAP = 128` bytes at `ALIGN = 16` covers the overwhelming majority of
+/// real ECS components -- a 4x4 `f32` transform matrix is 64 bytes at
+/// 4-byte alignment; ordinary game components (positions, velocities,
+/// health, tags, small structs) are typically well under this. SIMD-shaped
+/// types (`[f32; 4]`, etc.) never exceed 16-byte natural alignment on any
+/// target this crate supports. A component whose size or alignment
+/// requirement genuinely exceeds these bounds is rare, and
+/// `move_column_row` falls back to the original heap-allocating path for
+/// it -- correctness holds either way; only the common case skips the
+/// allocator.
+#[repr(align(16))]
+struct MoveScratch {
+    bytes: [MaybeUninit<u8>; Self::CAP],
+}
+
+impl MoveScratch {
+    const CAP: usize = 128;
+    const ALIGN: usize = 16;
+
+    #[inline]
+    fn new() -> Self {
+        // SAFETY-adjacent note: `MaybeUninit<u8>` needs no initialization
+        // (it is explicitly "possibly uninitialized"), so leaving every
+        // byte uninitialized here is not itself unsafe -- only reading the
+        // bytes before they've been written (which `move_column_row` never
+        // does; it always writes via `swap_remove_into` before reading via
+        // `push_from`) would be.
+        Self { bytes: [MaybeUninit::uninit(); Self::CAP] }
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr() as *mut u8
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr() as *const u8
+    }
+}
 
 /// The central ECS store: owns all entities, their component data, and the
 /// archetype graph.
@@ -36,6 +83,74 @@ pub struct World {
     /// `--no-default-features` never depends on `wgpu`).
     #[cfg(feature = "gpu")]
     gpu_mirror: Option<crate::gpu::GpuMirrorHandle>,
+}
+
+/// A mutable borrow of component `T` on some entity, returned by
+/// [`World::get_mut`]. `Deref`/`DerefMut` to `T`, so every existing call
+/// site (`*guard = value`, `guard.field += 1`, method calls) keeps working
+/// unchanged — the only observable difference from the old `&mut T` is that
+/// dropping this guard, not the mutation itself, is when a `#[gpu]`-bearing
+/// component's fields reach the GPU mirror (see the struct's field doc).
+///
+/// This exists to close a real gap: before this type, `World::insert` had a
+/// GPU dispatch hook but `get_mut` had none at all — mutating a `#[gpu]`
+/// field through `get_mut` silently never reached the GPU, for EITHER
+/// `MirrorMode`, not just `Once`. `Mut` gives `get_mut` the same hook
+/// `insert_inner` already has, reusing the identical link-time dispatch
+/// registry (`crate::gpu::world_mirror::dispatch_for`) — no new registration
+/// mechanism.
+pub struct Mut<'a, T> {
+    value: &'a mut T,
+    /// Precomputed at [`World::get_mut`] time (not resolved again in
+    /// [`Drop::drop`]): `None` whenever the `gpu` feature is off, no mirror
+    /// is attached, or `T` has no `#[gpu]` fields — the exact same
+    /// short-circuit `insert_inner` already applies, so a `get_mut` on a
+    /// plain (non-GPU) component costs one `Option`/`HashMap`-miss check on
+    /// construction and nothing at all on drop.
+    #[cfg(feature = "gpu")]
+    gpu_hook: Option<GpuMutHook>,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuMutHook {
+    mirror: crate::gpu::GpuMirrorHandle,
+    row: u32,
+    dispatch: crate::gpu::world_mirror::DispatchFn,
+}
+
+impl<'a, T> Deref for Mut<'a, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<'a, T> DerefMut for Mut<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<'a, T> Drop for Mut<'a, T> {
+    fn drop(&mut self) {
+        if let Some(hook) = &self.gpu_hook {
+            // `is_new_insert = true`: from `write_gpu_columns_at_row`'s
+            // perspective this bool means "write `Once` fields too, don't
+            // skip them" — exactly right here. `Once`'s "never re-write
+            // after the first insert" pinning is specifically an
+            // INSERT-path behavior (a routine re-insert of the same
+            // component shouldn't silently re-upload static data); an
+            // explicit `get_mut` mutation is, by construction, the caller
+            // deliberately changing the value, so `Once` fields re-upload
+            // here exactly like `DirtyTracked` ones do (see the module doc
+            // on `MirrorMode::Once` / `GpuUploadSource` for the full
+            // contract this is the write-side half of).
+            (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+        }
+    }
 }
 
 impl World {
@@ -210,7 +325,7 @@ impl World {
         self.spawn_inner(Some(tracker))
     }
 
-    fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
+    pub(crate) fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
         let (idx, gen) = if let Some(idx) = self.free_slots.pop() {
             let slot = &mut self.entity_slots[idx as usize];
             slot.generation = slot.generation.wrapping_add(1);
@@ -450,9 +565,23 @@ impl World {
             return;
         }
 
-        // Build the destination archetype key and ensure it exists.
-        let new_key = self.archetypes[old_arch_id.0 as usize].key.with::<T>();
-        let new_arch_id = self.get_or_create_archetype(new_key);
+        // Archetype-graph edge cache (see `Archetype::add_edges`'s doc): a
+        // transition already taken before is two Vec index reads, zero
+        // allocation, zero hashing -- the common case for any entity that
+        // repeatedly gains/loses the same component shape (tag toggling,
+        // pooled respawn, etc). Only a never-before-seen (old_arch_id, cid)
+        // pair pays for rebuilding the key and hashing it into
+        // `archetype_index`, and that cost is paid exactly once per pair,
+        // ever.
+        let new_arch_id = match self.archetypes[old_arch_id.0 as usize].add_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.with::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[old_arch_id.0 as usize].set_add_edge(cid, id);
+                id
+            }
+        };
 
         // Ensure Column<T> exists in the destination (may be empty).
         let new_arch = &mut self.archetypes[new_arch_id.0 as usize];
@@ -521,20 +650,34 @@ impl World {
             return None;
         }
 
-        // Pull the value out of the column.
-        let removed_ptr = unsafe {
-            Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                .unwrap()
-                .swap_remove_erased(old_row)
-        };
-        // SAFETY: we know the concrete type from the generic.
-        let removed_val = unsafe { *Box::from_raw(removed_ptr as *mut T) };
+        // Pull the value out of the column. `remove_inner<T>` already knows
+        // the concrete type -- unlike `migrate_row`'s type-erased column
+        // carry-over (which genuinely doesn't know the OTHER components'
+        // types at compile time), there is no reason to route the value
+        // being returned through the erased `swap_remove_erased`/
+        // `Box::from_raw` path at all. That path heap-allocates a `Box`
+        // just to hand back a type-erased pointer this call immediately
+        // downcasts and moves out of anyway -- a wasted allocator round
+        // trip for every single `World::remove` call. A direct, safe,
+        // typed `Vec::swap_remove` on the concrete `Column<T>` is both
+        // simpler and allocation-free.
+        let removed_val = self.archetypes[old_arch_id.0 as usize]
+            .column_mut::<T>()
+            .data
+            .swap_remove(old_row);
 
-        // Build the destination key WITHOUT this component.
-        let new_key = self.archetypes[old_arch_id.0 as usize]
-            .key
-            .without::<T>();
-        let new_arch_id = self.get_or_create_archetype(new_key);
+        // Archetype-graph edge cache -- see `insert_inner`'s identical use
+        // of `add_edge`/`Archetype::add_edges`'s doc for the shared
+        // rationale.
+        let new_arch_id = match self.archetypes[old_arch_id.0 as usize].remove_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.without::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[old_arch_id.0 as usize].set_remove_edge(cid, id);
+                id
+            }
+        };
 
         // Migrate everything except the removed component.
         // migrate_row_skip pushes the entity first, migrates all columns
@@ -564,9 +707,16 @@ impl World {
         })
     }
 
-    /// Returns a mutable reference to component `T` on `entity`, if present.
+    /// Returns a mutable borrow of component `T` on `entity`, if present.
+    ///
+    /// The returned [`Mut<T>`] derefs to `&mut T` exactly like the old raw
+    /// `&mut T` this used to return — every ordinary call site keeps working
+    /// unchanged. The difference is what happens when it drops: if `T` has
+    /// `#[gpu]` fields and a mirror is attached, the mutated value is written
+    /// through to the GPU mirror then, the same way `World::insert` already
+    /// does on every insert. See [`Mut`]'s doc for why this exists.
     #[inline]
-    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<Mut<'_, T>> {
         if !self.is_alive(entity) {
             return None;
         }
@@ -575,10 +725,25 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
-        Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
+        let value = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
             c.as_any_mut()
                 .downcast_mut::<Column<T>>()
                 .map(|col| &mut col.data[row])
+        })?;
+
+        #[cfg(feature = "gpu")]
+        let gpu_hook = self.gpu_mirror.as_ref().and_then(|mirror| {
+            crate::gpu::world_mirror::dispatch_for(cid).map(|dispatch| GpuMutHook {
+                mirror: mirror.clone(),
+                row: entity.index(),
+                dispatch,
+            })
+        });
+
+        Some(Mut {
+            value,
+            #[cfg(feature = "gpu")]
+            gpu_hook,
         })
     }
 
@@ -731,7 +896,181 @@ impl World {
         id
     }
 
+    // â”€â”€ Bundle support â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Edge-cached "insert `T`" archetype-graph step -- the exact same
+    /// cache-or-rebuild-key logic `insert_inner` uses for a single
+    /// component, extracted so [`crate::bundle::Bundle`] impls can chain it
+    /// once per component without duplicating the branch. Each call after
+    /// the first for a given `(from, T)` pair is two `Vec` index reads, no
+    /// allocation, no hashing -- see [`Archetype::add_edges`]'s doc for why.
+    pub(crate) fn step_add_edge<T: Component>(&mut self, from: ArchetypeId) -> ArchetypeId {
+        let cid = crate::component::component_id::<T>();
+        match self.archetypes[from.0 as usize].add_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[from.0 as usize].key.with::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[from.0 as usize].set_add_edge(cid, id);
+                id
+            }
+        }
+    }
+
+    /// Push one [`crate::bundle::Bundle`] component's value as a BRAND NEW
+    /// column entry onto `arch_id`, at the row `entity` already occupies
+    /// there (the caller -- [`World::spawn_bundle_inner`] -- pushes `entity`
+    /// onto `arch_id.entities` before calling this for any of the bundle's
+    /// components, so every column's `Vec::push` here keeps that same row
+    /// index in sync across every column, exactly like `insert_inner`'s
+    /// "phase 1 migrate, phase 2 push new value" ordering does for a single
+    /// component).
+    ///
+    /// Ensures the destination column exists (creating an empty one on first
+    /// use, same as `insert_inner`), runs the identical GPU-mirror dispatch
+    /// and liveness-mirror bookkeeping `insert_inner` runs for a
+    /// new-component insert (`is_new_insert = true` unconditionally --
+    /// every component in a bundle handed to a freshly spawned entity is,
+    /// by construction, new to it), then records the change in `tracker`
+    /// if present.
+    pub(crate) fn push_new_component<T: Component>(
+        &mut self,
+        arch_id: ArchetypeId,
+        entity: Entity,
+        value: T,
+        tracker: &mut Option<&mut ChangeTracker>,
+    ) {
+        let cid = crate::component::component_id::<T>();
+
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+                mirror.generations().note_gpu_bearing_insert(entity.index(), entity.generation());
+                dispatch(mirror, entity.index(), &value as *const T as *const (), true);
+            }
+        }
+
+        let arch = &mut self.archetypes[arch_id.0 as usize];
+        let idx = cid.0 as usize;
+        if arch.columns.get(idx).and_then(|c| c.as_ref()).is_none() {
+            Self::set_column(arch, cid, Box::new(Column::<T>::new()));
+        }
+        self.archetypes[arch_id.0 as usize].columns[idx]
+            .as_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .unwrap()
+            .data
+            .push(value);
+
+        if let Some(t) = tracker.as_deref_mut() {
+            t.record_component_change(entity, cid, 0, Vec::new());
+        }
+    }
+
+    /// Reserve capacity for `additional` more `T` values in `arch_id`'s
+    /// column, creating the (empty) column first if this archetype doesn't
+    /// have one yet. Used by [`crate::bundle::Bundle::reserve_columns`]
+    /// (via [`World::reserve_bundle`]) so a tight `spawn_bundle` loop over a
+    /// known entity count doesn't pay for repeated `Vec` capacity-doubling
+    /// on every column the bundle touches -- the same reason
+    /// [`World::reserve_entities`] exists for the empty archetype's own
+    /// entity list.
+    pub(crate) fn reserve_component_column<T: Component>(&mut self, arch_id: ArchetypeId, additional: u32) {
+        let cid = crate::component::component_id::<T>();
+        let arch = &mut self.archetypes[arch_id.0 as usize];
+        let idx = cid.0 as usize;
+        if arch.columns.get(idx).and_then(|c| c.as_ref()).is_none() {
+            Self::set_column(arch, cid, Box::new(Column::<T>::new()));
+        }
+        self.archetypes[arch_id.0 as usize].columns[idx]
+            .as_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .unwrap()
+            .data
+            .reserve(additional as usize);
+    }
+
     // â”€â”€ Archetype migration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Moves one column's element at `old_row` in `old_arch_id` into a
+    /// (possibly newly-created) column of the same `cid` in `new_arch_id`.
+    /// Shared by [`Self::migrate_row`]/[`Self::migrate_row_skip`].
+    ///
+    /// Uses the zero-allocation [`ErasedColumn::swap_remove_into`]/
+    /// [`ErasedColumn::push_from`] path (through a stack-allocated
+    /// [`MoveScratch`]) whenever the element fits it -- true for the
+    /// overwhelming majority of real components (anything up to 128 bytes
+    /// at up to 16-byte alignment; a 4x4 `[f32; 16]` transform matrix is
+    /// exactly 64 bytes at 4-byte alignment, well inside it). Before this,
+    /// EVERY column moved during EVERY migration went through
+    /// [`ErasedColumn::swap_remove_erased`]/[`ErasedColumn::push_erased`] --
+    /// a `Box::new` heap allocation on the way out and a matching
+    /// deallocation on the way in, for every single component on every
+    /// single entity that migrates. An entity with N components paid for
+    /// 2N allocator round trips on every `insert`/`remove` that changed its
+    /// archetype. Only a component whose size/alignment genuinely exceeds
+    /// the inline scratch capacity (rare) still pays that cost, via the
+    /// original path kept as a correctness fallback.
+    #[inline]
+    fn move_column_row(&mut self, old_arch_id: ArchetypeId, old_row: usize, new_arch_id: ArchetypeId, cid: ComponentId) {
+        if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
+            let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
+                .unwrap()
+                .new_empty();
+            Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
+        }
+
+        let (elem_size, elem_align) = {
+            let src = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid).unwrap();
+            (src.element_size(), src.element_align())
+        };
+
+        if elem_size <= MoveScratch::CAP && elem_align <= MoveScratch::ALIGN {
+            let mut scratch = MoveScratch::new();
+            // SAFETY: `scratch` is `MoveScratch::CAP` bytes, `repr(align(16))`
+            // (>= `MoveScratch::ALIGN`), and the check above confirms this
+            // column's element fits both bounds -- `swap_remove_into`'s
+            // safety contract (valid for writes, sufficiently aligned)
+            // holds. `old_row` is in bounds because the caller only ever
+            // reaches here for a real occupied row of `old_arch_id`.
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .swap_remove_into(old_row, scratch.as_mut_ptr());
+            }
+            // SAFETY: `scratch` now holds a valid, initialized, properly
+            // aligned instance of this column's element type -- written by
+            // `swap_remove_into` immediately above, with no intervening use
+            // of `scratch`. `push_from` is called exactly once per
+            // `swap_remove_into` on this path, upholding the "logical
+            // ownership handoff, exactly once" contract both methods
+            // document -- no double-move, no leak.
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .push_from(scratch.as_ptr());
+            }
+        } else {
+            // Fallback: an element too large or too strictly aligned for
+            // the inline scratch buffer (rare) -- the original Box-based
+            // path. Still fully correct, just not allocation-free.
+            let ptr = unsafe {
+                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .swap_remove_erased(old_row)
+            };
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .push_erased(ptr);
+            }
+        }
+    }
+
 
     /// Move the entity and all component data from `old_arch_id`/`old_row`
     /// into `new_arch_id`.
@@ -763,7 +1102,10 @@ impl World {
             .push(entity);
 
         // Phase 2: broadcast each source column into the destination using
-        // the pre-computed `active_cids` slice (no heap allocation).
+        // the pre-computed `active_cids` slice (no heap allocation for the
+        // slice itself, and -- via `move_column_row`'s inline scratch path
+        // -- none for the moved element's bytes either, for the
+        // overwhelming majority of component types).
         let n = self.archetypes[old_arch_id.0 as usize].active_cids.len();
         for i in 0..n {
             let cid = {
@@ -771,22 +1113,7 @@ impl World {
                 let src = &self.archetypes[old_arch_id.0 as usize];
                 src.active_cids[i]
             };
-            let ptr = unsafe {
-                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .swap_remove_erased(old_row)
-            };
-            if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
-                let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .new_empty();
-                Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
-            }
-            unsafe {
-                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .push_erased(ptr);
-            }
+            self.move_column_row(old_arch_id, old_row, new_arch_id, cid);
         }
 
         // Phase 3: remove entity from old archetype; fix swapped-in slot.
@@ -830,7 +1157,9 @@ impl World {
             .entities
             .push(entity);
 
-        // Phase 2: migrate all columns except `skip_cid`.
+        // Phase 2: migrate all columns except `skip_cid` (see
+        // `migrate_row`'s identical use of `move_column_row` for the
+        // zero-allocation rationale).
         let n = self.archetypes[old_arch_id.0 as usize].active_cids.len();
         for i in 0..n {
             let cid = {
@@ -840,22 +1169,7 @@ impl World {
             if cid == skip_cid {
                 continue;
             }
-            let ptr = unsafe {
-                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .swap_remove_erased(old_row)
-            };
-            if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
-                let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .new_empty();
-                Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
-            }
-            unsafe {
-                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .push_erased(ptr);
-            }
+            self.move_column_row(old_arch_id, old_row, new_arch_id, cid);
         }
 
         // Phase 3: remove entity from old archetype; fix swapped-in slot.

@@ -69,6 +69,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+/// The initial capacity `#[derive(SceneStore)]`'s generated per-type
+/// dispatch function passes to `T::register_gpu_columns_growable` when
+/// auto-registering a never-before-seen `#[gpu]`-bearing type on its first
+/// insert (issue #41: "auto-registration on first use"). Deliberately small
+/// — matches [`GenerationMirror`]'s own initial capacity and every other
+/// World-mirrored buffer's recommended sizing: growth is transparent and
+/// cheap-to-start-small is the right default when the eventual entity count
+/// isn't known ahead of time (see `SceneGpuStore::register_growable_gpu_buffer`'s
+/// doc). A caller who wants a different starting size, or who wants to move
+/// the first-growth cost off the per-insert critical path entirely, still
+/// registers manually (or calls `World::reserve_gpu_mirror_capacity`) BEFORE
+/// the type's first insert — manual registration always wins over
+/// auto-registration, since this constant is only ever consulted when
+/// nothing registered the type yet.
+pub const DEFAULT_AUTO_REGISTER_CAPACITY: u32 = 64;
+
 /// Row-indexed liveness/generation buffer, mirroring `World::entity_slots`'s
 /// `generation` field on the GPU, keyed by `Entity::index()` exactly like
 /// every other World-mirrored buffer. See the "Liveness" section of the
@@ -339,18 +355,27 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
         if col.mode == crate::gpu::MirrorMode::Once && !is_new_insert {
             continue; // Once fields never re-write after the first insert
         }
-        let size = col.field_token.desc().size as usize;
-        // SAFETY: `field_offset`/`size` describe a field within `T`, computed
-        // by the derive from `T`'s own layout (`offset_of!` + `size_of`) at
-        // macro-expansion time, so the byte range is in-bounds of `data` and
-        // fully initialized. `T: GpuColumnSet: Pod` guarantees every bit
-        // pattern in that range is a valid read (no padding-UB, no enum
-        // niches to violate).
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (data as *const T as *const u8).add(col.field_offset),
-                size,
-            )
+        // SAFETY: `field_offset` describes a field within `T`, computed by
+        // the derive from `T`'s own layout (`offset_of!`) at macro-expansion
+        // time, so this pointer is in-bounds of `data` and correctly aligned
+        // for the field's own type.
+        let field_ptr = unsafe { (data as *const T as *const u8).add(col.field_offset) };
+        // A `heavy` field's `upload` mapper produces freshly-computed,
+        // Element-sized bytes from the handle at `field_ptr` (see
+        // `GpuUploadSource`) — an owned allocation, since the mapped bytes
+        // don't live anywhere else. Every other field (the overwhelming
+        // majority) reads its own bytes directly, zero-copy, exactly as
+        // before `upload` existed.
+        let mapped;
+        let bytes: &[u8] = if let Some(upload) = col.upload {
+            mapped = upload(field_ptr as *const ());
+            &mapped
+        } else {
+            let size = col.field_token.desc().size as usize;
+            // SAFETY: `size` is this field's own type's size (`T:
+            // GpuColumnSet: Pod` guarantees every bit pattern in that range
+            // is a valid read — no padding-UB, no enum niches to violate).
+            unsafe { std::slice::from_raw_parts(field_ptr, size) }
         };
         let id = col.field_token.id();
 
@@ -467,6 +492,7 @@ mod tests {
                 field_offset: std::mem::offset_of!(TestComponent, value),
                 mode: MirrorMode::DirtyTracked,
                 buffer_name: "value",
+                upload: None,
             }]
         }
         fn write_gpu(

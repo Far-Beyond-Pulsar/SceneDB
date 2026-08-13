@@ -10,10 +10,10 @@
 //! dirty tracking.
 
 use super::{
-    CapacityError, DirtyMask, DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer,
-    EngineGpuContext, GenerationBuffer, GpuBufferDispatch, GrowableGpuBufferDispatch,
-    GrowableSceneBuffer, RegionError, RegionPool, SceneBuffer, SimulateWitness, SubmissionTracker,
-    SyncStats,
+    BufferAccess, BufferHandle, BufferKey, CapacityError, DirtyMask, DirtyTrackedGpuBufferDispatch,
+    DirtyTrackedSceneBuffer, EngineGpuContext, GenerationBuffer, GpuBufferDispatch,
+    GpuBufferRegistry, GrowableGpuBufferDispatch, GrowableSceneBuffer, RegionError, RegionPool,
+    SceneBuffer, SimulateWitness, SubmissionTracker, SyncStats,
 };
 use crate::page::Pod;
 use crate::cell::{CellStorage, PendingRetire};
@@ -21,10 +21,11 @@ use crate::component::{component_id, ComponentId};
 use crate::handle::Handle;
 use crate::spatial::InstanceInfo;
 use crate::token::HasTypeToken;
-use std::collections::HashMap;
+use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// One size class of region (design Rev 2 §2/§7): every cell registered
 /// under this class gets a fixed-size `capacity`-row region, and at most
@@ -56,6 +57,47 @@ impl SceneGpuConfig {
     }
 }
 
+/// Keyed-registry identity for the store's always-present built-in buffers
+/// (issue #41's "Collapse map": "Store builtins (transform, generation) →
+/// `GpuBuffer<...>` @ `"builtin_transform"` / `"builtin_generation"`"). The
+/// transform/instance-info buffers already register under
+/// `"scenedb-instances"`/`"scenedb-instance-info"` at construction (see
+/// [`SceneGpuStore::new`]); these three cover the remaining built-ins that
+/// were previously reachable only through their dedicated accessors
+/// ([`SceneGpuStore::generation_buffer`], [`SceneGpuStore::slot_mirror_buffer`],
+/// [`SceneGpuStore::cell_metadata_buffer`]) and NOT through the keyed
+/// registry — a renderer/tooling consumer had no `Buffer<"key">`-style path
+/// to them. Registered once at [`SceneGpuStore::new`] (all three are fixed
+/// capacity, allocated once, never reallocated — no epoch/growth sync
+/// needed after that single registration).
+pub const GENERATION_BUFFER_KEY: BufferKey = BufferKey::of("builtin_generation");
+pub const SLOT_MIRROR_BUFFER_KEY: BufferKey = BufferKey::of("builtin_slot_mirror");
+pub const CELL_METADATA_BUFFER_KEY: BufferKey = BufferKey::of("builtin_cell_metadata");
+
+/// The 8-byte per-cell metadata record `StreamingGrid::write_cell_metadata`
+/// packs directly by hand (`f32` alpha + `u32` domain code) — defined here
+/// purely so [`CELL_METADATA_BUFFER_KEY`] can be registered as a proper `T:
+/// Pod` row buffer instead of an opaque byte-range resource. Not a new wire
+/// format: `write_cell_metadata` still writes the same two `to_le_bytes()`
+/// calls it always did: this type documents that layout for the registry,
+/// it does not change it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetadataRow {
+    pub alpha: f32,
+    pub domain: u32,
+}
+const _: () = assert!(std::mem::size_of::<CellMetadataRow>() == 8);
+// SAFETY: `#[repr(C)]`, `Copy`, both fields are themselves POD (f32/u32),
+// and the const assert pins the layout to exactly 8 bytes with no hidden
+// padding — matching `write_cell_metadata`'s byte-for-byte packing.
+unsafe impl crate::page::Pod for CellMetadataRow {}
+// SAFETY: a bare marker impl (`HasTypeToken` derives its `TypeToken` purely
+// from `Self`'s `TypeId`/layout via the blanket impl this crate provides for
+// every `Pod` type elsewhere) — see `token.rs`. `CellMetadataRow` needs no
+// bespoke reflection metadata beyond what registering it as a row-buffer
+// element requires (`Pod + HasTypeToken + 'static`).
+
 /// How a GPU-mirrored field is synced to the GPU buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MirrorMode {
@@ -63,6 +105,52 @@ pub enum MirrorMode {
     DirtyTracked,
     /// Uploaded once at registration and never touched again (e.g. asset data).
     Once,
+}
+
+/// Type-erased `handle bytes -> heavy element bytes` mapper for a
+/// `#[gpu(mirror = Once, heavy)]` field whose declared type implements
+/// [`GpuUploadSource`]. `handle_ptr` points at the field's own bytes (the
+/// lightweight CPU handle, e.g. 4-16 bytes); the return value is the
+/// freshly-computed heavy element's bytes, sized to `GpuUploadSource::Element`
+/// — NOT to the handle. `None` on [`GpuColumnDesc::upload`] means "no split":
+/// the field's own type IS the GPU buffer's element type, exactly as every
+/// `#[gpu]` field (including plain `Once`) has always worked.
+///
+/// A plain `fn` pointer, not a boxed closure: the derive generates a
+/// non-capturing closure (concrete types baked in at macro-expansion time),
+/// which coerces to `fn` for free — no allocation, no dynamic dispatch
+/// beyond the one indirect call already implied by a `fn` pointer.
+pub type UploadMapperFn = fn(handle_ptr: *const ()) -> Vec<u8>;
+
+/// Declares that a `#[gpu(mirror = Once, heavy)]` field's CPU-side type is a
+/// lightweight HANDLE for a separate, heavier GPU-resident type — the CPU
+/// never holds a full copy of `Element`. Tier 1 calls [`Self::upload_element`]
+/// to produce it at registration, and again whenever the handle changes
+/// (`World::get_mut`'s [`crate::world::Mut`] guard marks the field's GPU slot
+/// dirty on drop, the same as any other mutated `#[gpu]` field).
+///
+/// This is the "CPU Asset Handle / Descriptor Pattern": the field's CPU type
+/// (`Self`) is the handle — a `u32` slot index, an asset ID, a small
+/// `Copy`/`Pod` descriptor — and `Element` is the heavy GPU-native record
+/// (a full mesh-metadata row, a material, anything far larger than the
+/// handle) that actually lives in VRAM. Reads (`world.get::<T>()`) return the
+/// handle instantly from system RAM; they never trigger a VRAM readback.
+///
+/// Only meaningful for `#[gpu(mirror = Once)]` fields — `DirtyTracked`
+/// fields keep a full CPU shadow of whatever type they declare by design (so
+/// delta-sync has something to diff against), which the handle/heavy split
+/// has no useful meaning against; the derive rejects `heavy` combined with
+/// `mirror = DirtyTracked` at macro-expansion time.
+pub trait GpuUploadSource {
+    /// The heavy GPU-resident type this handle maps to. Must be `Pod` (it's
+    /// written directly into a GPU buffer) and `Send + Sync` (the buffer
+    /// storing it is shared, like every other GPU-mirrored column).
+    type Element: crate::page::Pod + crate::token::HasTypeToken + Send + Sync + 'static;
+
+    /// Produce the current heavy element for this handle. Called by Tier 1,
+    /// never by ordinary CPU-side code — `world.get::<T>()` returns the
+    /// handle itself, not this.
+    fn upload_element(&self) -> Self::Element;
 }
 
 /// Describes one GPU-mirrored field in a component type.
@@ -78,6 +166,12 @@ pub struct GpuColumnDesc {
     pub mode: MirrorMode,
     /// Logical buffer name for GPU binding.
     pub buffer_name: &'static str,
+    /// `Some` for a `#[gpu(mirror = Once, heavy)]` field whose type
+    /// implements [`GpuUploadSource`] — see [`UploadMapperFn`]'s doc. `None`
+    /// for every other field (the overwhelming majority): the field's own
+    /// bytes ARE the GPU buffer's element, written directly with no mapping
+    /// step, exactly as before this existed.
+    pub upload: Option<UploadMapperFn>,
 }
 
 /// Trait for GPU-mirrored component types.  Generated by `#[derive(SceneStore)]`.
@@ -203,6 +297,45 @@ pub struct CellSlot<'a> {
     pub cell: &'a mut CellStorage,
 }
 
+/// Which registration path a shared buffer was created through — the same
+/// `BufferKey` may never span two paths (a key registered fixed/
+/// cell-mirrored and also growable/World-mirrored is a config error, not a
+/// shared buffer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SharedKindTag {
+    Fixed,
+    Growable,
+    DirtyTracked,
+}
+
+/// One shared buffer's live dispatch object, aliased under every
+/// `ComponentId` that declared its `BufferKey`.
+enum SharedKind {
+    Fixed(Arc<dyn GpuBufferDispatch>),
+    Growable(Arc<dyn GrowableGpuBufferDispatch>),
+    DirtyTracked(Arc<dyn DirtyTrackedGpuBufferDispatch>),
+}
+
+/// Store-side record of one shared `BufferKey`: the compatibility metadata
+/// every later declaration of the same key is validated against, plus the
+/// live dispatch object. This is the registry-collapse authority — the
+/// `GpuBufferRegistry` is populated alongside it (so the renderer handoff
+/// and future resource-entry namespace collisions work), but the live Arc
+/// here is what aliasing actually shares, so growth/epoch/readback stay
+/// consistent across every `ComponentId` that declares the key.
+struct SharedOwner {
+    element_type_id: TypeId,
+    element_size: usize,
+    /// Row capacity at registration. Fixed/cell-mirrored shared buffers must
+    /// agree on this exactly (a shared key spanning two different capacities
+    /// is a config error); growable/dirty-tracked buffers carry it as
+    /// metadata only.
+    capacity: u32,
+    access: BufferAccess,
+    mode: MirrorMode,
+    kind: SharedKind,
+}
+
 /// The SceneDB-owned multi-cell device-side store (M2b-α §2): persistent
 /// region-partitioned scene SSBOs, the mirrored-column writer, delta-sync,
 /// and the retirement drain — generalizing M2a's single-cell `GpuStore` to
@@ -210,10 +343,50 @@ pub struct CellSlot<'a> {
 pub struct SceneGpuStore {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    /// The keyed buffer registry (Tier 1, `gpu::buffer_registry`): the
+    /// shared namespace every registration flows through. Row buffers are
+    /// registered here at first-creation (validating against resource
+    /// entries); [`Self::resolve_buffer_handle`] keeps this entry's
+    /// buffer/epoch synced to the LIVE dispatch object on every call (via
+    /// [`GpuBufferRegistry::sync`]) and returns [`GpuBufferRegistry::resolve`]
+    /// as its terminal step — that's what makes this registry the actual
+    /// renderer handoff rather than a snapshot frozen at first registration.
+    /// `owners` below still owns the live dispatch objects (`Arc<dyn
+    /// GpuBufferDispatch>` etc.) that `write_row_bytes`/`mark_column_dirty`
+    /// write through; this registry is the read-side keyed view over them.
+    registry: GpuBufferRegistry,
+    /// One entry per shared `BufferKey` (and per unique auto-generated key),
+    /// holding the live dispatch object + the compatibility metadata every
+    /// later declaration of the same key is checked against. This is what
+    /// makes `#[gpu(buffer = "key")]` collapse work: a second component
+    /// declaring the same key adopts this Arc instead of allocating another
+    /// buffer, so both components' `ComponentId`s alias ONE physical buffer.
+    ///
+    /// `RwLock`-backed (not a plain `HashMap`, unlike before this doc note):
+    /// registration ([`Self::register_gpu_buffer`] and friends) needs to be
+    /// reachable through the `Arc<SceneGpuStore>` a `World`'s attached
+    /// [`crate::gpu::GpuMirrorHandle`] holds — and an `Arc` never yields
+    /// `&mut` access once more than one owner exists (`World`'s mirror
+    /// clone plus whatever the caller kept). Interior mutability here is
+    /// what makes "auto-registration on first use"
+    /// (`world_mirror::write_gpu_columns_at_row`'s dispatch caller) possible
+    /// at all — see that module's doc for the full rationale. This is
+    /// registration-time-only churn (a handful of calls at startup, or once
+    /// per never-before-seen `#[gpu]` type on first insert); the actual
+    /// per-frame hot path (`write_row_bytes`/`mark_gpu_row_dirty`/`sync_all`)
+    /// only ever takes the read side.
+    owners: RwLock<HashMap<BufferKey, SharedOwner>>,
+    /// Reverse map `ComponentId -> BufferKey`, populated at registration.
+    /// Lets `register_cell`'s dirty-mask warm-up skip aliased columns (a
+    /// shared buffer is warmed through exactly one ComponentId, so the first
+    /// sync doesn't let one alias's cold bytes overwrite another's rows).
+    column_keys: RwLock<HashMap<ComponentId, BufferKey>>,
     /// Type-erased GPU buffers keyed by `ComponentId`.  Replaces the old
     /// concrete `transforms` / `instance_infos` fields (pre-work item 3).
-    /// Registered via [`Self::register_gpu_buffer`].
-    gpu_buffers: HashMap<ComponentId, Box<dyn GpuBufferDispatch>>,
+    /// Registered via [`Self::register_gpu_buffer`]. `Arc` (not `Box`)
+    /// because two `ComponentId`s declaring the same `BufferKey` alias the
+    /// SAME dispatch object — that is the registry-collapse sharing.
+    gpu_buffers: RwLock<HashMap<ComponentId, Arc<dyn GpuBufferDispatch>>>,
     /// Growable counterpart to `gpu_buffers`, disjoint from it — a given
     /// `ComponentId` is registered in exactly one of the two maps, never
     /// both. Registered via [`Self::register_growable_gpu_buffer`]; see
@@ -221,7 +394,7 @@ pub struct SceneGpuStore {
     /// map/trait rather than living in `gpu_buffers` (`GpuBufferDispatch::
     /// buffer(&self) -> &wgpu::Buffer` can't be implemented soundly once the
     /// buffer lives behind the `RwLock` growth requires).
-    growable_gpu_buffers: HashMap<ComponentId, Box<dyn GrowableGpuBufferDispatch>>,
+    growable_gpu_buffers: RwLock<HashMap<ComponentId, Arc<dyn GrowableGpuBufferDispatch>>>,
     /// Dirty-tracked counterpart to `growable_gpu_buffers` -- disjoint from
     /// both it and `gpu_buffers`; a given `ComponentId` lives in exactly one
     /// of the three. Registered via
@@ -241,7 +414,7 @@ pub struct SceneGpuStore {
     /// deliberate — see `GenerationMirror`'s doc (`gpu::world_mirror`) for
     /// why an earlier, more "obviously cheap" alternative measured worse in
     /// practice.
-    dirty_tracked_gpu_buffers: HashMap<ComponentId, Box<dyn DirtyTrackedGpuBufferDispatch>>,
+    dirty_tracked_gpu_buffers: RwLock<HashMap<ComponentId, Arc<dyn DirtyTrackedGpuBufferDispatch>>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -283,6 +456,14 @@ impl SceneGpuStore {
         Arc::clone(&self.device)
     }
 
+    /// This store's own queue — the same one every internal write already
+    /// goes through. Lets a caller that only has a `&SceneGpuStore` in hand
+    /// (e.g. `SceneDb::step_gpu`, driving the automatic World-mirror flush)
+    /// reach a `&wgpu::Queue` without separately threading one through.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub fn new(ctx: &EngineGpuContext, cfg: SceneGpuConfig) -> Self {
         let mut row_pools = Vec::with_capacity(cfg.classes.len());
         let mut slot_pools = Vec::with_capacity(cfg.classes.len());
@@ -310,12 +491,15 @@ impl SceneGpuStore {
                 )
                 .expect("slot capacity overflow");
         }
-        let mut store = Self {
+        let store = Self {
             device: Arc::clone(ctx.device()),
             queue: Arc::clone(ctx.queue()),
-            gpu_buffers: HashMap::new(),
-            growable_gpu_buffers: HashMap::new(),
-            dirty_tracked_gpu_buffers: HashMap::new(),
+            registry: GpuBufferRegistry::new(),
+            owners: RwLock::new(HashMap::new()),
+            column_keys: RwLock::new(HashMap::new()),
+            gpu_buffers: RwLock::new(HashMap::new()),
+            growable_gpu_buffers: RwLock::new(HashMap::new()),
+            dirty_tracked_gpu_buffers: RwLock::new(HashMap::new()),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -336,10 +520,74 @@ impl SceneGpuStore {
             cells: Vec::new(),
             gen_writes: AtomicU64::new(0),
         };
-        // Register built-in GPU buffers
-        store.register_gpu_buffer::<[f32; 16]>(row_offset, ctx.device(), "scenedb-instances");
-        store.register_gpu_buffer::<InstanceInfo>(row_offset, ctx.device(), "scenedb-instance-info");
+        // Register built-in GPU buffers under stable, documented keys — these
+        // are the store's two always-present shared buffers (every cell's
+        // transform / instance-info region lives in one physical buffer).
+        store.register_gpu_buffer::<[f32; 16], [f32; 16]>(
+            row_offset,
+            ctx.device(),
+            BufferKey::of("scenedb-instances"),
+            MirrorMode::DirtyTracked,
+        );
+        store.register_gpu_buffer::<InstanceInfo, InstanceInfo>(
+            row_offset,
+            ctx.device(),
+            BufferKey::of("scenedb-instance-info"),
+            MirrorMode::DirtyTracked,
+        );
+        // Remaining store builtins (issue #41 collapse map): reachable by
+        // key through the SAME registry the shared/`#[gpu(buffer=...)]`
+        // fields resolve through, alongside their existing dedicated
+        // accessors (`generation_buffer()`/`slot_mirror_buffer()`/
+        // `cell_metadata_buffer()`, unchanged). All three are fixed-capacity
+        // and allocated exactly once, right here — never reallocated, so
+        // one `register_row` call each is the complete registration; no
+        // `sync` call site is needed anywhere else in this store for them.
         store
+            .registry
+            .register_row::<u32>(GENERATION_BUFFER_KEY, store.generations.buffer().clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("GENERATION_BUFFER_KEY is a fresh key on every new store");
+        store
+            .registry
+            .register_row::<u32>(SLOT_MIRROR_BUFFER_KEY, store.slot_mirror.buffer().clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("SLOT_MIRROR_BUFFER_KEY is a fresh key on every new store");
+        store
+            .registry
+            .register_row::<CellMetadataRow>(CELL_METADATA_BUFFER_KEY, store.cell_metadata.clone(), BufferAccess::ReadOnly, MirrorMode::DirtyTracked)
+            .expect("CELL_METADATA_BUFFER_KEY is a fresh key on every new store");
+        store
+    }
+
+    /// The Tier 1 keyed buffer registry this store registers every built-in
+    /// and `#[gpu(buffer = "...")]`-shared buffer into (issue #41's single
+    /// namespace: "the registry — the single namespace resource entries...
+    /// will eventually share"). Exposed so external, non-`SceneGpuStore`-
+    /// owned GPU asset stores (`MeshRegistry`, `ClusterBuffer`,
+    /// `MaterialRegistry`, `GeometryArena`, `TextureStore`, and friends) can
+    /// register their OWN buffers into the SAME registry this store already
+    /// builds — see each type's `register_key`/`register_into` method. Read-
+    /// only: registration into it still goes through `GpuBufferRegistry`'s
+    /// own `register_row`/`register_resource`/`register_texture_array`,
+    /// which validate compatibility exactly the same way whether the caller
+    /// is this store or an external asset registry.
+    pub fn buffer_registry(&self) -> &GpuBufferRegistry {
+        &self.registry
+    }
+
+    /// Diagnostic-only convenience: [`super::readback_row`] for a key
+    /// registered as a row buffer in this store's [`Self::buffer_registry`]
+    /// (a store builtin, or any `#[gpu(buffer = "...")]`-shared key). `None`
+    /// if `key` isn't registered as a row buffer at all (unregistered,
+    /// registered as a resource, or registered as a texture array — see
+    /// [`GpuBufferRegistry::resolve`]).
+    ///
+    /// Like every function in [`super::readback`], this is explicit,
+    /// decoupled, diagnostic-only VRAM readback: it blocks the calling
+    /// thread on `device.poll`, and nothing in the `get`/`get_mut`/query
+    /// path ever calls it. See that module's doc for the full rationale.
+    pub fn readback_row<T: Pod>(&self, device: &wgpu::Device, key: BufferKey, row: u32) -> Option<T> {
+        let handle = self.registry.resolve(key)?;
+        Some(super::readback_row::<T>(device, &self.queue, &handle.buffer, row))
     }
 
     pub fn tracker(&self) -> &SubmissionTracker {
@@ -350,15 +598,237 @@ impl SceneGpuStore {
     /// for `[f32; 16]` (transforms) and `InstanceInfo` during [`Self::new`];
     /// derive macros for custom SceneComponent types will call this during
     /// store construction.
-    pub fn register_gpu_buffer<T: Pod + Send + Sync + HasTypeToken + 'static>(
-        &mut self,
+    ///
+    /// `key` is the buffer's identity in the keyed registry:
+    /// `#[gpu(buffer = "key")]` fields resolve here. The FIRST registration
+    /// of a key allocates its physical buffer; every later registration of
+    /// the SAME key adopts that buffer (one shared allocation) provided the
+    /// element type, stride, access, and mirror mode all match — otherwise
+    /// this panics at construction time, loudly (a shared key whose
+    /// declarers disagree on element identity is a config error, never a
+    /// silent alias). `T` is the CPU-side column type this store dispatches
+    /// writes through (a derive-generated per-field wrapper); `E` is the
+    /// ELEMENT type the shared buffer is keyed on — the field's RAW type,
+    /// so two different components' same-typed shared fields (whose wrapper
+    /// types necessarily differ) still count as one compatible element.
+    ///
+    /// The declared row `capacity` must agree across declarers of a key
+    /// (each fixed/cell-mirrored column is sized to the store's row-region
+    /// count); a mismatch is a config error.
+    pub fn register_gpu_buffer<T, E>(
+        &self,
         capacity: u32,
         device: &wgpu::Device,
-        label: &str,
-    ) {
+        key: BufferKey,
+        mode: MirrorMode,
+    ) where
+        T: Pod + Send + Sync + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + 'static,
+    {
+        assert_eq!(
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+            "gpu buffer key {key:?}: CPU dispatch type and element type disagree in size ({} vs {} bytes) — \
+             the per-field wrapper must be byte-identical to the element it wraps",
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+        );
         let id = <T as HasTypeToken>::type_token().id();
-        let buffer = SceneBuffer::<T>::new(device, label, capacity);
-        self.gpu_buffers.insert(id, Box::new(buffer));
+        // Whole check-then-insert sequence under ONE write lock: two threads
+        // racing to register the same never-before-seen key must not both
+        // observe "not present" and both allocate a physical buffer.
+        let mut owners = self.owners.write().expect("SceneGpuStore owners lock poisoned");
+        if let Some(existing) = owners.get(&key) {
+            Self::assert_share_compatible(
+                existing,
+                key,
+                TypeId::of::<E>(),
+                std::mem::size_of::<E>(),
+                BufferAccess::ReadOnly,
+                mode,
+                SharedKindTag::Fixed,
+            );
+            assert!(
+                capacity == existing.capacity,
+                "buffer key {key:?} already registered at capacity {} rows; incoming declares {capacity} — \
+                 shared fixed buffers must agree on capacity (the store's row-region count)",
+                existing.capacity,
+            );
+            let SharedKind::Fixed(buf) = &existing.kind else { unreachable!("tag checked above") };
+            let buf = Arc::clone(buf);
+            drop(owners);
+            self.gpu_buffers.write().expect("SceneGpuStore gpu_buffers lock poisoned").insert(id, buf);
+            self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+            return;
+        }
+        let buf: Arc<dyn GpuBufferDispatch> = Arc::new(SceneBuffer::<T>::new(device, key.as_str(), capacity));
+        self.registry
+            .register_row::<E>(key, buf.buffer().clone(), BufferAccess::ReadOnly, mode)
+            .unwrap_or_else(|e| panic!("failed to register buffer key {key:?}: {e}"));
+        owners.insert(
+            key,
+            SharedOwner {
+                element_type_id: TypeId::of::<E>(),
+                element_size: std::mem::size_of::<E>(),
+                capacity,
+                access: BufferAccess::ReadOnly,
+                mode,
+                kind: SharedKind::Fixed(Arc::clone(&buf)),
+            },
+        );
+        drop(owners);
+        self.gpu_buffers.write().expect("SceneGpuStore gpu_buffers lock poisoned").insert(id, buf);
+        self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+    }
+
+    /// Clone the current `wgpu::Buffer` handle out of a dispatch object whose
+    /// buffer lives behind a lock (growable/dirty-tracked) — cheap, wgpu
+    /// handles are refcounted clones, not data copies. Used to snapshot the
+    /// handle into the registry at first registration.
+    fn current_handle<F>(f: &mut F) -> wgpu::Buffer
+    where
+        F: FnMut(&mut dyn FnMut(&wgpu::Buffer)),
+    {
+        let mut out: Option<wgpu::Buffer> = None;
+        f(&mut |b| out = Some(b.clone()));
+        out.expect("dispatch with_buffer must invoke its callback")
+    }
+
+    /// Panics unless `existing` (the already-registered owner of `key`) is
+    /// compatible with a new declaration of element type `elem_tid`, size
+    /// `elem_size`, access, mode, and registration path `incoming_tag`. A
+    /// shared `BufferKey` may never span the fixed/growable/dirty-tracked
+    /// paths, and any metadata disagreement is a config error, loudly
+    /// panicked at store-construction time (never a silent alias).
+    fn assert_share_compatible(
+        existing: &SharedOwner,
+        key: BufferKey,
+        elem_tid: TypeId,
+        elem_size: usize,
+        access: BufferAccess,
+        mode: MirrorMode,
+        incoming_tag: SharedKindTag,
+    ) {
+        let existing_tag = match &existing.kind {
+            SharedKind::Fixed(_) => SharedKindTag::Fixed,
+            SharedKind::Growable(_) => SharedKindTag::Growable,
+            SharedKind::DirtyTracked(_) => SharedKindTag::DirtyTracked,
+        };
+        assert_eq!(
+            existing_tag, incoming_tag,
+            "buffer key {key:?}: already registered through the {existing_tag:?} path, \
+             incoming declaration is {incoming_tag:?} — the same key may never span the \
+             fixed / growable / dirty-tracked registration paths",
+        );
+        assert_eq!(
+            existing.element_type_id, elem_tid,
+            "buffer key {key:?}: shared-key element type mismatch — first declarer used type id {:?}, \
+             this declarer is {:?}. Two components may share a buffer key only when their fields agree \
+             on the raw element type",
+            existing.element_type_id, elem_tid,
+        );
+        assert_eq!(
+            existing.element_size, elem_size,
+            "buffer key {key:?}: shared-key element size mismatch ({} vs {elem_size} bytes)",
+            existing.element_size,
+        );
+        assert_eq!(
+            existing.access, access,
+            "buffer key {key:?}: shared-key access mismatch ({:?} vs {access:?})",
+            existing.access,
+        );
+        assert_eq!(
+            existing.mode, mode,
+            "buffer key {key:?}: shared-key mirror-mode mismatch ({:?} vs {mode:?}) — Once fields share \
+             only with Once, DirtyTracked only with DirtyTracked",
+            existing.mode,
+        );
+    }
+
+    /// Resolve a shared `BufferKey` to the physical `wgpu::Buffer` backing it
+    /// (the renderer handoff: build bind groups against the buffer a set of
+    /// shared-key columns actually live in) plus its current element count.
+    /// `None` if `key` was never registered. The handle reflects the LIVE
+    /// buffer even after growth — it is cloned fresh from the dispatch object
+    /// on every call, not cached at registration.
+    ///
+    /// The second value is an ELEMENT COUNT, not an allocation epoch — for a
+    /// rebind-detecting handoff (owned buffer + epoch), use
+    /// [`Self::resolve_buffer_handle`] instead.
+    pub fn resolve_buffer(&self, key: BufferKey) -> Option<(wgpu::Buffer, u64)> {
+        let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
+        let owner = owners.get(&key)?;
+        let handle = match &owner.kind {
+            SharedKind::Fixed(b) => b.buffer().clone(),
+            SharedKind::Growable(b) => Self::current_handle(&mut |f| b.with_buffer(f)),
+            SharedKind::DirtyTracked(b) => Self::current_handle(&mut |f| b.with_buffer(f)),
+        };
+        let element_count = handle.size() / owner.element_size as u64;
+        Some((handle, element_count))
+    }
+
+    /// The Tier 1 renderer handoff: resolve `key` to its current
+    /// [`BufferHandle`] (an owned `wgpu::Buffer` clone plus an allocation
+    /// `epoch` that bumps exactly once per reallocation). `None` if `key` was
+    /// never registered.
+    ///
+    /// A `Fixed` (cell-mirrored) buffer never reallocates after
+    /// registration, so its epoch is always `0`. A `Growable`/`DirtyTracked`
+    /// (World-mirrored) buffer's epoch is read live from its owning dispatch
+    /// object — [`GrowableGpuBufferDispatch::epoch`] /
+    /// [`DirtyTrackedGpuBufferDispatch::epoch`], which already increment
+    /// correctly on every grow-triggered reallocation — so this is always
+    /// current, never a stale snapshot frozen at first registration.
+    ///
+    /// This also syncs the live buffer/epoch into the keyed
+    /// [`GpuBufferRegistry`] (`self.registry`) and returns its
+    /// [`GpuBufferRegistry::resolve`] result, so the registry — the single
+    /// namespace resource entries (`GeometryArena`, `TextureStore`) will
+    /// eventually share — is the actual terminal source of truth for this
+    /// handoff, not a write-only snapshot nobody reads.
+    pub fn resolve_buffer_handle(&self, key: BufferKey) -> Option<BufferHandle> {
+        let (buffer, epoch) = {
+            let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
+            let owner = owners.get(&key)?;
+            match &owner.kind {
+                SharedKind::Fixed(b) => (b.buffer().clone(), 0u64),
+                SharedKind::Growable(b) => (Self::current_handle(&mut |f| b.with_buffer(f)), b.epoch()),
+                SharedKind::DirtyTracked(b) => {
+                    (Self::current_handle(&mut |f| b.with_buffer(f)), b.epoch())
+                }
+            }
+        };
+        self.registry.sync(key, buffer, epoch);
+        self.registry.resolve(key)
+    }
+
+    /// The `BufferKey` a `ComponentId` was registered under, if any — lets
+    /// callers learn which shared (or auto-generated) buffer a column aliases,
+    /// and lets [`Self::register_cell`] deduplicate warm-up across aliases.
+    pub fn buffer_key_for(&self, id: ComponentId) -> Option<BufferKey> {
+        self.column_keys.read().expect("SceneGpuStore column_keys lock poisoned").get(&id).copied()
+    }
+
+    /// Whether `T`'s `#[gpu]` fields are already registered on this store —
+    /// checks only `T::gpu_columns()`'s FIRST field as a proxy for "is `T`
+    /// registered at all", which is correct because registration
+    /// ([`Self::register_gpu_buffer`]/[`Self::register_growable_gpu_buffer`]/
+    /// [`Self::register_dirty_tracked_gpu_buffer`]) always registers every
+    /// field of a type together, in one call — never partially. `true`
+    /// (nothing to register) for a `T` with zero `#[gpu]` fields.
+    ///
+    /// This is what makes "auto-registration on first use"
+    /// (`gpu::world_mirror`'s per-type dispatch function) a single cheap
+    /// lookup rather than a scan: one `RwLock::read` + `HashMap::get`, the
+    /// same cost `buffer_key_for` alone already had.
+    pub fn is_registered<T: GpuColumnSet>(&self) -> bool {
+        // `map_or(true, ..)`, not `is_none_or` (stabilized 1.82) -- this
+        // crate's declared MSRV is 1.81 (workspace Cargo.toml). Silences
+        // clippy::unnecessary_map_or deliberately, not by oversight.
+        #[allow(clippy::unnecessary_map_or)]
+        T::gpu_columns()
+            .first()
+            .map_or(true, |col| self.buffer_key_for(col.field_token.id()).is_some())
     }
 
     /// Growable counterpart to [`Self::register_gpu_buffer`] — for
@@ -379,22 +849,81 @@ impl SceneGpuStore {
     /// fail with no way to report that failure back to the caller — see
     /// [`Self::write_row_bytes_growing`]'s doc).
     ///
+    /// Sharing (`#[gpu(buffer = "key")]`, `World`-mirror side): the FIRST
+    /// registration of `key` in this mode allocates; later same-key
+    /// declarations (including from `#[derive(SceneStore)]`'s generated
+    /// `register_gpu_columns_growable`) adopt the existing dispatch Arc —
+    /// same element/access/mode must hold, else panic. The same key may
+    /// never span fixed AND growable AND dirty-tracked paths.
+    ///
     /// A given `ComponentId` must be registered through exactly one of
     /// [`Self::register_gpu_buffer`]/`Self::register_growable_gpu_buffer` —
     /// registering the same id both ways leaves the growable one shadowed by
     /// [`Self::write_row_bytes`]'s lookup order and is almost certainly not
     /// what was intended; this is not currently asserted against (no test
     /// covers the double-registration case), so avoid it by construction.
-    pub fn register_growable_gpu_buffer<T: Pod + Send + Sync + HasTypeToken + 'static>(
-        &mut self,
+    pub fn register_growable_gpu_buffer<T, E>(
+        &self,
         initial_capacity: u32,
         max_capacity: Option<u32>,
         device: &Arc<wgpu::Device>,
-        label: &str,
-    ) {
+        key: BufferKey,
+        mode: MirrorMode,
+    ) where
+        T: Pod + Send + Sync + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + 'static,
+    {
+        assert_eq!(
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+            "gpu buffer key {key:?}: CPU dispatch type and element type disagree in size ({} vs {} bytes) — \
+             the per-field wrapper must be byte-identical to the element it wraps",
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+        );
         let id = <T as HasTypeToken>::type_token().id();
-        let buffer = GrowableSceneBuffer::<T>::new(Arc::clone(device), label, initial_capacity, max_capacity);
-        self.growable_gpu_buffers.insert(id, Box::new(buffer));
+        let mut owners = self.owners.write().expect("SceneGpuStore owners lock poisoned");
+        if let Some(existing) = owners.get(&key) {
+            Self::assert_share_compatible(
+                existing,
+                key,
+                TypeId::of::<E>(),
+                std::mem::size_of::<E>(),
+                BufferAccess::ReadOnly,
+                mode,
+                SharedKindTag::Growable,
+            );
+            let SharedKind::Growable(buf) = &existing.kind else { unreachable!("tag checked above") };
+            let buf = Arc::clone(buf);
+            drop(owners);
+            self.growable_gpu_buffers.write().expect("SceneGpuStore growable_gpu_buffers lock poisoned").insert(id, buf);
+            self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+            return;
+        }
+        let buf: Arc<dyn GrowableGpuBufferDispatch> = Arc::new(GrowableSceneBuffer::<T>::new(
+            Arc::clone(device),
+            key.as_str(),
+            initial_capacity,
+            max_capacity,
+        ));
+        let handle = Self::current_handle(&mut |f| buf.with_buffer(f));
+        self.registry
+            .register_row::<E>(key, handle, BufferAccess::ReadOnly, mode)
+            .unwrap_or_else(|e| panic!("failed to register buffer key {key:?}: {e}"));
+        owners.insert(
+            key,
+            SharedOwner {
+                element_type_id: TypeId::of::<E>(),
+                element_size: std::mem::size_of::<E>(),
+                capacity: initial_capacity,
+                access: BufferAccess::ReadOnly,
+                mode,
+                kind: SharedKind::Growable(Arc::clone(&buf)),
+            },
+        );
+        drop(owners);
+        self.growable_gpu_buffers.write().expect("SceneGpuStore growable_gpu_buffers lock poisoned").insert(id, buf);
+        self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
     }
 
     /// Mark a column's row as dirty for the next GPU sync.
@@ -556,18 +1085,48 @@ impl SceneGpuStore {
             gen_shadow[slot].store(generation, Ordering::Relaxed);
         }
 
-        // Warm up dirty masks for every registered GPU buffer column.
+        // Warm up dirty masks for every GPU buffer column THIS CELL HAS.
         // For built-in buffers ([f32; 16] and InstanceInfo), this ensures
         // the first sync_all uploads every occupied row.  Any additional
         // GPU-mirrored columns registered via register_gpu_buffer are also
-        // warmed up here.
+        // warmed up here when the cell actually carries them.
         // Dense table sized to the highest registered GPU-column id; holes
         // (unregistered ids, and index 0 which `ComponentId` reserves) stay
         // `None`. Built once here so every subsequent write is a Vec index.
-        let widest = self.gpu_buffers.keys().map(|id| id.0 as usize).max().unwrap_or(0);
+        //
+        // Shared-key aliasing (`#[gpu(buffer = "key")]`, cell-mirrored
+        // path): two `ComponentId`s that declared the same `BufferKey` alias
+        // ONE physical buffer whose rows are a shared pool. Per CELL, each
+        // key's pool slice is consumed by AT MOST ONE column — so a cell
+        // that carries two same-key columns would have both claiming the
+        // identical row region of the same buffer (a contradiction: either
+        // column's first sync would overwrite the other's rows). That is a
+        // config error, and it panics LOUDLY here at registration rather
+        // than corrupting the pool on the first sync. Otherwise, exactly the
+        // one column this cell carries for a key is warmed (an alias the
+        // cell doesn't carry gets no mask — its sync_all contribution is
+        // nothing).
+        let gpu_buffers = self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned");
+        let widest = gpu_buffers.keys().map(|id| id.0 as usize).max().unwrap_or(0);
         let mut dirty_columns: Vec<Option<DirtyMask>> = Vec::new();
         dirty_columns.resize_with(widest + 1, || None);
-        for (id, _buf) in &self.gpu_buffers {
+        let mut warmed: HashSet<BufferKey> = HashSet::new();
+        for id in gpu_buffers.keys() {
+            if cell.column_raw_bytes(*id).is_none() {
+                continue;
+            }
+            let key = self
+                .buffer_key_for(*id)
+                .expect("registered GPU buffer always has a column key");
+            assert!(
+                !warmed.contains(&key),
+                "cell carries two columns sharing buffer key {key:?} ({:?} and a prior column) — \
+                 a shared pool's rows are one column's per cell; two same-key columns in one cell \
+                 would overwrite each other's rows on the first sync. Split them across cells, or \
+                 use distinct keys",
+                id,
+            );
+            warmed.insert(key);
             let mask = DirtyMask::new(row_capacity);
             mask.mark_range(cell.rows_in_use());
             dirty_columns[id.0 as usize] = Some(mask);
@@ -639,7 +1198,7 @@ impl SceneGpuStore {
             // Bulk-write every registered GPU buffer via the generic
             // type-erased path.  Replaces the old hardcoded downcasts to
             // `SceneBuffer<[f32; 16]>` / `SceneBuffer<InstanceInfo>`.
-            for (id, buffer) in &store.gpu_buffers {
+            for (id, buffer) in store.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned").iter() {
                 if let Some(col_bytes) = cell.column_raw_bytes(*id) {
                     let row_bytes = buffer.element_size() * rows as usize;
                     if row_bytes > 0 && col_bytes.len() >= row_bytes {
@@ -940,10 +1499,13 @@ impl SceneGpuStore {
             let rows = slot.cell.rows_in_use() as usize;
             let cell_ref = &*slot.cell; // reborrow as shared for column reads
 
-            // Sync every dirty GPU-mirrored column.
+            // Sync every dirty GPU-mirrored column. One read-lock acquire
+            // per cell (not per column) -- the map itself only ever changes
+            // at registration time, well outside this per-frame hot path.
             let state = self.cells[slot.id.0 as usize].as_ref().expect("cell unregistered");
+            let gpu_buffers = self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned");
             for (id, dirty_mask) in state.dirty_columns_iter() {
-                if let Some(buffer) = self.gpu_buffers.get(&id) {
+                if let Some(buffer) = gpu_buffers.get(&id) {
                     if let Some(col_bytes) = cell_ref.column_raw_bytes(id) {
                         let row_count = rows.min(col_bytes.len() / buffer.element_size());
                         if row_count > 0 {
@@ -1005,9 +1567,20 @@ impl SceneGpuStore {
         self.cells[id.0 as usize].as_ref().expect("cell unregistered").row_base
     }
 
-    pub fn transform_buffer(&self) -> &wgpu::Buffer {
+    /// Returns an OWNED clone (`wgpu::Buffer` is a cheap, refcounted handle
+    /// — see `BufferHandle`'s doc for the same convention) rather than a
+    /// borrow: `gpu_buffers` lives behind a `RwLock` now (see the field's
+    /// doc for why), so a `&wgpu::Buffer` tied to a temporary read-guard
+    /// can't outlive this call.
+    pub fn transform_buffer(&self) -> wgpu::Buffer {
         let id = component_id::<[f32; 16]>();
-        self.gpu_buffers.get(&id).expect("transform buffer not registered").buffer()
+        self.gpu_buffers
+            .read()
+            .expect("SceneGpuStore gpu_buffers lock poisoned")
+            .get(&id)
+            .expect("transform buffer not registered")
+            .buffer()
+            .clone()
     }
 
     /// Generic counterpart to [`Self::transform_buffer`]/
@@ -1018,9 +1591,13 @@ impl SceneGpuStore {
     /// callers that know their type is a required built-in should keep using
     /// the specific accessor (whose `.expect()` gives a clearer panic
     /// message); this is for generic/optional columns.
-    pub fn buffer_for<T: HasTypeToken + 'static>(&self) -> Option<&wgpu::Buffer> {
+    pub fn buffer_for<T: HasTypeToken + 'static>(&self) -> Option<wgpu::Buffer> {
         let id = <T as HasTypeToken>::type_token().id();
-        self.gpu_buffers.get(&id).map(|b| b.buffer())
+        self.gpu_buffers
+            .read()
+            .expect("SceneGpuStore gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|b| b.buffer().clone())
     }
 
     /// `ComponentId`-keyed counterpart to [`Self::buffer_for`], for callers
@@ -1032,8 +1609,12 @@ impl SceneGpuStore {
     /// derive-mirrored field's buffer back — in a test, in editor tooling,
     /// or in `Self::write_row_bytes`'s own caller, [`crate::gpu::world_mirror`]
     /// — goes through this, not `buffer_for::<Wrapper>()`.
-    pub fn buffer_for_id(&self, id: ComponentId) -> Option<&wgpu::Buffer> {
-        self.gpu_buffers.get(&id).map(|b| b.buffer())
+    pub fn buffer_for_id(&self, id: ComponentId) -> Option<wgpu::Buffer> {
+        self.gpu_buffers
+            .read()
+            .expect("SceneGpuStore gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|b| b.buffer().clone())
     }
 
     /// Raw, `ComponentId`-keyed counterpart to [`Self::register_gpu_buffer`]
@@ -1053,7 +1634,7 @@ impl SceneGpuStore {
     /// via `register_gpu_buffer` — a caller inserting a component before its
     /// GPU buffer is wired up is expected during bring-up, not a bug.
     pub fn write_row_bytes(&self, id: ComponentId, queue: &wgpu::Queue, data: &[u8], row: u32) -> bool {
-        match self.gpu_buffers.get(&id) {
+        match self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned").get(&id) {
             Some(buf) => {
                 buf.write_rows_raw(queue, data, row);
                 true
@@ -1086,7 +1667,11 @@ impl SceneGpuStore {
         data: &[u8],
         row: u32,
     ) -> Option<Result<(), CapacityError>> {
-        self.growable_gpu_buffers.get(&id).map(|buf| buf.write_row_growing(queue, row, data))
+        self.growable_gpu_buffers
+            .read()
+            .expect("SceneGpuStore growable_gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|buf| buf.write_row_growing(queue, row, data))
     }
 
     /// Lock-safe access to a growable column's current buffer, by
@@ -1095,7 +1680,7 @@ impl SceneGpuStore {
     /// for why this is callback-shaped rather than returning `&wgpu::Buffer`
     /// directly. Silently does nothing if `id` isn't registered as growable.
     pub fn with_growable_buffer_for_id(&self, id: ComponentId, f: &mut dyn FnMut(&wgpu::Buffer)) {
-        if let Some(buf) = self.growable_gpu_buffers.get(&id) {
+        if let Some(buf) = self.growable_gpu_buffers.read().expect("SceneGpuStore growable_gpu_buffers lock poisoned").get(&id) {
             buf.with_buffer(f);
         }
     }
@@ -1105,13 +1690,21 @@ impl SceneGpuStore {
     /// to know whether a bind group built against this column needs
     /// rebuilding. `None` if `id` isn't registered as growable.
     pub fn growable_epoch_for_id(&self, id: ComponentId) -> Option<u64> {
-        self.growable_gpu_buffers.get(&id).map(|buf| buf.epoch())
+        self.growable_gpu_buffers
+            .read()
+            .expect("SceneGpuStore growable_gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|buf| buf.epoch())
     }
 
     /// Current capacity of a growable column's buffer, by `ComponentId`.
     /// `None` if `id` isn't registered as growable.
     pub fn growable_capacity_for_id(&self, id: ComponentId) -> Option<u32> {
-        self.growable_gpu_buffers.get(&id).map(|buf| buf.capacity())
+        self.growable_gpu_buffers
+            .read()
+            .expect("SceneGpuStore growable_gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|buf| buf.capacity())
     }
 
     /// Registers a dirty-tracked, growable World-mirrored column — for
@@ -1122,15 +1715,150 @@ impl SceneGpuStore {
     /// [`Self::register_growable_gpu_buffer`], never bounded by a
     /// `max_capacity` — a World-mirrored column with a capacity ceiling has
     /// no `Result` to fail through on an ordinary `world.insert()` call.
-    pub fn register_dirty_tracked_gpu_buffer<T: Pod + Send + Sync + HasTypeToken + 'static>(
-        &mut self,
+    ///
+    /// Sharing (`#[gpu(buffer = "key")]`, `World`-mirror side): the FIRST
+    /// registration of `key` in this mode allocates; later same-key
+    /// declarations adopt the existing dispatch Arc. The same key may never
+    /// span two of the fixed/growable/dirty-tracked registration paths.
+    pub fn register_dirty_tracked_gpu_buffer<T, E>(
+        &self,
         initial_capacity: u32,
         device: &Arc<wgpu::Device>,
-        label: &str,
-    ) {
+        key: BufferKey,
+        mode: MirrorMode,
+    ) where
+        T: Pod + Send + Sync + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + 'static,
+    {
+        assert_eq!(
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+            "gpu buffer key {key:?}: CPU dispatch type and element type disagree in size ({} vs {} bytes) — \
+             the per-field wrapper must be byte-identical to the element it wraps",
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<E>(),
+        );
         let id = <T as HasTypeToken>::type_token().id();
-        let buffer = DirtyTrackedSceneBuffer::<T>::new(Arc::clone(device), label, initial_capacity);
-        self.dirty_tracked_gpu_buffers.insert(id, Box::new(buffer));
+        let mut owners = self.owners.write().expect("SceneGpuStore owners lock poisoned");
+        if let Some(existing) = owners.get(&key) {
+            Self::assert_share_compatible(
+                existing,
+                key,
+                TypeId::of::<E>(),
+                std::mem::size_of::<E>(),
+                BufferAccess::ReadOnly,
+                mode,
+                SharedKindTag::DirtyTracked,
+            );
+            let SharedKind::DirtyTracked(buf) = &existing.kind else { unreachable!("tag checked above") };
+            let buf = Arc::clone(buf);
+            drop(owners);
+            self.dirty_tracked_gpu_buffers.write().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").insert(id, buf);
+            self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+            return;
+        }
+        let buf: Arc<dyn DirtyTrackedGpuBufferDispatch> = Arc::new(DirtyTrackedSceneBuffer::<T>::new(
+            Arc::clone(device),
+            key.as_str(),
+            initial_capacity,
+        ));
+        let handle = Self::current_handle(&mut |f| buf.with_buffer(f));
+        self.registry
+            .register_row::<E>(key, handle, BufferAccess::ReadOnly, mode)
+            .unwrap_or_else(|e| panic!("failed to register buffer key {key:?}: {e}"));
+        owners.insert(
+            key,
+            SharedOwner {
+                element_type_id: TypeId::of::<E>(),
+                element_size: std::mem::size_of::<E>(),
+                capacity: initial_capacity,
+                access: BufferAccess::ReadOnly,
+                mode,
+                kind: SharedKind::DirtyTracked(Arc::clone(&buf)),
+            },
+        );
+        drop(owners);
+        self.dirty_tracked_gpu_buffers.write().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").insert(id, buf);
+        self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+    }
+
+    /// Registers a `#[gpu(mirror = Once, heavy)]` field's GPU buffer — the
+    /// handle/heavy-element split ([`GpuUploadSource`]). Unlike
+    /// [`Self::register_dirty_tracked_gpu_buffer`], the physical buffer is
+    /// built from `Element` (the heavy GPU-resident type), NOT from
+    /// `Wrapper` (the CPU dispatch type, sized to the lightweight handle) —
+    /// there is deliberately no `size_of::<Wrapper>() == size_of::<Element>()`
+    /// assertion here, because breaking that equality is the entire point of
+    /// `heavy`: the CPU column stays handle-sized while the GPU buffer holds
+    /// the (typically much larger) mapped element. `write_gpu_columns_at_row`
+    /// is what actually produces `Element`-sized bytes to write here, via
+    /// the field's [`GpuColumnDesc::upload`] mapper — never raw handle
+    /// bytes.
+    ///
+    /// Always registers as [`MirrorMode::Once`] — a heavy field's whole
+    /// premise (a lightweight handle standing in for asset data uploaded via
+    /// its mapper) has no sensible `DirtyTracked` reading of "delta-sync
+    /// this every frame"; the derive rejects `heavy` on a `DirtyTracked`
+    /// field at macro-expansion time, so this never needs a `mode` param.
+    ///
+    /// Sharing (`#[gpu(buffer = "key")]`): identical rules to
+    /// [`Self::register_dirty_tracked_gpu_buffer`], keyed on `Element`, not
+    /// `Wrapper` — two heavy fields (even from different handle types) may
+    /// share a key as long as their `Element`s agree.
+    pub fn register_dirty_tracked_gpu_buffer_heavy<Wrapper, Element>(
+        &self,
+        initial_capacity: u32,
+        device: &Arc<wgpu::Device>,
+        key: BufferKey,
+    ) where
+        Wrapper: Pod + Send + Sync + HasTypeToken + 'static,
+        Element: Pod + Send + Sync + HasTypeToken + 'static,
+    {
+        let mode = MirrorMode::Once;
+        let id = <Wrapper as HasTypeToken>::type_token().id();
+        let mut owners = self.owners.write().expect("SceneGpuStore owners lock poisoned");
+        if let Some(existing) = owners.get(&key) {
+            Self::assert_share_compatible(
+                existing,
+                key,
+                TypeId::of::<Element>(),
+                std::mem::size_of::<Element>(),
+                BufferAccess::ReadOnly,
+                mode,
+                SharedKindTag::DirtyTracked,
+            );
+            let SharedKind::DirtyTracked(buf) = &existing.kind else { unreachable!("tag checked above") };
+            let buf = Arc::clone(buf);
+            drop(owners);
+            self.dirty_tracked_gpu_buffers.write().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").insert(id, buf);
+            self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
+            return;
+        }
+        // Built from `Element`, not `Wrapper` — the load-bearing difference
+        // from `register_dirty_tracked_gpu_buffer`.
+        let buf: Arc<dyn DirtyTrackedGpuBufferDispatch> = Arc::new(DirtyTrackedSceneBuffer::<Element>::new(
+            Arc::clone(device),
+            key.as_str(),
+            initial_capacity,
+        ));
+        let handle = Self::current_handle(&mut |f| buf.with_buffer(f));
+        self.registry
+            .register_row::<Element>(key, handle, BufferAccess::ReadOnly, mode)
+            .unwrap_or_else(|e| panic!("failed to register buffer key {key:?}: {e}"));
+        owners.insert(
+            key,
+            SharedOwner {
+                element_type_id: TypeId::of::<Element>(),
+                element_size: std::mem::size_of::<Element>(),
+                capacity: initial_capacity,
+                access: BufferAccess::ReadOnly,
+                mode,
+                kind: SharedKind::DirtyTracked(Arc::clone(&buf)),
+            },
+        );
+        drop(owners);
+        self.dirty_tracked_gpu_buffers.write().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").insert(id, buf);
+        self.column_keys.write().expect("SceneGpuStore column_keys lock poisoned").insert(id, key);
     }
 
     /// Marks `row` dirty with `data`'s bytes, for a column registered via
@@ -1139,7 +1867,7 @@ impl SceneGpuStore {
     /// Returns `false` if `id` isn't registered dirty-tracked (mirrors
     /// [`Self::write_row_bytes`]'s "unregistered = no-op" contract).
     pub fn mark_gpu_row_dirty(&self, id: ComponentId, row: u32, data: &[u8]) -> bool {
-        match self.dirty_tracked_gpu_buffers.get(&id) {
+        match self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").get(&id) {
             Some(buf) => {
                 buf.mark_dirty_bytes(row, data);
                 true
@@ -1160,7 +1888,7 @@ impl SceneGpuStore {
     /// extra needed here to make `Once` deferred/batched too.
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
         let mut total = SyncStats { ranges: 0, bytes: 0 };
-        for buf in self.dirty_tracked_gpu_buffers.values() {
+        for buf in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").values() {
             let stats = buf.flush(queue);
             total.ranges += stats.ranges;
             total.bytes += stats.bytes;
@@ -1172,7 +1900,7 @@ impl SceneGpuStore {
     /// `ComponentId` — the dirty-tracked counterpart to
     /// [`Self::with_growable_buffer_for_id`]/[`Self::buffer_for_id`].
     pub fn with_dirty_tracked_buffer_for_id(&self, id: ComponentId, f: &mut dyn FnMut(&wgpu::Buffer)) {
-        if let Some(buf) = self.dirty_tracked_gpu_buffers.get(&id) {
+        if let Some(buf) = self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").get(&id) {
             buf.with_buffer(f);
         }
     }
@@ -1181,7 +1909,11 @@ impl SceneGpuStore {
     /// dirty-tracked counterpart to [`Self::growable_epoch_for_id`]. `None`
     /// if `id` isn't registered dirty-tracked.
     pub fn dirty_tracked_epoch_for_id(&self, id: ComponentId) -> Option<u64> {
-        self.dirty_tracked_gpu_buffers.get(&id).map(|buf| buf.epoch())
+        self.dirty_tracked_gpu_buffers
+            .read()
+            .expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned")
+            .get(&id)
+            .map(|buf| buf.epoch())
     }
 
     /// Reserves capacity `n` on every World-mirrored buffer registered so
@@ -1201,10 +1933,10 @@ impl SceneGpuStore {
     /// failing one keep whatever capacity they were successfully grown to
     /// — this is a best-effort batch operation, not transactional.
     pub fn reserve_world_mirror_capacity(&self, queue: &wgpu::Queue, n: u32) -> Result<(), CapacityError> {
-        for buf in self.growable_gpu_buffers.values() {
+        for buf in self.growable_gpu_buffers.read().expect("SceneGpuStore growable_gpu_buffers lock poisoned").values() {
             buf.reserve(queue, n)?;
         }
-        for buf in self.dirty_tracked_gpu_buffers.values() {
+        for buf in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").values() {
             buf.reserve(queue, n)?;
         }
         Ok(())
@@ -1219,10 +1951,10 @@ impl SceneGpuStore {
     /// not every frame; this is a real GPU-to-GPU copy per buffer that
     /// actually shrinks, same cost profile as growth.
     pub fn shrink_world_mirror_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) {
-        for buf in self.growable_gpu_buffers.values() {
+        for buf in self.growable_gpu_buffers.read().expect("SceneGpuStore growable_gpu_buffers lock poisoned").values() {
             buf.shrink_to_fit(queue, highest_live_row, slack_factor);
         }
-        for buf in self.dirty_tracked_gpu_buffers.values() {
+        for buf in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").values() {
             buf.shrink_to_fit(queue, highest_live_row, slack_factor);
         }
     }
@@ -1236,9 +1968,17 @@ impl SceneGpuStore {
     /// bytes — readers must not treat `mesh_index` as trusted without the
     /// row having passed a harvest/liveness gate; the M3-β cull shader
     /// additionally bounds-checks `mesh_index` against the mesh table.
-    pub fn instance_info_buffer(&self) -> &wgpu::Buffer {
+    /// Owned clone (see [`Self::transform_buffer`]'s doc for why) rather
+    /// than a borrow.
+    pub fn instance_info_buffer(&self) -> wgpu::Buffer {
         let id = component_id::<InstanceInfo>();
-        self.gpu_buffers.get(&id).expect("InstanceInfo buffer not registered").buffer()
+        self.gpu_buffers
+            .read()
+            .expect("SceneGpuStore gpu_buffers lock poisoned")
+            .get(&id)
+            .expect("InstanceInfo buffer not registered")
+            .buffer()
+            .clone()
     }
 
     /// Row-indexed global-slot mirror (T4; C6 GPU handle validation).
@@ -1277,9 +2017,12 @@ impl SceneGpuStore {
 
     // ── Telemetry / snapshot accessors (pub(crate)) ──────────────────────
 
-    /// GPU buffers map for telemetry snapshot.
-    pub(crate) fn telemetry_gpu_buffers(&self) -> &HashMap<ComponentId, Box<dyn GpuBufferDispatch>> {
-        &self.gpu_buffers
+    /// GPU buffers map for telemetry snapshot. Returns the read-lock guard
+    /// itself (not a `&HashMap` — `gpu_buffers` lives behind a `RwLock`, see
+    /// its field doc) so callers `Deref` through it exactly like a plain
+    /// reference.
+    pub(crate) fn telemetry_gpu_buffers(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ComponentId, Arc<dyn GpuBufferDispatch>>> {
+        self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned")
     }
 
     /// Row region pools for telemetry snapshot.

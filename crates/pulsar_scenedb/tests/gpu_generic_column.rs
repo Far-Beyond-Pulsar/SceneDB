@@ -24,8 +24,8 @@
 //! only some of their fields to the GPU, not "this whole type is a GPU row").
 
 use pulsar_scenedb::gpu::{
-    CellId, CellSlot, EngineGpuContext, FrameDriver, GpuColumnDesc, GpuColumnSet, MirrorMode,
-    RegionClassConfig, SceneGpuConfig, SceneGpuStore, SimulateWitness,
+    BufferKey, CellId, CellSlot, EngineGpuContext, FrameDriver, GpuColumnDesc, GpuColumnSet,
+    MirrorMode, RegionClassConfig, SceneGpuConfig, SceneGpuStore, SimulateWitness,
 };
 use pulsar_scenedb::{component_id, CellStorage, CellType, Handle, Pod, TypeToken};
 
@@ -108,6 +108,7 @@ impl GpuColumnSet for TestMaterial {
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-materials",
+            upload: None,
         }]
     }
 
@@ -148,6 +149,7 @@ impl GpuColumnSet for TestLight {
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-lights",
+            upload: None,
         }]
     }
 
@@ -176,8 +178,18 @@ fn two_independently_registered_custom_types_round_trip_without_cross_contaminat
     // The exact call shape SceneGpuStore::new uses internally for the two
     // built-ins ([f32;16] transforms, InstanceInfo) -- proving it works
     // identically for caller-defined types is the whole point.
-    store.register_gpu_buffer::<TestMaterial>(ROW_CAPACITY, ctx.device(), "test-materials");
-    store.register_gpu_buffer::<TestLight>(ROW_CAPACITY, ctx.device(), "test-lights");
+    store.register_gpu_buffer::<TestMaterial, TestMaterial>(
+        ROW_CAPACITY,
+        ctx.device(),
+        BufferKey::of("test-materials"),
+        MirrorMode::DirtyTracked,
+    );
+    store.register_gpu_buffer::<TestLight, TestLight>(
+        ROW_CAPACITY,
+        ctx.device(),
+        BufferKey::of("test-lights"),
+        MirrorMode::DirtyTracked,
+    );
 
     let material_type = CellType::new("materials")
         .with(TypeToken::of::<TestMaterial>())
@@ -265,7 +277,7 @@ fn two_independently_registered_custom_types_round_trip_without_cross_contaminat
     let material_row = store.row_region_base(material_cell_id) as u64;
     let material_bytes = readback(
         &ctx,
-        material_buf,
+        &material_buf,
         material_row * std::mem::size_of::<TestMaterial>() as u64,
         std::mem::size_of::<TestMaterial>() as u64,
     );
@@ -285,7 +297,7 @@ fn two_independently_registered_custom_types_round_trip_without_cross_contaminat
     let light_row = store.row_region_base(light_cell_id) as u64;
     let light_bytes = readback(
         &ctx,
-        light_buf,
+        &light_buf,
         light_row * std::mem::size_of::<TestLight>() as u64,
         std::mem::size_of::<TestLight>() as u64,
     );

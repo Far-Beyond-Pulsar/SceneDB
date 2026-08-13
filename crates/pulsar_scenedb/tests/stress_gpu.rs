@@ -422,7 +422,7 @@ fn storm2_eviction_recycle_storm_500_cycles() {
         b.run(&mut store, &mut slots);
     }
     let total_rows = MAX_RESIDENT as u64 * CAPACITY as u64;
-    let data = readback(&ctx, store.transform_buffer(), total_rows * 64);
+    let data = readback(&ctx, &store.transform_buffer(), total_rows * 64);
     let mut rows_checked = 0u32;
     for &(idx, id) in resident.iter() {
         let base = store.row_region_base(id) as usize;

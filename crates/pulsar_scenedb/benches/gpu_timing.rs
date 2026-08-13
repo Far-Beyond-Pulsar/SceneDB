@@ -345,7 +345,7 @@ fn main() {
         let total_ns = timer.measure_ns(&ctx, || {
             for _ in 0..REPEATS {
                 ctx.queue().write_buffer(
-                    store.transform_buffer(),
+                    &store.transform_buffer(),
                     region_base * MAT_BYTES,
                     as_bytes(&full_bytes),
                 );

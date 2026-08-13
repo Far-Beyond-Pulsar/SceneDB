@@ -11,6 +11,18 @@ use crate::gpu::generate_gpu_column_set;
 
 pub struct GpuAttr {
     pub mirror_mode: Option<MirrorModeAttr>,
+    /// The buffer key a `#[gpu(buffer = "...")]` field declares; `None` when
+    /// the field uses the default one-buffer-per-field split (the derive then
+    /// derives a key unique to this (struct, field) pair).
+    pub buffer_key: Option<String>,
+    /// `#[gpu(mirror = Once, heavy)]` -- a bare flag (no `= value`). Declares
+    /// that this field's type implements `GpuUploadSource`: the CPU column
+    /// stores the field's own (lightweight handle) type, but the GPU buffer's
+    /// element is `<FieldTy as GpuUploadSource>::Element` instead, populated
+    /// via the trait's `upload_element`. Only valid alongside `mirror = Once`
+    /// -- checked at macro-expansion time, not here (this struct doesn't see
+    /// the field's default mirror mode when `mirror` is omitted).
+    pub heavy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,25 +33,50 @@ pub enum MirrorModeAttr {
 
 impl Parse for GpuAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(GpuAttr { mirror_mode: None });
-        }
-        let _: Ident = input.parse()?;
-        let _: syn::Token![=] = input.parse()?;
-        let mode: Ident = input.parse()?;
-        let mode = match mode.to_string().as_str() {
-            "DirtyTracked" => MirrorModeAttr::DirtyTracked,
-            "Once" => MirrorModeAttr::Once,
-            _ => {
-                return Err(syn::Error::new(
-                    mode.span(),
-                    "expected DirtyTracked or Once",
-                ))
+        let mut mirror_mode = None;
+        let mut buffer_key = None;
+        let mut heavy = false;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "mirror" => {
+                    let _: syn::Token![=] = input.parse()?;
+                    let mode: Ident = input.parse()?;
+                    let mode = match mode.to_string().as_str() {
+                        "DirtyTracked" => MirrorModeAttr::DirtyTracked,
+                        "Once" => MirrorModeAttr::Once,
+                        _ => {
+                            return Err(syn::Error::new(
+                                mode.span(),
+                                "expected DirtyTracked or Once",
+                            ))
+                        }
+                    };
+                    mirror_mode = Some(mode);
+                }
+                "buffer" => {
+                    let _: syn::Token![=] = input.parse()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    buffer_key = Some(lit.value());
+                }
+                "heavy" => {
+                    // Bare flag -- no `= value`, unlike `mirror`/`buffer`.
+                    heavy = true;
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown #[gpu] option `{other}` (expected `mirror`, `buffer`, or `heavy`)"),
+                    ))
+                }
             }
-        };
-        Ok(GpuAttr {
-            mirror_mode: Some(mode),
-        })
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        Ok(GpuAttr { mirror_mode, buffer_key, heavy })
     }
 }
 
@@ -52,27 +89,51 @@ impl Parse for GpuAttr {
 
 pub struct StructGpuAttr {
     pub layout_packed: bool,
+    /// Optional struct-level `buffer = "..."` key for packed layout — the
+    /// key under which the single interleaved packed buffer is registered
+    /// (defaults to `{Type}::packed`). Only meaningful alongside
+    /// `layout = packed`.
+    pub buffer_key: Option<String>,
 }
 
 impl Parse for StructGpuAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(StructGpuAttr { layout_packed: false });
+        let mut layout_packed = false;
+        let mut buffer_key = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            let _: syn::Token![=] = input.parse()?;
+            match key.to_string().as_str() {
+                "layout" => {
+                    let value: Ident = input.parse()?;
+                    if value != "packed" {
+                        return Err(syn::Error::new(value.span(), "expected `packed` -- the only supported layout today"));
+                    }
+                    layout_packed = true;
+                }
+                "buffer" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    buffer_key = Some(lit.value());
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown #[gpu] option `{other}` (expected `layout` or `buffer`)"),
+                    ))
+                }
+            }
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            } else {
+                break;
+            }
         }
-        let key: Ident = input.parse()?;
-        if key != "layout" {
-            return Err(syn::Error::new(key.span(), "expected `layout` (e.g. `#[gpu(layout = packed)]`)"));
-        }
-        let _: syn::Token![=] = input.parse()?;
-        let value: Ident = input.parse()?;
-        if value != "packed" {
-            return Err(syn::Error::new(value.span(), "expected `packed` -- the only supported layout today"));
-        }
-        Ok(StructGpuAttr { layout_packed: true })
+        Ok(StructGpuAttr { layout_packed, buffer_key })
     }
 }
 
-/// Scans a struct's own attributes (not its fields') for `#[gpu(layout = packed)]`.
+/// Scans a struct's own attributes (not its fields') for `#[gpu(...)]`,
+/// returning the parsed [`StructGpuAttr`].
 ///
 /// Packed layout groups every `#[gpu]` field into ONE GPU buffer (a single
 /// interleaved record per row) instead of the default one-buffer-per-field
@@ -89,20 +150,22 @@ impl Parse for StructGpuAttr {
 /// side, not how it's stored on the CPU side). Requires at least one
 /// `#[gpu]` field to have any effect -- a packed struct with none behaves
 /// identically to one without the attribute at all (nothing to pack).
-pub fn struct_is_packed(attrs: &[syn::Attribute]) -> bool {
-    // Lenient on parse failure (a bare `#[gpu]` with no `(...)` at all, or
-    // unrecognized content), matching the existing per-field `#[gpu]`
-    // parsing's own tolerance (`scene_store::expand`'s field loop: `if let
-    // Ok(...) = attr.parse_args()`) rather than hard-erroring -- consistent
-    // behavior for the same attribute name used at two different syntactic
-    // positions in this macro.
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("gpu")
-            && attr
-                .parse_args::<StructGpuAttr>()
-                .map(|parsed| parsed.layout_packed)
-                .unwrap_or(false)
-    })
+///
+/// A struct-level `buffer = "..."` names the packed buffer's shared key;
+/// without it the packed buffer registers under `{Type}::packed`. Sharing a
+/// packed key across two different structs is only accepted when their
+/// element types agree, and the registered element type for a packed record
+/// is the struct itself (`#name`), so in practice a packed key is shared
+/// only by the exact same struct type -- document this if you rely on it.
+///
+/// Lenient on parse failure (a bare `#[gpu]` with no `(...)` at all, or
+/// unrecognized content), matching the existing per-field `#[gpu]`
+/// parsing's own tolerance (`scene_store::expand`'s field loop: `if let
+/// Ok(...) = attr.parse_args()`) rather than hard-erroring -- consistent
+/// behavior for the same attribute name used at two different syntactic
+/// positions in this macro.
+pub fn struct_gpu_attr(attrs: &[syn::Attribute]) -> StructGpuAttr {
+    attrs.iter().find(|attr| attr.path().is_ident("gpu")).and_then(|attr| attr.parse_args::<StructGpuAttr>().ok()).unwrap_or(StructGpuAttr { layout_packed: false, buffer_key: None })
 }
 
 // ── Per-field metadata ────────────────────────────────────────────────────
@@ -112,6 +175,18 @@ pub struct FieldInfo {
     pub ty: Type,
     pub is_gpu: bool,
     pub mirror_mode: MirrorModeAttr,
+    /// The declared `buffer = "..."` key from a `#[gpu(buffer = "...")]`
+    /// field, or `None` for the default one-buffer-per-field split. See the
+    /// `GpuBufferRegistry` doc for what sharing a key means and the
+    /// compatibility rules that apply to it.
+    pub buffer_key: Option<String>,
+    /// `#[gpu(mirror = Once, heavy)]` -- see [`GpuAttr::heavy`]'s doc.
+    /// Validated (macro-expansion-time `compile_error!`, not a runtime
+    /// panic) to only appear alongside `mirror_mode == Once` in
+    /// `generate_gpu_column_set`, since `FieldInfo` itself doesn't know
+    /// whether `mirror_mode` came from an explicit `mirror = ...` or the
+    /// default.
+    pub heavy: bool,
     /// Present iff `is_gpu`. `ComponentId`/`TypeToken` (this crate's GPU
     /// buffer + CPU-column keys) are derived from a Rust `TypeId`, globally
     /// — keyed by the field's own raw type, they carry no notion of which
@@ -170,6 +245,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let ty = field.ty.clone();
         let mut is_gpu = false;
         let mut mirror_mode = MirrorModeAttr::DirtyTracked;
+        let mut buffer_key: Option<String> = None;
+        let mut heavy = false;
 
         for attr in &field.attrs {
             if attr.path().is_ident("gpu") {
@@ -178,6 +255,10 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     if let Some(mode) = gpu_attr.mirror_mode {
                         mirror_mode = mode;
                     }
+                    if let Some(key) = gpu_attr.buffer_key {
+                        buffer_key = Some(key);
+                    }
+                    heavy = gpu_attr.heavy;
                 }
             }
         }
@@ -202,6 +283,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             ty,
             is_gpu,
             mirror_mode,
+            buffer_key,
+            heavy,
             gpu_wrapper,
         });
     }
@@ -262,7 +345,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         })
         .collect();
 
-    let is_packed = struct_is_packed(&input.attrs);
+    let struct_gpu_attr = struct_gpu_attr(&input.attrs);
+    let is_packed = struct_gpu_attr.layout_packed;
     let gpu_column_set = generate_gpu_column_set(
         name,
         &impl_generics,
@@ -270,6 +354,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         where_clause,
         &gpu_fields,
         is_packed,
+        struct_gpu_attr.buffer_key.as_deref(),
     );
     // NOTE: HasTypeToken is NOT generated here — the blanket impl in
     // `pulsar_scenedb::token` covers `T: Pod + 'static`, which our Pod impl

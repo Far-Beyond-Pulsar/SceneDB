@@ -5,7 +5,22 @@
 //! The arena retains no CPU copy of geometry; it is residency-only (the asset
 //! system owns the source blobs for any future re-upload).
 
-use super::EngineGpuContext;
+use super::{BufferAccess, BufferKey, BufferRegistrationError, EngineGpuContext, GpuBufferRegistry, MirrorMode};
+
+/// Issue #41's "Collapse map": the documented `BufferKey`s each asset store
+/// below registers under via its `register_key` method. `GeometryArena`
+/// registers TWO keys (vertex + index); every other store registers one.
+/// These are the ONLY well-known keys this module claims — a caller wiring
+/// an asset store to a [`GpuBufferRegistry`] (typically
+/// `SceneGpuStore::buffer_registry()`) uses these constants rather than
+/// re-typing the string literals.
+pub const GEOMETRY_VERTEX_BUFFER_KEY: BufferKey = BufferKey::of("builtin_mesh_vertex");
+pub const GEOMETRY_INDEX_BUFFER_KEY: BufferKey = BufferKey::of("builtin_mesh_index");
+pub const MESH_METADATA_BUFFER_KEY: BufferKey = BufferKey::of("builtin_mesh_metadata");
+pub const CLUSTER_BUFFER_KEY: BufferKey = BufferKey::of("builtin_cluster");
+pub const MESHLET_BUFFER_KEY: BufferKey = BufferKey::of("builtin_meshlet");
+pub const MATERIAL_BUFFER_KEY: BufferKey = BufferKey::of("builtin_material");
+pub const TEXTURE_STORE_KEY: BufferKey = BufferKey::of("builtin_texture");
 
 /// Hard arena-exhaustion error (§8): surfaced to the caller, never a realloc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +178,36 @@ impl GeometryArena {
     pub fn upload_count(&self) -> u64 {
         self.upload_count
     }
+
+    /// Issue #41 Tier-2 collapse: register both arenas as *resource* entries
+    /// (not row buffers — a byte-range suballocator has no fixed-stride `T`)
+    /// under [`GEOMETRY_VERTEX_BUFFER_KEY`]/[`GEOMETRY_INDEX_BUFFER_KEY`] in
+    /// `registry`, so a renderer can resolve them the same way it resolves
+    /// any other keyed buffer — `upload_vertices`/`upload_indices`/`free_*`
+    /// stay this type's own API (module doc: "no CPU copy retained,
+    /// residency-only"; the collapse doesn't change the suballocator, only
+    /// makes its buffers reachable by key too).
+    ///
+    /// Both arenas are fixed-size (allocated once in [`Self::new`], never
+    /// reallocated — only their byte RANGES are suballocated/freed, the
+    /// underlying `wgpu::Buffer` identity never changes), so one call here
+    /// right after construction is a complete, permanent registration; no
+    /// further `sync` is ever needed for these two keys.
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_resource(
+            GEOMETRY_VERTEX_BUFFER_KEY,
+            self.vertex.size() as usize,
+            self.vertex.clone(),
+            BufferAccess::ReadOnly,
+        )?;
+        registry.register_resource(
+            GEOMETRY_INDEX_BUFFER_KEY,
+            self.index.size() as usize,
+            self.index.clone(),
+            BufferAccess::ReadOnly,
+        )?;
+        Ok(())
+    }
 }
 
 /// C5 (§6.1): 72-byte mesh metadata record, mirrored 1:1 into the
@@ -286,6 +331,25 @@ impl MeshRegistry {
     #[doc(hidden)]
     pub fn upload_count(&self) -> u64 {
         self.upload_count
+    }
+
+    /// Issue #41 Tier-2 collapse: register this registry's buffer as a row
+    /// buffer of [`MeshMetadata`] under [`MESH_METADATA_BUFFER_KEY`] in
+    /// `registry`, reachable by key alongside the store's own `#[gpu]`
+    /// columns — `register`/`get`/`entries`/`rebuild` stay this type's own
+    /// CPU-side API (issue #41: "Their CPU-side APIs... stay, but they go
+    /// through the same transport"). `MirrorMode::Once` reflects this
+    /// registry's real write pattern: entries are appended at load and never
+    /// mutated in place. Fixed-capacity, allocated once in [`Self::new`] and
+    /// never reallocated — one call here is a complete, permanent
+    /// registration.
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_row::<MeshMetadata>(
+            MESH_METADATA_BUFFER_KEY,
+            self.buf.clone(),
+            BufferAccess::ReadOnly,
+            MirrorMode::Once,
+        )
     }
 }
 
@@ -456,6 +520,21 @@ impl ClusterBuffer {
     #[doc(hidden)]
     pub fn upload_count(&self) -> u64 {
         self.upload_count
+    }
+
+    /// Issue #41 Tier-2 collapse: register this buffer as a row buffer of
+    /// [`ClusterNode`] under [`CLUSTER_BUFFER_KEY`] in `registry` — see
+    /// [`MeshRegistry::register_key`]'s doc for the shared rationale
+    /// (`append`/`get`/`nodes`/`rebuild` stay this type's own API;
+    /// `MirrorMode::Once` matches the append-only write pattern; fixed
+    /// capacity, one call here is a complete, permanent registration).
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_row::<ClusterNode>(
+            CLUSTER_BUFFER_KEY,
+            self.buf.clone(),
+            BufferAccess::ReadOnly,
+            MirrorMode::Once,
+        )
     }
 }
 
@@ -637,6 +716,18 @@ impl MeshletBuffer {
     #[doc(hidden)]
     pub fn upload_count(&self) -> u64 {
         self.upload_count
+    }
+
+    /// Issue #41 Tier-2 collapse: register this buffer as a row buffer of
+    /// [`MeshletEntry`] under [`MESHLET_BUFFER_KEY`] in `registry` — see
+    /// [`MeshRegistry::register_key`]'s doc for the shared rationale.
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_row::<MeshletEntry>(
+            MESHLET_BUFFER_KEY,
+            self.buf.clone(),
+            BufferAccess::ReadOnly,
+            MirrorMode::Once,
+        )
     }
 }
 
@@ -830,6 +921,23 @@ impl MaterialRegistry {
     pub fn upload_count(&self) -> u64 {
         self.upload_count
     }
+
+    /// Issue #41 Tier-2 collapse: register this buffer as a row buffer of
+    /// [`MaterialRow`] under [`MATERIAL_BUFFER_KEY`] in `registry` — see
+    /// [`MeshRegistry::register_key`]'s doc for the shared rationale. A
+    /// `#[gpu(buffer = "builtin_material", mirror = Once)]` component field
+    /// declaring the SAME key lands in this exact physical buffer (issue
+    /// #41's worked `MaterialComponent` example) — `GpuBufferRegistry`'s
+    /// element/stride/access/mode validation at registration is what makes
+    /// that safe rather than a silent alias.
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_row::<MaterialRow>(
+            MATERIAL_BUFFER_KEY,
+            self.buf.clone(),
+            BufferAccess::ReadOnly,
+            MirrorMode::Once,
+        )
+    }
 }
 
 /// Bindless texture slot ceiling (spec §10 G4 / recon ceiling). `TextureStore`
@@ -1007,6 +1115,27 @@ impl TextureStore {
     #[doc(hidden)]
     pub fn upload_count(&self) -> u64 {
         self.upload_count
+    }
+
+    /// Issue #41 Tier-2 collapse: reserve [`TEXTURE_STORE_KEY`] in
+    /// `registry` as a *texture array* ([`GpuBufferRegistry::register_texture_array`])
+    /// — a bind-group array of `wgpu::Texture`s has no single `wgpu::Buffer`
+    /// to hand back, so this only reserves the key's namespace (blocking a
+    /// row buffer or byte-range resource from ever claiming
+    /// `"builtin_texture"`) and records the current slot extent. Texture
+    /// access itself stays entirely through this store's own API
+    /// ([`Self::texture`]) — see issue #41's "What legitimately stays
+    /// bespoke" section and [`GpuBufferRegistry::register_texture_array`]'s
+    /// doc.
+    ///
+    /// Unlike the fixed-capacity asset stores above, [`Self::slot_count`]
+    /// can grow after this call (each [`Self::register`] past the current
+    /// high-water mark advances it) — call this again whenever the recorded
+    /// capacity should reflect a new high-water mark; it is a cheap,
+    /// idempotent-on-no-growth re-registration
+    /// ([`GpuBufferRegistry::register_texture_array`] handles the update).
+    pub fn register_key(&self, registry: &GpuBufferRegistry) -> Result<(), BufferRegistrationError> {
+        registry.register_texture_array(TEXTURE_STORE_KEY, self.slot_count(), BufferAccess::ReadWrite)
     }
 }
 
