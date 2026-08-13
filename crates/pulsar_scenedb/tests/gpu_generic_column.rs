@@ -277,7 +277,7 @@ fn two_independently_registered_custom_types_round_trip_without_cross_contaminat
     let material_row = store.row_region_base(material_cell_id) as u64;
     let material_bytes = readback(
         &ctx,
-        material_buf,
+        &material_buf,
         material_row * std::mem::size_of::<TestMaterial>() as u64,
         std::mem::size_of::<TestMaterial>() as u64,
     );
@@ -297,7 +297,7 @@ fn two_independently_registered_custom_types_round_trip_without_cross_contaminat
     let light_row = store.row_region_base(light_cell_id) as u64;
     let light_bytes = readback(
         &ctx,
-        light_buf,
+        &light_buf,
         light_row * std::mem::size_of::<TestLight>() as u64,
         std::mem::size_of::<TestLight>() as u64,
     );

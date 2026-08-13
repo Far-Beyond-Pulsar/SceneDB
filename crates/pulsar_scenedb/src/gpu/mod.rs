@@ -27,6 +27,7 @@ mod readback;
 mod region;
 mod scatter_write;
 mod scene_store;
+mod slot_allocator;
 mod system_binding;
 mod tracker;
 mod view_upload;
@@ -64,6 +65,7 @@ pub use scene_store::{
     RegionClassConfig, SceneGpuConfig, SceneGpuStore, UploadMapperFn, CELL_METADATA_BUFFER_KEY,
     GENERATION_BUFFER_KEY, SLOT_MIRROR_BUFFER_KEY,
 };
+pub use slot_allocator::{SlotAllocator, SlotHandle};
 pub use system_binding::{BufferBinding, BufferResolveError, GpuSystemContext};
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;

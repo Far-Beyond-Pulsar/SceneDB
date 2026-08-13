@@ -69,6 +69,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+/// The initial capacity `#[derive(SceneStore)]`'s generated per-type
+/// dispatch function passes to `T::register_gpu_columns_growable` when
+/// auto-registering a never-before-seen `#[gpu]`-bearing type on its first
+/// insert (issue #41: "auto-registration on first use"). Deliberately small
+/// — matches [`GenerationMirror`]'s own initial capacity and every other
+/// World-mirrored buffer's recommended sizing: growth is transparent and
+/// cheap-to-start-small is the right default when the eventual entity count
+/// isn't known ahead of time (see `SceneGpuStore::register_growable_gpu_buffer`'s
+/// doc). A caller who wants a different starting size, or who wants to move
+/// the first-growth cost off the per-insert critical path entirely, still
+/// registers manually (or calls `World::reserve_gpu_mirror_capacity`) BEFORE
+/// the type's first insert — manual registration always wins over
+/// auto-registration, since this constant is only ever consulted when
+/// nothing registered the type yet.
+pub const DEFAULT_AUTO_REGISTER_CAPACITY: u32 = 64;
+
 /// Row-indexed liveness/generation buffer, mirroring `World::entity_slots`'s
 /// `generation` field on the GPU, keyed by `Entity::index()` exactly like
 /// every other World-mirrored buffer. See the "Liveness" section of the

@@ -128,7 +128,7 @@ fn gpu_tagged_component_lands_in_its_buffer_at_entity_index_on_plain_insert() {
     let mesh_field_id = columns[0].field_token.id();
     let mesh_buf = store.buffer_for_id(mesh_field_id).expect("mesh buffer registered");
 
-    let bytes = readback(&ctx, mesh_buf, (row as u64) * 4, 4);
+    let bytes = readback(&ctx, &mesh_buf, (row as u64) * 4, 4);
     let got = u32::from_ne_bytes(bytes.try_into().unwrap());
     assert_eq!(got, 0xBEEF, "GPU-tagged field must be readable at row = entity.index()");
 
@@ -136,7 +136,7 @@ fn gpu_tagged_component_lands_in_its_buffer_at_entity_index_on_plain_insert() {
     // `World::insert_inner` must re-mirror too, not just the
     // first-time/migration path.
     world.insert(entity, StaticMeshComponent { mesh: 0x1234, label: 0xCAFE });
-    let bytes = readback(&ctx, mesh_buf, (row as u64) * 4, 4);
+    let bytes = readback(&ctx, &mesh_buf, (row as u64) * 4, 4);
     let got = u32::from_ne_bytes(bytes.try_into().unwrap());
     assert_eq!(got, 0x1234, "re-insert (update) must re-mirror the new value");
 }

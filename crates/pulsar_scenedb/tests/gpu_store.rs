@@ -271,7 +271,7 @@ fn write_transform_is_the_single_mutation_path() {
     }
     let row = cell.row_of(h).unwrap() as usize;
     let base = store.row_region_base(id) as usize;
-    let gpu = as_f32s(&readback(&ctx, store.transform_buffer(), (64 * 4 * 64) as u64));
+    let gpu = as_f32s(&readback(&ctx, &store.transform_buffer(), (64 * 4 * 64) as u64));
     assert_eq!(&gpu[(base + row) * 16..(base + row) * 16 + 16], &mat(9.0));
     // Stale handle rejected.
     let dead = cell.alloc().unwrap();
@@ -310,7 +310,7 @@ fn compaction_move_is_resynced_and_generation_buffer_matches_registry() {
     // Moved row's GPU bytes are correct at its NEW index:
     let hc_row = cell.row_of(hc).unwrap() as usize;
     let base = store.row_region_base(id) as usize;
-    let gpu = as_f32s(&readback(&ctx, store.transform_buffer(), (64 * 4 * 64) as u64));
+    let gpu = as_f32s(&readback(&ctx, &store.transform_buffer(), (64 * 4 * 64) as u64));
     assert_eq!(&gpu[(base + hc_row) * 16..(base + hc_row) * 16 + 16], &mat(3.0));
     // Generation buffer matches the registry for every allocated slot:
     let regs = cell.registry().generations().to_vec();
@@ -344,7 +344,7 @@ fn write_instance_info_boundary_readback_is_byte_exact() {
     }
     let row = cell.row_of(h).unwrap() as usize;
     let base = store.row_region_base(id) as usize;
-    let gpu = as_infos(&readback(&ctx, store.instance_info_buffer(), (64 * 4 * 8) as u64));
+    let gpu = as_infos(&readback(&ctx, &store.instance_info_buffer(), (64 * 4 * 8) as u64));
     assert_eq!(gpu[base + row], info, "GPU bytes == CPU instance-info column, by row");
     // Stale handle rejected, mirroring write_transform's contract.
     let dead = cell.alloc().unwrap();
@@ -389,7 +389,7 @@ fn compaction_move_carries_instance_info() {
     assert!(stats.ranges >= 1, "the compaction move was re-uploaded");
     let hc_row = cell.row_of(hc).unwrap() as usize;
     let base = store.row_region_base(id) as usize;
-    let gpu = as_infos(&readback(&ctx, store.instance_info_buffer(), (64 * 4 * 8) as u64));
+    let gpu = as_infos(&readback(&ctx, &store.instance_info_buffer(), (64 * 4 * 8) as u64));
     assert_eq!(
         gpu[base + hc_row],
         InstanceInfo { mesh_index: 30, flags: 0 },
@@ -554,7 +554,7 @@ fn test14_device_loss_rematerialization() {
         scene_boundary(&mut frames, sim, &mut store, &mut slots);
     }
     let base_before = store.row_region_base(id) as usize;
-    let before_rows = readback(&ctx1, store.transform_buffer(), (64 * 4 * 64) as u64);
+    let before_rows = readback(&ctx1, &store.transform_buffer(), (64 * 4 * 64) as u64);
     let before_gens = readback(&ctx1, store.generation_buffer(), 64 * 4);
     let before_mirror = readback(&ctx1, store.slot_mirror_buffer(), (64 * 4 * 4) as u64);
 
@@ -567,7 +567,7 @@ fn test14_device_loss_rematerialization() {
     let (rebuilt, ids) = SceneGpuStore::rebuild(&ctx2, cfg, &[(0, &cell)]);
     let id2 = ids[0];
     let base_after = rebuilt.row_region_base(id2) as usize;
-    let after_rows = readback(&ctx2, rebuilt.transform_buffer(), (64 * 4 * 64) as u64);
+    let after_rows = readback(&ctx2, &rebuilt.transform_buffer(), (64 * 4 * 64) as u64);
     let after_gens = readback(&ctx2, rebuilt.generation_buffer(), 64 * 4);
     let after_mirror = readback(&ctx2, rebuilt.slot_mirror_buffer(), (64 * 4 * 4) as u64);
 
@@ -620,7 +620,7 @@ fn two_cells_write_into_disjoint_regions() {
         // Only frame of the test: next-frame witness dropped.
         scene_boundary(&mut frames, sim, &mut store, &mut slots);
     }
-    let gpu = as_f32s(&readback(&ctx, store.transform_buffer(), (64 * 4 * 64) as u64));
+    let gpu = as_f32s(&readback(&ctx, &store.transform_buffer(), (64 * 4 * 64) as u64));
     let base_a = store.row_region_base(ida) as usize;
     let base_b = store.row_region_base(idb) as usize;
     assert_eq!(&gpu[base_a * 16..base_a * 16 + 16], &mat(1.0), "cell A row 0 in region A");
@@ -723,7 +723,7 @@ fn register_cell_warmup_syncs_rows_populated_before_registration() {
         scene_boundary(&mut frames, sim, &mut store, &mut slots);
     }
 
-    let gpu_mats = as_f32s(&readback(&ctx, store.transform_buffer(), (64 * 4 * 64) as u64));
+    let gpu_mats = as_f32s(&readback(&ctx, &store.transform_buffer(), (64 * 4 * 64) as u64));
     for (row, want) in want_mats.iter().enumerate() {
         assert_eq!(
             &gpu_mats[(base + row) * 16..(base + row) * 16 + 16],
@@ -731,7 +731,7 @@ fn register_cell_warmup_syncs_rows_populated_before_registration() {
             "row {row}: pre-registration transform must reach VRAM via register_cell's warm-up"
         );
     }
-    let gpu_infos = as_infos(&readback(&ctx, store.instance_info_buffer(), (64 * 4 * 8) as u64));
+    let gpu_infos = as_infos(&readback(&ctx, &store.instance_info_buffer(), (64 * 4 * 8) as u64));
     for (row, want) in want_infos.iter().enumerate() {
         assert_eq!(
             gpu_infos[base + row], *want,
@@ -975,10 +975,10 @@ fn test14_multicell_device_loss_rematerialization() {
     let slot_base_a_before = 0usize;
     let slot_base_b_before = slot_region_size as usize;
 
-    let before_rows = readback(&ctx1, store.transform_buffer(), transform_bytes);
+    let before_rows = readback(&ctx1, &store.transform_buffer(), transform_bytes);
     let before_mirror = readback(&ctx1, store.slot_mirror_buffer(), mirror_bytes);
     let before_gens = readback(&ctx1, store.generation_buffer(), gen_bytes);
-    let before_infos = readback(&ctx1, store.instance_info_buffer(), info_bytes);
+    let before_infos = readback(&ctx1, &store.instance_info_buffer(), info_bytes);
 
     // Device loss: drop the store, then the entire device.
     drop(store);
@@ -998,10 +998,10 @@ fn test14_multicell_device_loss_rematerialization() {
     let slot_base_a_after = 0usize;
     let slot_base_b_after = slot_region_size as usize;
 
-    let after_rows = readback(&ctx2, rebuilt.transform_buffer(), transform_bytes);
+    let after_rows = readback(&ctx2, &rebuilt.transform_buffer(), transform_bytes);
     let after_mirror = readback(&ctx2, rebuilt.slot_mirror_buffer(), mirror_bytes);
     let after_gens = readback(&ctx2, rebuilt.generation_buffer(), gen_bytes);
-    let after_infos = readback(&ctx2, rebuilt.instance_info_buffer(), info_bytes);
+    let after_infos = readback(&ctx2, &rebuilt.instance_info_buffer(), info_bytes);
 
     // Cell A: byte-identity over its region-relative slices.
     let rows_a = cell_a.rows_in_use() as usize;
@@ -1261,6 +1261,6 @@ fn spatial_cell_with_transform_registers_and_syncs() {
     let mut slots = [CellSlot { id, cell: sc.storage_mut() }];
     b.run(&mut store, &mut slots);
     let base = store.row_region_base(id) as usize;
-    let gpu = as_f32s(&readback(&ctx, store.transform_buffer(), (64 * 4 * 64) as u64));
+    let gpu = as_f32s(&readback(&ctx, &store.transform_buffer(), (64 * 4 * 64) as u64));
     assert_eq!(&gpu[base * 16..base * 16 + 16], &mat(5.0));
 }

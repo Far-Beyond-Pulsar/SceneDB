@@ -33,7 +33,7 @@ pub fn generate_gpu_column_set(
             impl #impl_generics #name #ty_generics #where_clause {
                 /// No `#[gpu]` fields on this type -- nothing to register.
                 pub fn register_gpu_columns(
-                    _store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                    _store: &::pulsar_scenedb::gpu::SceneGpuStore,
                     _capacity: u32,
                     _device: &::wgpu::Device,
                 ) {
@@ -41,7 +41,7 @@ pub fn generate_gpu_column_set(
 
                 /// No `#[gpu]` fields on this type -- nothing to register.
                 pub fn register_gpu_columns_growable(
-                    _store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                    _store: &::pulsar_scenedb::gpu::SceneGpuStore,
                     _initial_capacity: u32,
                     _device: &::std::sync::Arc<::wgpu::Device>,
                 ) {
@@ -443,6 +443,19 @@ pub fn generate_gpu_column_set(
             };
             let id = ::pulsar_scenedb::component::component_id::<#packed_view_ident>();
             let store = mirror.store();
+            // Auto-registration on first use (issue #41: "auto-registration
+            // on first use removes the rest" of the manual setup burden).
+            // Packed columns register under the packed view's OWN
+            // `ComponentId` (not any individual field's token), so that is
+            // exactly what gets checked here -- one cheap `RwLock` read via
+            // `buffer_key_for`, a no-op on every call after the first.
+            if store.buffer_key_for(id).is_none() {
+                <#name #ty_generics>::register_gpu_columns_growable(
+                    store,
+                    ::pulsar_scenedb::gpu::world_mirror::DEFAULT_AUTO_REGISTER_CAPACITY,
+                    &store.device_arc(),
+                );
+            }
             #packed_write_body
         }
 
@@ -471,8 +484,31 @@ pub fn generate_gpu_column_set(
             // so `data` is guaranteed to point at a live, correctly-aligned
             // `#name`.
             let data = unsafe { &*(data as *const #name #ty_generics) };
+            let store = mirror.store();
+            // Auto-registration on first use (issue #41: "auto-registration
+            // on first use removes the rest" of the manual setup burden) --
+            // the very first time ANY entity's `#name` is inserted (or
+            // mutated via `get_mut`) on a `World` with a mirror attached,
+            // this registers `#name`'s `#[gpu]` buffers with a sane default
+            // capacity, so `T::register_gpu_columns_growable` never needs a
+            // manual call. `is_registered` checks only the first field as a
+            // proxy for "is `#name` registered at all" -- correct because
+            // registration always covers every field together, in one call
+            // (see `SceneGpuStore::is_registered`'s doc) -- so this is one
+            // cheap `RwLock` read on every call, a no-op after the first.
+            // A caller that DID register manually (with a custom capacity,
+            // or ahead of time via `World::reserve_gpu_mirror_capacity`)
+            // is unaffected: manual registration already satisfies this
+            // check, so auto-registration never runs for it.
+            if !store.is_registered::<#name #ty_generics>() {
+                <#name #ty_generics>::register_gpu_columns_growable(
+                    store,
+                    ::pulsar_scenedb::gpu::world_mirror::DEFAULT_AUTO_REGISTER_CAPACITY,
+                    &store.device_arc(),
+                );
+            }
             ::pulsar_scenedb::gpu::world_mirror::write_gpu_columns_at_row(
-                mirror.store(),
+                store,
                 mirror.queue(),
                 row,
                 data,
@@ -570,7 +606,7 @@ pub fn generate_gpu_column_set(
             /// what `#[derive(SceneStore)]`'s generated `Pod` impl requires
             /// anyway.
             pub fn register_gpu_columns(
-                store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                store: &::pulsar_scenedb::gpu::SceneGpuStore,
                 capacity: u32,
                 device: &::wgpu::Device,
             ) where
@@ -592,7 +628,7 @@ pub fn generate_gpu_column_set(
             /// Same shared-key semantics as [`Self::register_gpu_columns`],
             /// applied through the dirty-tracked World-mirror path.
             pub fn register_gpu_columns_growable(
-                store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                store: &::pulsar_scenedb::gpu::SceneGpuStore,
                 initial_capacity: u32,
                 device: &::std::sync::Arc<::wgpu::Device>,
             ) where
