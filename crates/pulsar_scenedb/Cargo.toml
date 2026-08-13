@@ -32,6 +32,7 @@ naga = { version = "30", features = ["wgsl-in"] }
 ratatui = "0.29"
 crossterm = "0.28"
 pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
+bevy_ecs = { version = "0.19.1", default-features = false, features = ["std"] }
 
 [[example]]
 name = "stress_tui"
@@ -59,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "replication_bench"
+harness = false
+
+[[bench]]
+name = "vs_bevy_ecs"
 harness = false
 
 [[bench]]
