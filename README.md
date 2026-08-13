@@ -49,7 +49,7 @@ On top of paged storage, the **archetype ECS** (`World`) groups entities by comp
 
 The **spatial layer** wraps a page with six dedicated `f32` columns (AABB min/max per axis). Queries scan the column arrays directly — no per-entity iteration, no hot-path allocation — accelerated by AVX2 (x86) and NEON (ARM) SIMD kernels that a scalar reference implementation must match bit-for-bit. AABB and frustum queries are both supported.
 
-The **streaming grid** classifies cells into Outer/Margin/Inner domains from a concentric distance model with hysteresis bands that damp boundary jitter, against a *slice* of observer AABBs — multiple players with overlapping load areas work correctly, a cell promotes if any player is close enough and demotes only once all have left. Cells can also be pinned to a domain directly, bypassing distance rules entirely; pinned and distance-classified cells coexist on the same grid.
+The **streaming grid** classifies cells into Outer/Margin/Inner domains — SceneDB's concentric VRAM-residency rings — from a distance model with hysteresis bands that damp boundary jitter, against a *slice* of observer AABBs — multiple players with overlapping load areas work correctly, a cell promotes if any player is close enough and demotes only once all have left. Cells can also be pinned to a domain directly, bypassing distance rules entirely; pinned and distance-classified cells coexist on the same grid. `Outer` is not on the GPU at all — SceneDB still tracks the cell's coordinate/bounds, but nothing is registered with `SceneGpuStore`. Crossing `Outer → Margin` is what actually uploads the cell (`SceneGpuStore::register_cell`); `Margin ↔ Inner` is a cheaper flag flip on top of that — both are GPU-resident, distinguished by detail tier (proxy/HLOD vs. full geometry, per `StreamingBudget`'s `vram_hlod_budget`/`vram_geometry_budget` split), not by whether the cell is on the GPU at all. There is currently no separate system-RAM residency tier in between — see the note on the FAQ's "asset streaming" answer below for the closest related open question.
 
 On the **GPU side**, a `SceneGpuStore` holds region-partitioned SSBOs shared across every registered cell, delta-synced so only changed rows upload. A generation buffer and slot mirror live in VRAM for GPU-side handle validation, with bulk rebuild after device loss. The harvest pipeline runs per-view spatial queries (one staging array per view, no shared state) and routes hits into mesh-class buckets for indirect draw dispatch. Every GPU resource — row buffers, texture arrays, asset registries — resolves through one keyed `GpuBufferRegistry`; see [Performance](#performance) and the GPU integration section below for how little of this a caller ever touches directly.
 
@@ -1225,7 +1225,12 @@ No. SceneDB produces `Delta` (state) and `EventBatch` (RPC) byte payloads and sp
 
 **Does SceneDB handle asset streaming?**
 
-No. A `GpuHandle`-mode field replicates only the handle index (8 bytes). The actual GPU resource (mesh, texture, buffer) is loaded independently by the engine's asset streaming system. SceneDB says "entity 42's mesh changed to handle 17 at frame 128" — the assembly and delivery of the vertex data is a separate pipeline.
+Depends which kind. Two different things share the name "streaming" here:
+
+- **Local VRAM residency** — which cells are actually uploaded to the GPU right now, based on distance to players — is fully owned by SceneDB: the [streaming grid](#streaming-grid)'s Outer/Margin/Inner domains, described in Architecture above. This has not gone anywhere.
+- **Network asset delivery** — sending the raw bytes of a mesh/texture/buffer to a remote client over the wire — is NOT owned by SceneDB. A `GpuHandle`-mode replicated field only ever carries an 8-byte handle index; SceneDB says "entity 42's mesh changed to handle 17 at frame 128," and resolving handle 17 into actual vertex data on the receiving end is the engine's asset streaming system's job, same as loading any other asset from disk/cache.
+
+What SceneDB does *not* currently have is a system-RAM tier in between — an `Outer` cell today is either GPU-resident (`Margin`/`Inner`) or not registered with the GPU at all, with no explicit "warmed into system RAM, ready for a cheap VRAM promotion" middle state. Tracked as [#43](https://github.com/Far-Beyond-Pulsar/SceneDB/issues/43).
 
 **Can I use SceneDB replication for a multi-user editor?**
 
