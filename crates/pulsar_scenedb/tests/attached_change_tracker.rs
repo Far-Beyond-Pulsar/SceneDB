@@ -87,6 +87,27 @@ fn plain_despawn_and_remove_are_recorded() {
 }
 
 #[test]
+fn plain_spawn_bundle_is_recorded_with_no_tracked_call() {
+    // spawn_bundle/spawn_bundle_tracked route through spawn_inner directly
+    // (not through the plain spawn()/insert() wrappers), so this is a
+    // distinct code path from `plain_spawn_and_insert_are_recorded_...`
+    // above and needs its own coverage.
+    let mut world = World::new();
+    let tracker = SharedChangeTracker::new();
+    world.attach_change_tracker(tracker.clone());
+
+    let e = world.spawn_bundle((Pos(1.0, 1.0, 1.0), Health(10)));
+
+    let delta = tracker.drain_with_world(&world);
+    assert_eq!(delta.spawned, vec![(e, delta.spawned[0].1.clone())]);
+    assert_eq!(
+        delta.component_deltas.len(),
+        2,
+        "both bundle components must be recorded"
+    );
+}
+
+#[test]
 fn no_tracker_attached_plain_calls_behave_exactly_as_before() {
     let mut world = World::new();
     assert!(!world.has_change_tracker());

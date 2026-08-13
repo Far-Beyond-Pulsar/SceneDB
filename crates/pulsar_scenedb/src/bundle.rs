@@ -158,15 +158,34 @@ impl World {
     /// assert!(world.get::<Pos>(e).is_some());
     /// assert!(world.get::<Vel>(e).is_some());
     /// ```
+    ///
+    /// Records into the `World`'s attached change tracker automatically,
+    /// same as [`World::spawn`] — no `_tracked` call needed for that; see
+    /// [`World::spawn_bundle_tracked`]'s doc if you additionally need to
+    /// record into a *different*, explicitly-held tracker.
     pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
-        self.spawn_bundle_inner(bundle, None)
+        if let Some(shared) = self.change_tracker().cloned() {
+            let mut guard = shared.lock();
+            self.spawn_bundle_inner(bundle, Some(&mut guard))
+        } else {
+            self.spawn_bundle_inner(bundle, None)
+        }
     }
 
     /// Like [`spawn_bundle`](Self::spawn_bundle) but also records the spawn
-    /// and every component in `bundle` in a [`ChangeTracker`] for
-    /// replication.
+    /// and every component in `bundle` in `tracker`. Redundant with plain
+    /// [`Self::spawn_bundle`] once a change tracker is attached
+    /// ([`World::attach_change_tracker`]) — in that case this records into
+    /// the ATTACHED tracker (same as `spawn_bundle` would), not `tracker`,
+    /// matching every other `_tracked` method's documented behavior (see
+    /// [`World::spawn_tracked`]'s doc).
     pub fn spawn_bundle_tracked<B: Bundle>(&mut self, bundle: B, tracker: &mut ChangeTracker) -> Entity {
-        self.spawn_bundle_inner(bundle, Some(tracker))
+        if let Some(shared) = self.change_tracker().cloned() {
+            let mut guard = shared.lock();
+            self.spawn_bundle_inner(bundle, Some(&mut guard))
+        } else {
+            self.spawn_bundle_inner(bundle, Some(tracker))
+        }
     }
 
     fn spawn_bundle_inner<B: Bundle>(&mut self, bundle: B, mut tracker: Option<&mut ChangeTracker>) -> Entity {
