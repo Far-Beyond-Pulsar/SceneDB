@@ -3,7 +3,53 @@ use crate::component::{Column, Component, ComponentId, ErasedColumn};
 use crate::entity::{Entity, EntitySlot};
 use crate::replication::ChangeTracker;
 use ahash::AHashMap;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
+
+/// Fixed-capacity, over-aligned scratch buffer for a single erased-component
+/// move (swap-remove -> push) during archetype migration
+/// ([`World::move_column_row`]), without a heap allocation.
+///
+/// `CAP = 128` bytes at `ALIGN = 16` covers the overwhelming majority of
+/// real ECS components -- a 4x4 `f32` transform matrix is 64 bytes at
+/// 4-byte alignment; ordinary game components (positions, velocities,
+/// health, tags, small structs) are typically well under this. SIMD-shaped
+/// types (`[f32; 4]`, etc.) never exceed 16-byte natural alignment on any
+/// target this crate supports. A component whose size or alignment
+/// requirement genuinely exceeds these bounds is rare, and
+/// `move_column_row` falls back to the original heap-allocating path for
+/// it -- correctness holds either way; only the common case skips the
+/// allocator.
+#[repr(align(16))]
+struct MoveScratch {
+    bytes: [MaybeUninit<u8>; Self::CAP],
+}
+
+impl MoveScratch {
+    const CAP: usize = 128;
+    const ALIGN: usize = 16;
+
+    #[inline]
+    fn new() -> Self {
+        // SAFETY-adjacent note: `MaybeUninit<u8>` needs no initialization
+        // (it is explicitly "possibly uninitialized"), so leaving every
+        // byte uninitialized here is not itself unsafe -- only reading the
+        // bytes before they've been written (which `move_column_row` never
+        // does; it always writes via `swap_remove_into` before reading via
+        // `push_from`) would be.
+        Self { bytes: [MaybeUninit::uninit(); Self::CAP] }
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr() as *mut u8
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr() as *const u8
+    }
+}
 
 /// The central ECS store: owns all entities, their component data, and the
 /// archetype graph.
@@ -604,14 +650,21 @@ impl World {
             return None;
         }
 
-        // Pull the value out of the column.
-        let removed_ptr = unsafe {
-            Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                .unwrap()
-                .swap_remove_erased(old_row)
-        };
-        // SAFETY: we know the concrete type from the generic.
-        let removed_val = unsafe { *Box::from_raw(removed_ptr as *mut T) };
+        // Pull the value out of the column. `remove_inner<T>` already knows
+        // the concrete type -- unlike `migrate_row`'s type-erased column
+        // carry-over (which genuinely doesn't know the OTHER components'
+        // types at compile time), there is no reason to route the value
+        // being returned through the erased `swap_remove_erased`/
+        // `Box::from_raw` path at all. That path heap-allocates a `Box`
+        // just to hand back a type-erased pointer this call immediately
+        // downcasts and moves out of anyway -- a wasted allocator round
+        // trip for every single `World::remove` call. A direct, safe,
+        // typed `Vec::swap_remove` on the concrete `Column<T>` is both
+        // simpler and allocation-free.
+        let removed_val = self.archetypes[old_arch_id.0 as usize]
+            .column_mut::<T>()
+            .data
+            .swap_remove(old_row);
 
         // Archetype-graph edge cache -- see `insert_inner`'s identical use
         // of `add_edge`/`Archetype::add_edges`'s doc for the shared
@@ -845,6 +898,82 @@ impl World {
 
     // â”€â”€ Archetype migration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    /// Moves one column's element at `old_row` in `old_arch_id` into a
+    /// (possibly newly-created) column of the same `cid` in `new_arch_id`.
+    /// Shared by [`Self::migrate_row`]/[`Self::migrate_row_skip`].
+    ///
+    /// Uses the zero-allocation [`ErasedColumn::swap_remove_into`]/
+    /// [`ErasedColumn::push_from`] path (through a stack-allocated
+    /// [`MoveScratch`]) whenever the element fits it -- true for the
+    /// overwhelming majority of real components (anything up to 128 bytes
+    /// at up to 16-byte alignment; a 4x4 `[f32; 16]` transform matrix is
+    /// exactly 64 bytes at 4-byte alignment, well inside it). Before this,
+    /// EVERY column moved during EVERY migration went through
+    /// [`ErasedColumn::swap_remove_erased`]/[`ErasedColumn::push_erased`] --
+    /// a `Box::new` heap allocation on the way out and a matching
+    /// deallocation on the way in, for every single component on every
+    /// single entity that migrates. An entity with N components paid for
+    /// 2N allocator round trips on every `insert`/`remove` that changed its
+    /// archetype. Only a component whose size/alignment genuinely exceeds
+    /// the inline scratch capacity (rare) still pays that cost, via the
+    /// original path kept as a correctness fallback.
+    #[inline]
+    fn move_column_row(&mut self, old_arch_id: ArchetypeId, old_row: usize, new_arch_id: ArchetypeId, cid: ComponentId) {
+        if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
+            let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
+                .unwrap()
+                .new_empty();
+            Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
+        }
+
+        let (elem_size, elem_align) = {
+            let src = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid).unwrap();
+            (src.element_size(), src.element_align())
+        };
+
+        if elem_size <= MoveScratch::CAP && elem_align <= MoveScratch::ALIGN {
+            let mut scratch = MoveScratch::new();
+            // SAFETY: `scratch` is `MoveScratch::CAP` bytes, `repr(align(16))`
+            // (>= `MoveScratch::ALIGN`), and the check above confirms this
+            // column's element fits both bounds -- `swap_remove_into`'s
+            // safety contract (valid for writes, sufficiently aligned)
+            // holds. `old_row` is in bounds because the caller only ever
+            // reaches here for a real occupied row of `old_arch_id`.
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .swap_remove_into(old_row, scratch.as_mut_ptr());
+            }
+            // SAFETY: `scratch` now holds a valid, initialized, properly
+            // aligned instance of this column's element type -- written by
+            // `swap_remove_into` immediately above, with no intervening use
+            // of `scratch`. `push_from` is called exactly once per
+            // `swap_remove_into` on this path, upholding the "logical
+            // ownership handoff, exactly once" contract both methods
+            // document -- no double-move, no leak.
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .push_from(scratch.as_ptr());
+            }
+        } else {
+            // Fallback: an element too large or too strictly aligned for
+            // the inline scratch buffer (rare) -- the original Box-based
+            // path. Still fully correct, just not allocation-free.
+            let ptr = unsafe {
+                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .swap_remove_erased(old_row)
+            };
+            unsafe {
+                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
+                    .unwrap()
+                    .push_erased(ptr);
+            }
+        }
+    }
+
+
     /// Move the entity and all component data from `old_arch_id`/`old_row`
     /// into `new_arch_id`.
     ///
@@ -875,7 +1004,10 @@ impl World {
             .push(entity);
 
         // Phase 2: broadcast each source column into the destination using
-        // the pre-computed `active_cids` slice (no heap allocation).
+        // the pre-computed `active_cids` slice (no heap allocation for the
+        // slice itself, and -- via `move_column_row`'s inline scratch path
+        // -- none for the moved element's bytes either, for the
+        // overwhelming majority of component types).
         let n = self.archetypes[old_arch_id.0 as usize].active_cids.len();
         for i in 0..n {
             let cid = {
@@ -883,22 +1015,7 @@ impl World {
                 let src = &self.archetypes[old_arch_id.0 as usize];
                 src.active_cids[i]
             };
-            let ptr = unsafe {
-                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .swap_remove_erased(old_row)
-            };
-            if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
-                let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .new_empty();
-                Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
-            }
-            unsafe {
-                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .push_erased(ptr);
-            }
+            self.move_column_row(old_arch_id, old_row, new_arch_id, cid);
         }
 
         // Phase 3: remove entity from old archetype; fix swapped-in slot.
@@ -942,7 +1059,9 @@ impl World {
             .entities
             .push(entity);
 
-        // Phase 2: migrate all columns except `skip_cid`.
+        // Phase 2: migrate all columns except `skip_cid` (see
+        // `migrate_row`'s identical use of `move_column_row` for the
+        // zero-allocation rationale).
         let n = self.archetypes[old_arch_id.0 as usize].active_cids.len();
         for i in 0..n {
             let cid = {
@@ -952,22 +1071,7 @@ impl World {
             if cid == skip_cid {
                 continue;
             }
-            let ptr = unsafe {
-                Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .swap_remove_erased(old_row)
-            };
-            if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
-                let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .new_empty();
-                Self::set_column(&mut self.archetypes[new_arch_id.0 as usize], cid, proto);
-            }
-            unsafe {
-                Self::get_erased_mut(&mut self.archetypes[new_arch_id.0 as usize], cid)
-                    .unwrap()
-                    .push_erased(ptr);
-            }
+            self.move_column_row(old_arch_id, old_row, new_arch_id, cid);
         }
 
         // Phase 3: remove entity from old archetype; fix swapped-in slot.
