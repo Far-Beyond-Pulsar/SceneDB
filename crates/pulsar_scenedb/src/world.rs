@@ -519,9 +519,23 @@ impl World {
             return;
         }
 
-        // Build the destination archetype key and ensure it exists.
-        let new_key = self.archetypes[old_arch_id.0 as usize].key.with::<T>();
-        let new_arch_id = self.get_or_create_archetype(new_key);
+        // Archetype-graph edge cache (see `Archetype::add_edges`'s doc): a
+        // transition already taken before is two Vec index reads, zero
+        // allocation, zero hashing -- the common case for any entity that
+        // repeatedly gains/loses the same component shape (tag toggling,
+        // pooled respawn, etc). Only a never-before-seen (old_arch_id, cid)
+        // pair pays for rebuilding the key and hashing it into
+        // `archetype_index`, and that cost is paid exactly once per pair,
+        // ever.
+        let new_arch_id = match self.archetypes[old_arch_id.0 as usize].add_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.with::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[old_arch_id.0 as usize].set_add_edge(cid, id);
+                id
+            }
+        };
 
         // Ensure Column<T> exists in the destination (may be empty).
         let new_arch = &mut self.archetypes[new_arch_id.0 as usize];
@@ -599,11 +613,18 @@ impl World {
         // SAFETY: we know the concrete type from the generic.
         let removed_val = unsafe { *Box::from_raw(removed_ptr as *mut T) };
 
-        // Build the destination key WITHOUT this component.
-        let new_key = self.archetypes[old_arch_id.0 as usize]
-            .key
-            .without::<T>();
-        let new_arch_id = self.get_or_create_archetype(new_key);
+        // Archetype-graph edge cache -- see `insert_inner`'s identical use
+        // of `add_edge`/`Archetype::add_edges`'s doc for the shared
+        // rationale.
+        let new_arch_id = match self.archetypes[old_arch_id.0 as usize].remove_edge(cid) {
+            Some(cached) => cached,
+            None => {
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.without::<T>();
+                let id = self.get_or_create_archetype(new_key);
+                self.archetypes[old_arch_id.0 as usize].set_remove_edge(cid, id);
+                id
+            }
+        };
 
         // Migrate everything except the removed component.
         // migrate_row_skip pushes the entity first, migrates all columns
