@@ -148,6 +148,45 @@ Three changes got the ECS here from an early baseline that was 18–27x behind o
 
 Archetype migration also got a zero-allocation column-move path (stack-scratch `ptr::write`/`ptr::read` in place of a `Box::new`/`Box::from_raw` round trip per component per migration), with a correctness-preserving fallback for the rare component too large or over-aligned for the inline buffer.
 
+### Stats for nerds
+
+Raw query numbers, in case "fast" isn't specific enough. Measured 2026-08-13 on an AMD Ryzen 9 9950X3D (Windows 11, `cargo bench` release profile, criterion 0.8.2 — 100 samples for the ECS runs, 30 for the spatial runs). All figures are medians. Reproduce with:
+
+```bash
+cargo bench -p pulsar_scenedb --bench ecs_detailed_bench -- query_single
+cargo bench -p pulsar_scenedb --bench scenedb_bench -- scan_scaling
+```
+
+**Archetype ECS `World` query** — `world.query::<(&Pos, &Health)>()` over `n` matching entities plus `n/10` non-matching ones to exercise archetype skipping, single-threaded:
+
+| Entities | Query time | Per entity | Throughput |
+|---|---:|---:|---:|
+| 100 | 81.9 ns | 0.82 ns | 1.22 Gelem/s |
+| 1,000 | 664 ns | 0.66 ns | 1.51 Gelem/s |
+| 10,000 | 6.42 µs | 0.64 ns | 1.56 Gelem/s |
+| 50,000 | 31.9 µs | 0.64 ns | 1.57 Gelem/s |
+| 100,000 | 63.6 µs | 0.64 ns | 1.57 Gelem/s |
+
+**Spatial cell query** — one AABB/frustum query over `N` rows laid out across 1024-row cells, ~50% hit rate. "Scalar" is the reference implementation; "AVX2" is the runtime-dispatched SIMD path this host resolves to:
+
+| Rows | AABB scalar | AABB AVX2 | Frustum scalar | Frustum AVX2 |
+|---|---:|---:|---:|---:|
+| 1,024 | 1.04 µs | 510 ns | 3.38 µs | 1.05 µs |
+| 16,384 | 16.9 µs | 8.55 µs | 54.0 µs | 17.1 µs |
+| 256,000 | 270 µs | 154 µs | 864 µs | 279 µs |
+| 1,000,448 | 1.18 ms | 956 µs | 3.79 ms | 1.42 ms |
+
+Same runs, normalized to time per row:
+
+| Rows | AABB scalar | AABB AVX2 | Frustum scalar | Frustum AVX2 |
+|---|---:|---:|---:|---:|
+| 1,024 | 1.01 ns/row | 0.50 ns/row | 3.30 ns/row | 1.02 ns/row |
+| 16,384 | 1.03 ns/row | 0.52 ns/row | 3.30 ns/row | 1.04 ns/row |
+| 256,000 | 1.05 ns/row | 0.60 ns/row | 3.38 ns/row | 1.09 ns/row |
+| 1,000,448 | 1.18 ns/row | 0.96 ns/row | 3.79 ns/row | 1.42 ns/row |
+
+A couple of honesty caveats: the ECS table counts only the `n` matching entities toward throughput, but the scan also walks the `n/10` non-matching archetype. The spatial scan seams capture a fresh liveness-words buffer per per-cell call (shared by both arms), so absolute ns/row at large `N` includes that fixed per-cell cost — the scalar/AVX2 ratio is the honest comparison.
+
 ## Usage
 
 ### Spatial cell
