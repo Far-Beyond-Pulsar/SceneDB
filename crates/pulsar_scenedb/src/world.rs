@@ -97,6 +97,17 @@ pub struct World {
 /// field through `get_mut` silently never reached the GPU, for EITHER
 /// `MirrorMode`, not just `Once`. `Mut` gives `get_mut` the same hook
 /// `insert_inner` already has, reusing the identical link-time dispatch
+///
+/// TODO(Far-Beyond-Pulsar/SceneDB#47): this drop-hook mechanism is also
+/// exactly the right anchor for a `World`-level entity/component
+/// listener/subscription system (`insert`/`get_mut`/`remove` all already
+/// have — or, for `get_mut`, are about to have — a single point where "this
+/// component just changed" is known). Surfaced because Pulsar-Native's
+/// properties panel currently has no way to avoid polling `World` on every
+/// render pass — there's nothing to subscribe to yet. `gpu_hook` below is
+/// the template: a second, symmetric `Option<ListenerHook>` field, `None`
+/// (one cheap check, nothing on drop) whenever nobody's subscribed to this
+/// `(entity, T)`.
 /// registry (`crate::gpu::world_mirror::dispatch_for`) — no new registration
 /// mechanism.
 pub struct Mut<'a, T> {
