@@ -142,7 +142,7 @@ pub use replication::{
     encode_archetype_key, encode_field_value, encode_pod_raw, EntityCellMap, EntitySnapshot,
     ErrorCode, EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler, RelevanceSet,
     ReplicatedEvent, Replicable, ReplicationCondition, ReplicationEncoding, ReplicationSchema,
-    ReplicationRegistry, SchemaBuilder, Snapshot,
+    ReplicationRegistry, SchemaBuilder, SharedChangeTracker, Snapshot,
 };
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;

@@ -83,6 +83,14 @@ pub struct World {
     /// `--no-default-features` never depends on `wgpu`).
     #[cfg(feature = "gpu")]
     gpu_mirror: Option<crate::gpu::GpuMirrorHandle>,
+    /// Change-tracking wiring, attached the same way as `gpu_mirror` above
+    /// (see [`Self::attach_change_tracker`]). `None` (the default) means
+    /// `spawn`/`insert`/`remove`/`despawn`/`get_mut` behave exactly as they
+    /// always have -- no tracking, no cost beyond the `Option::is_none()`
+    /// check. Once attached, every one of those calls records into it
+    /// automatically -- no `_tracked`-suffixed call needed anywhere. Not
+    /// `gpu`-feature-gated: replication is always available (CONTRACTS C0).
+    change_tracker: Option<crate::replication::SharedChangeTracker>,
 }
 
 /// A mutable borrow of component `T` on some entity, returned by
@@ -97,17 +105,6 @@ pub struct World {
 /// field through `get_mut` silently never reached the GPU, for EITHER
 /// `MirrorMode`, not just `Once`. `Mut` gives `get_mut` the same hook
 /// `insert_inner` already has, reusing the identical link-time dispatch
-///
-/// TODO(Far-Beyond-Pulsar/SceneDB#47): this drop-hook mechanism is also
-/// exactly the right anchor for a `World`-level entity/component
-/// listener/subscription system (`insert`/`get_mut`/`remove` all already
-/// have — or, for `get_mut`, are about to have — a single point where "this
-/// component just changed" is known). Surfaced because Pulsar-Native's
-/// properties panel currently has no way to avoid polling `World` on every
-/// render pass — there's nothing to subscribe to yet. `gpu_hook` below is
-/// the template: a second, symmetric `Option<ListenerHook>` field, `None`
-/// (one cheap check, nothing on drop) whenever nobody's subscribed to this
-/// `(entity, T)`.
 /// registry (`crate::gpu::world_mirror::dispatch_for`) — no new registration
 /// mechanism.
 pub struct Mut<'a, T> {
@@ -120,6 +117,13 @@ pub struct Mut<'a, T> {
     /// construction and nothing at all on drop.
     #[cfg(feature = "gpu")]
     gpu_hook: Option<GpuMutHook>,
+    /// Precomputed at [`World::get_mut`] time, same shape as `gpu_hook`
+    /// above: `None` unless a [`crate::replication::SharedChangeTracker`]
+    /// is attached ([`World::attach_change_tracker`]). Lets `get_mut`
+    /// mutations record automatically on drop, the same way `insert`
+    /// already does when a tracker is attached — no `_tracked` call, no
+    /// separate `get_mut_tracked` method to remember.
+    change_hook: Option<ChangeMutHook>,
 }
 
 #[cfg(feature = "gpu")]
@@ -127,6 +131,17 @@ struct GpuMutHook {
     mirror: crate::gpu::GpuMirrorHandle,
     row: u32,
     dispatch: crate::gpu::world_mirror::DispatchFn,
+}
+
+/// See [`Mut::change_hook`]'s doc. Records into the SAME `SharedChangeTracker`
+/// `insert`/`spawn`/`remove`/`despawn` already record into when one is
+/// attached to the `World` this entity belongs to — captured at `get_mut`
+/// time (not re-resolved in `Drop`) since `Mut` doesn't keep a `&World`
+/// borrow alive across its own lifetime.
+struct ChangeMutHook {
+    tracker: crate::replication::SharedChangeTracker,
+    entity: Entity,
+    component_id: ComponentId,
 }
 
 impl<'a, T> Deref for Mut<'a, T> {
@@ -144,9 +159,52 @@ impl<'a, T> DerefMut for Mut<'a, T> {
     }
 }
 
-#[cfg(feature = "gpu")]
+impl<'a, T> Mut<'a, T> {
+    /// Escape hatch back to a bare `&'a mut T`, for callers that need to
+    /// hand this reference across an API boundary that has no room for
+    /// `Mut`'s guard (e.g. a plain `fn(&mut World, Entity) -> Option<&mut
+    /// dyn SomeTrait>` function-pointer signature — Pulsar-Native's
+    /// `engine_class_derive`-generated `WorldComponentRegistration.
+    /// get_as_engine_class_mut` shim is the motivating caller).
+    ///
+    /// Runs the same GPU dirty-mark dispatch AND change-tracking record
+    /// [`Drop::drop`] would (see this struct's top doc), immediately, for
+    /// whatever value is in the field *right now* — then hands back the raw
+    /// reference with no guard left to fire again later. **Any further
+    /// mutation through the returned reference is NOT automatically
+    /// tracked.** For a `T` with `#[gpu]` fields, or with a change tracker
+    /// attached, mutating again after calling this means the caller is
+    /// responsible for re-marking that row dirty / re-recording the change
+    /// themselves (or, better, preferring to keep mutating through
+    /// `DerefMut` on a live `Mut` instead of calling this at all — that
+    /// stays automatically tracked for the whole borrow). For a `T` with no
+    /// `#[gpu]` fields and no change tracker attached (nothing all the way
+    /// through `Drop` happens either way), this is indistinguishable from
+    /// the guard never having existed.
+    pub fn into_inner(mut self) -> &'a mut T {
+        #[cfg(feature = "gpu")]
+        if let Some(hook) = self.gpu_hook.take() {
+            (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+        }
+        if let Some(hook) = self.change_hook.take() {
+            hook.tracker.record_component_change(hook.entity, hook.component_id, 0, Vec::new());
+        }
+        let ptr: *mut T = self.value as *mut T;
+        // SAFETY: `ptr` is `self.value`, a `&'a mut T` this `Mut` uniquely
+        // owned. `mem::forget` below means `self` (and its `Drop` impl,
+        // whose only remaining job — both hooks already fired above — is a
+        // no-op) never runs again and no other code observes `self` — so
+        // reconstituting a fresh `&'a mut T` from `ptr` under lifetime `'a`
+        // aliases nothing; it is exactly the same unique borrow handed back
+        // under its original lifetime, not a new one.
+        std::mem::forget(self);
+        unsafe { &mut *ptr }
+    }
+}
+
 impl<'a, T> Drop for Mut<'a, T> {
     fn drop(&mut self) {
+        #[cfg(feature = "gpu")]
         if let Some(hook) = &self.gpu_hook {
             // `is_new_insert = true`: from `write_gpu_columns_at_row`'s
             // perspective this bool means "write `Once` fields too, don't
@@ -160,6 +218,15 @@ impl<'a, T> Drop for Mut<'a, T> {
             // on `MirrorMode::Once` / `GpuUploadSource` for the full
             // contract this is the write-side half of).
             (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+        }
+        if let Some(hook) = &self.change_hook {
+            // Same "0, empty bytes" shape `insert_inner`'s tracked path
+            // already uses (see its own call to `record_component_change`
+            // below) -- the actual field-level bytes are reconstructed by
+            // the replication schema encoder from the live component at
+            // encode time, not captured here.
+            hook.tracker
+                .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
     }
 }
@@ -177,7 +244,62 @@ impl World {
             archetype_index,
             #[cfg(feature = "gpu")]
             gpu_mirror: None,
+            change_tracker: None,
         }
+    }
+
+    /// Like [`Self::new`], already wired to `tracker` — the constructor
+    /// counterpart of [`Self::attach_change_tracker`], for a caller that
+    /// knows its tracker up front (mirrors [`crate::SceneDb::new_with_gpu_mirror`]'s
+    /// shape for the GPU mirror).
+    pub fn new_with_change_tracker(tracker: crate::replication::SharedChangeTracker) -> Self {
+        let mut world = Self::new();
+        world.attach_change_tracker(tracker);
+        world
+    }
+
+    /// Attach a [`crate::replication::SharedChangeTracker`] so that every
+    /// future `spawn`/`insert`/`remove`/`despawn`/`get_mut` call
+    /// automatically records into it — no `_tracked`-suffixed call needed
+    /// anywhere. Exactly the same shape as [`Self::attach_gpu_mirror`],
+    /// applied to change tracking instead of GPU mirroring: before this,
+    /// every mutating call site had to remember, on its own, whether *this*
+    /// write needed tracking; now it's a property of whether a tracker is
+    /// attached to the `World` at all.
+    ///
+    /// Existing `_tracked` methods (`insert_tracked`, etc, which take an
+    /// explicit `&mut ChangeTracker` parameter) are unaffected by this —
+    /// they keep recording into whatever tracker the caller passes them,
+    /// independent of whatever is or isn't attached here.
+    ///
+    /// Idempotent: calling this again replaces the previous handle, it does
+    /// not stack.
+    pub fn attach_change_tracker(&mut self, tracker: crate::replication::SharedChangeTracker) {
+        self.change_tracker = Some(tracker);
+    }
+
+    /// Detach the change tracker, if any — subsequent plain
+    /// `spawn`/`insert`/`remove`/`despawn`/`get_mut` calls stop recording
+    /// (existing `_tracked` call sites are unaffected either way).
+    pub fn detach_change_tracker(&mut self) -> Option<crate::replication::SharedChangeTracker> {
+        self.change_tracker.take()
+    }
+
+    /// Whether a change tracker is currently attached (see
+    /// [`Self::attach_change_tracker`]).
+    pub fn has_change_tracker(&self) -> bool {
+        self.change_tracker.is_some()
+    }
+
+    /// The currently-attached change tracker, if any —
+    /// [`crate::replication::SharedChangeTracker`] is cheap to `Clone`, so
+    /// callers that already kept their own copy from before
+    /// [`Self::attach_change_tracker`] don't need this — it exists for the
+    /// case where they didn't (e.g. draining it once per frame from
+    /// wherever the frame loop lives, without also having to thread the
+    /// original handle all the way there separately).
+    pub fn change_tracker(&self) -> Option<&crate::replication::SharedChangeTracker> {
+        self.change_tracker.as_ref()
     }
 
     /// Attach a [`crate::gpu::GpuMirrorHandle`] so that every future
@@ -326,14 +448,37 @@ impl World {
     /// Recycles a free slot if one is available; otherwise extends the slot
     /// vec.  The returned handle includes a generation counter that allows
     /// [`is_alive`](Self::is_alive) to detect stale handles after despawn.
+    ///
+    /// Records into the attached [`crate::replication::SharedChangeTracker`]
+    /// automatically, if one is attached ([`Self::attach_change_tracker`]) —
+    /// no separate `_tracked` call needed for that; see [`Self::spawn_tracked`]
+    /// only if you additionally need to record into a *different*,
+    /// explicitly-held tracker.
     pub fn spawn(&mut self) -> Entity {
-        self.spawn_inner(None)
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.spawn_inner(Some(&mut guard))
+        } else {
+            self.spawn_inner(None)
+        }
     }
 
-    /// Like [`spawn`](Self::spawn) but also records the spawn in a
-    /// [`ChangeTracker`] for replication.
+    /// Like [`spawn`](Self::spawn) but also records the spawn in `tracker`.
+    ///
+    /// Redundant with plain [`Self::spawn`] once a change tracker is
+    /// attached via [`Self::attach_change_tracker`] — in that case this
+    /// records into the ATTACHED tracker (same as `spawn` would), not
+    /// `tracker`, so the two spellings can't silently diverge once a
+    /// `World` opts into automatic tracking. `tracker` is only actually
+    /// used when nothing is attached, preserving this method's exact prior
+    /// behavior for a `World` that never calls `attach_change_tracker`.
     pub fn spawn_tracked(&mut self, tracker: &mut ChangeTracker) -> Entity {
-        self.spawn_inner(Some(tracker))
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.spawn_inner(Some(&mut guard))
+        } else {
+            self.spawn_inner(Some(tracker))
+        }
     }
 
     pub(crate) fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
@@ -381,13 +526,26 @@ impl World {
     /// The entity's slot is recycled: the generation is incremented and the
     /// index is pushed onto the free list.  The entity's data is
     /// swap-removed from its archetype.
+    ///
+    /// Records into the attached change tracker automatically, same as
+    /// [`Self::spawn`] — see that method's doc.
     pub fn despawn(&mut self, entity: Entity) -> bool {
-        self.despawn_inner(entity, None)
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.despawn_inner(entity, Some(&mut guard))
+        } else {
+            self.despawn_inner(entity, None)
+        }
     }
 
-    /// Like [`despawn`](Self::despawn) but also records the despawn in a
-    /// [`ChangeTracker`] for replication.
+    /// Like [`despawn`](Self::despawn) but also records the despawn in
+    /// `tracker`. Redundant with plain [`Self::despawn`] once a change
+    /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
     pub fn despawn_tracked(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> bool {
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            return self.despawn_inner(entity, Some(&mut guard));
+        }
         self.despawn_inner(entity, Some(tracker))
     }
 
@@ -508,14 +666,28 @@ impl World {
     /// # Panics
     ///
     /// Panics if `entity` is dead.
+    ///
+    /// Records into the attached change tracker automatically, same as
+    /// [`Self::spawn`] — see that method's doc.
     pub fn insert<T: Component>(&mut self, entity: Entity, value: T) {
-        self.insert_inner(entity, value, None);
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.insert_inner(entity, value, Some(&mut guard));
+        } else {
+            self.insert_inner(entity, value, None);
+        }
     }
 
-    /// Like [`insert`](Self::insert) but also records the change in a
-    /// [`ChangeTracker`] for replication.
+    /// Like [`insert`](Self::insert) but also records the change in
+    /// `tracker`. Redundant with plain [`Self::insert`] once a change
+    /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
     pub fn insert_tracked<T: Component>(&mut self, entity: Entity, value: T, tracker: &mut ChangeTracker) {
-        self.insert_inner(entity, value, Some(tracker));
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.insert_inner(entity, value, Some(&mut guard));
+        } else {
+            self.insert_inner(entity, value, Some(tracker));
+        }
     }
 
     fn insert_inner<T: Component>(&mut self, entity: Entity, value: T, mut tracker: Option<&mut ChangeTracker>) {
@@ -638,13 +810,26 @@ impl World {
     /// components are preserved.
     ///
     /// Returns `None` if the entity is dead or does not have component `T`.
+    ///
+    /// Records into the attached change tracker automatically, same as
+    /// [`Self::spawn`] — see that method's doc.
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
-        self.remove_inner(entity, None)
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.remove_inner(entity, Some(&mut guard))
+        } else {
+            self.remove_inner(entity, None)
+        }
     }
 
-    /// Like [`remove`](Self::remove) but also records the change in a
-    /// [`ChangeTracker`] for replication.
+    /// Like [`remove`](Self::remove) but also records the change in
+    /// `tracker`. Redundant with plain [`Self::remove`] once a change
+    /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
     pub fn remove_tracked<T: Component>(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> Option<T> {
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            return self.remove_inner(entity, Some(&mut guard));
+        }
         self.remove_inner(entity, Some(tracker))
     }
 
@@ -751,10 +936,17 @@ impl World {
             })
         });
 
+        let change_hook = self.change_tracker.as_ref().map(|tracker| ChangeMutHook {
+            tracker: tracker.clone(),
+            entity,
+            component_id: cid,
+        });
+
         Some(Mut {
             value,
             #[cfg(feature = "gpu")]
             gpu_hook,
+            change_hook,
         })
     }
 

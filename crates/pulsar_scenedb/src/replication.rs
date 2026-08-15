@@ -231,7 +231,7 @@ use crate::spatial::{Aabb, SpatialCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ── Error reporting ────────────────────────────────────────────────────────
 
@@ -1614,6 +1614,103 @@ impl ChangeTracker {
             component_deltas: mem::take(&mut self.component_changes),
             events: mem::take(&mut self.events),
         }
+    }
+}
+
+/// Cheap-to-clone, interior-mutable handle to a [`ChangeTracker`] --
+/// `World::attach_change_tracker` holds one of these exactly the way it
+/// already holds a `GpuMirrorHandle` (via `attach_gpu_mirror`), so every
+/// mutating call (`spawn`/`insert`/`remove`/`despawn`/`get_mut`) records
+/// automatically once a tracker is attached, with no `_tracked`-suffixed
+/// call needed anywhere -- the same "attach once, every write already
+/// knows" shape the GPU mirror already uses, applied to change tracking.
+///
+/// Before this type, a caller had to remember, at every single mutating
+/// call site, whether *this particular write* needed tracking and reach
+/// for the `_tracked` spelling if so -- a plain `world.insert(e, v)` on
+/// otherwise-tracked data compiled fine and silently produced no signal.
+/// `SharedChangeTracker` moves that decision to one place (whether a
+/// tracker is attached to the `World` at all), matching how the crate
+/// already decided this exact question for GPU mirroring.
+///
+/// Existing `_tracked` methods (which take an explicit `&mut ChangeTracker`
+/// parameter) are untouched by this -- they keep working exactly as they
+/// always have, independent of whether a `SharedChangeTracker` happens to
+/// also be attached. This type is purely additive: a second, opt-in way to
+/// reach a `ChangeTracker`, not a replacement for the first.
+#[derive(Clone)]
+pub struct SharedChangeTracker(Arc<Mutex<ChangeTracker>>);
+
+impl SharedChangeTracker {
+    /// Wraps a fresh, empty [`ChangeTracker`].
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(ChangeTracker::new())))
+    }
+
+    /// Wraps an existing [`ChangeTracker`] (e.g. one already populated by
+    /// some earlier `_tracked` calls, or with a non-zero `frame` counter
+    /// restored from elsewhere).
+    pub fn from_tracker(tracker: ChangeTracker) -> Self {
+        Self(Arc::new(Mutex::new(tracker)))
+    }
+
+    /// Drain this frame's accumulated changes into a [`Delta`] -- same
+    /// contract as [`ChangeTracker::drain_with_world`], just callable
+    /// through the shared handle without the caller needing its own
+    /// exclusive `&mut ChangeTracker`.
+    pub fn drain_with_world(&self, world: &crate::World) -> Delta {
+        self.lock().drain_with_world(world)
+    }
+
+    /// Drain this frame's accumulated changes -- same contract as
+    /// [`ChangeTracker::drain`].
+    pub fn drain(
+        &self,
+        schema: &ReplicationSchema,
+        client: ClientId,
+        authority: &AuthorityTable,
+    ) -> (Delta, Vec<ReplicatedEvent>) {
+        self.lock().drain(schema, client, authority)
+    }
+
+    /// Same contract as [`ChangeTracker::end_frame`].
+    pub fn end_frame(&self) {
+        self.lock().end_frame();
+    }
+
+    /// Records a component change directly through the shared handle --
+    /// used by [`crate::world::Mut`]'s `Drop` impl, which only has this
+    /// handle (cloned at `get_mut` time), not a live `&mut ChangeTracker`
+    /// borrow to reuse. Same contract as [`ChangeTracker::record_component_change`].
+    pub(crate) fn record_component_change(
+        &self,
+        entity: Entity,
+        component_type: ComponentId,
+        field_index: u32,
+        field_bytes: Vec<u8>,
+    ) {
+        self.lock()
+            .record_component_change(entity, component_type, field_index, field_bytes);
+    }
+
+    /// Locks the underlying [`ChangeTracker`] for direct access -- e.g. to
+    /// call [`ChangeTracker::record_event`], which `World`'s automatic
+    /// recording has no occasion to call on its own (events are enqueued
+    /// by application code, not inferred from a component write).
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned (a prior holder panicked while
+    /// holding it) -- the same failure mode every other `Mutex`/`RwLock`
+    /// use in this crate accepts rather than silently continuing on
+    /// possibly-inconsistent tracker state.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, ChangeTracker> {
+        self.0.lock().expect("SharedChangeTracker: mutex poisoned")
+    }
+}
+
+impl Default for SharedChangeTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
