@@ -1943,10 +1943,22 @@ impl SceneGpuStore {
                     )
                 });
         }
-        let pool = Arc::new(crate::gpu::VarLenGpuPool::<T>::new(
+        // `STORAGE` alone is enough for every var-len pool's ordinary
+        // consumer (a shader reading it as a storage buffer), but adding
+        // `VERTEX | INDEX` unconditionally costs nothing for those and is
+        // what lets a `Vec<T>`-typed `#[gpu]` field ALSO be bound directly
+        // through the fixed-function vertex/index pipeline stages -- e.g. a
+        // mesh component's own `vertices`/`indices` fields, read straight
+        // by a renderer's draw calls with zero separate "is this a mesh
+        // buffer" attribute or opt-in (see `helio::mesh::MeshPool`'s own
+        // `VarLenGpuPool`-backed storage, Pulsar-Native#561 Phase D: the
+        // SAME pool this call creates for `StaticMeshComponent::vertices`
+        // is what Helio's draw calls end up bound to).
+        let pool = Arc::new(crate::gpu::VarLenGpuPool::<T>::new_with_usage(
             Arc::clone(device),
             &format!("scenedb-var-len-pool-{key:?}"),
             initial_capacity,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         ));
         pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
         pool
