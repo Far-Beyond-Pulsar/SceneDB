@@ -150,6 +150,25 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
         guard.free.free(handle.offset as u64, handle.count as u64);
     }
 
+    /// Overwrites `data` at `offset` in place — no allocation, no freelist
+    /// interaction, offset never changes. For a caller that already holds a
+    /// valid, still-allocated `VarLenHandle` and wants to replace its
+    /// contents WITHOUT the free-then-reallocate cycle [`Self::write_var_row`]
+    /// does (which offers no guarantee the same offset comes back — a caller
+    /// that baked the old offset into other GPU-side state, e.g. a draw
+    /// command's `vertex_offset`, would silently start reading garbage).
+    /// Panics (same contract as the underlying `DynamicGpuBuffer::write`) if
+    /// `offset + data.len()` exceeds the pool's current capacity, or if
+    /// `data.len()` doesn't match `offset`'s original allocation size —
+    /// neither of which this call can check on its own (it has no notion of
+    /// "whose" allocation `offset` belongs to), so callers must pass an
+    /// `offset`/length pair known to fit inside an allocation they already
+    /// hold the matching `VarLenHandle` for.
+    pub fn write_at_offset(&self, queue: &wgpu::Queue, offset: u32, data: &[T]) {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        guard.buf.write(queue, offset, data);
+    }
+
     pub fn epoch(&self) -> u64 {
         self.inner.read().expect("VarLenGpuPool lock poisoned").buf.epoch()
     }
@@ -337,5 +356,36 @@ mod tests {
         let got: Vec<u32> =
             via_guard.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
         assert_eq!(got, vec![11, 22, 33]);
+    }
+
+    #[test]
+    fn write_at_offset_overwrites_in_place_without_touching_the_freelist() {
+        // The property Helio's dynamic-mesh vertex updates depend on:
+        // overwriting an existing allocation's contents must NEVER change
+        // its offset (unlike write_var_row's free-then-reallocate), since
+        // other GPU-side state (a draw command's vertex_offset) may have
+        // already baked in the old offset and would silently read garbage
+        // if a same-size "update" ever relocated the data.
+        let (device, queue) = test_device();
+        let pool: VarLenGpuPool<u32> = VarLenGpuPool::new(Arc::clone(&device), "test", 8);
+
+        let h1 = pool.write_var_row(&queue, VarLenHandle::default(), &[1, 2, 3, 4]).unwrap();
+
+        // A second, unrelated allocation right after h1 -- if write_at_offset
+        // touched the freelist at all, this would be corrupted by it.
+        let h2 = pool.write_var_row(&queue, VarLenHandle::default(), &[100, 200]).unwrap();
+        assert_eq!(h2.offset, 4, "second alloc lands right after the first");
+
+        pool.write_at_offset(&queue, h1.offset, &[9, 9, 9, 9]);
+
+        let bytes = readback(&device, &queue, &pool.read_buffer(), 6 * 4);
+        let got: Vec<u32> = bytes.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(&got[0..4], &[9, 9, 9, 9], "h1's slot must be overwritten in place, same offset");
+        assert_eq!(&got[4..6], &[100, 200], "h2's data, right after h1, must be completely untouched");
+
+        // A fresh allocation afterward must NOT be able to reuse h1's
+        // offset -- write_at_offset must not have freed it.
+        let h3 = pool.write_var_row(&queue, VarLenHandle::default(), &[7]).unwrap();
+        assert_eq!(h3.offset, 6, "h1's range was never freed, so h3 must append past both live allocations");
     }
 }
