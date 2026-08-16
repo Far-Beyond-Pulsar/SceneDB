@@ -57,18 +57,42 @@ pub struct DynamicGpuBuffer<T: Pod> {
     max_capacity: Option<u32>,
     epoch: u64,
     label: String,
+    /// Usage flags every (re)allocation is created with, always implicitly
+    /// carrying `COPY_DST | COPY_SRC` (load-bearing for `write`/grow-copy —
+    /// not caller-configurable). Defaults to `STORAGE` via [`Self::new`],
+    /// matching every existing caller's behavior exactly; override with
+    /// [`Self::with_usage`] for buffers bound a different way (e.g. a
+    /// fixed-function `VERTEX`/`INDEX` buffer that has no need to also be
+    /// `STORAGE`-bindable).
+    usage: wgpu::BufferUsages,
     _elem: PhantomData<T>,
 }
 
 impl<T: Pod> DynamicGpuBuffer<T> {
     pub fn new(device: &wgpu::Device, label: &str, initial_capacity: u32) -> Self {
-        let buf = Self::alloc(device, label, initial_capacity);
+        Self::new_with_usage(device, label, initial_capacity, wgpu::BufferUsages::STORAGE)
+    }
+
+    /// Same as [`Self::new`], but with an explicit base usage instead of the
+    /// default `STORAGE` — e.g. `VERTEX`/`INDEX` for a buffer that's only
+    /// ever bound through the fixed-function vertex/index pipeline stages,
+    /// not read by a shader as a storage buffer. `COPY_DST | COPY_SRC` are
+    /// always added on top (grow-and-copy and `write` depend on them
+    /// unconditionally); no need to include them here.
+    pub fn new_with_usage(
+        device: &wgpu::Device,
+        label: &str,
+        initial_capacity: u32,
+        usage: wgpu::BufferUsages,
+    ) -> Self {
+        let buf = Self::alloc(device, label, initial_capacity, usage);
         Self {
             buf,
             capacity: initial_capacity,
             max_capacity: None,
             epoch: 0,
             label: label.to_string(),
+            usage,
             _elem: PhantomData,
         }
     }
@@ -82,11 +106,11 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         self
     }
 
-    fn alloc(device: &wgpu::Device, label: &str, capacity: u32) -> wgpu::Buffer {
+    fn alloc(device: &wgpu::Device, label: &str, capacity: u32, usage: wgpu::BufferUsages) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: capacity as u64 * std::mem::size_of::<T>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         })
     }
@@ -141,7 +165,7 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         }
         new_capacity = new_capacity.min(effective_max);
 
-        let new_buf = Self::alloc(device, &self.label, new_capacity);
+        let new_buf = Self::alloc(device, &self.label, new_capacity, self.usage);
         // Copy the live prefix (the old buffer's full capacity — every row
         // up to `self.capacity`, since this type has no notion of which
         // rows within that range are actually "in use"; that's the
@@ -204,7 +228,7 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         if target >= self.capacity {
             return false;
         }
-        let new_buf = Self::alloc(device, &self.label, target);
+        let new_buf = Self::alloc(device, &self.label, target, self.usage);
         // Only the surviving prefix needs copying -- rows past `target`
         // are, by the caller's own claim (`highest_live_row`), not live,
         // so their bytes are not owed any preservation guarantee.
@@ -400,5 +424,26 @@ mod tests {
 
         // Already at (or below) the target -- a true no-op.
         assert!(!buf.shrink_to_fit(&device, &queue, 2, 1.0));
+    }
+
+    #[test]
+    fn new_with_usage_sets_the_requested_usage_and_survives_growth() {
+        let (device, queue) = test_device();
+        // VERTEX instead of the default STORAGE -- the shape Helio's mesh
+        // pool needs (bound only via the fixed-function vertex stage, never
+        // read as a shader storage buffer).
+        let mut buf: DynamicGpuBuffer<u32> =
+            DynamicGpuBuffer::new_with_usage(&device, "test", 4, wgpu::BufferUsages::VERTEX);
+        assert!(buf.buffer().usage().contains(wgpu::BufferUsages::VERTEX));
+        assert!(!buf.buffer().usage().contains(wgpu::BufferUsages::STORAGE));
+        // COPY_DST/COPY_SRC are always implicitly present -- write/grow rely on them.
+        assert!(buf.buffer().usage().contains(wgpu::BufferUsages::COPY_DST));
+        assert!(buf.buffer().usage().contains(wgpu::BufferUsages::COPY_SRC));
+
+        // Reallocation (on growth) must carry the same requested usage
+        // forward, not silently fall back to the STORAGE default.
+        buf.ensure_capacity(&device, &queue, 100).expect("grow");
+        assert!(buf.buffer().usage().contains(wgpu::BufferUsages::VERTEX));
+        assert!(!buf.buffer().usage().contains(wgpu::BufferUsages::STORAGE));
     }
 }

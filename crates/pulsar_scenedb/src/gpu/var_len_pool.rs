@@ -69,7 +69,24 @@ pub struct VarLenGpuPool<T: Pod> {
 
 impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
     pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32) -> Self {
-        let buf = DynamicGpuBuffer::new(&device, label, initial_capacity);
+        Self::new_with_usage(device, label, initial_capacity, wgpu::BufferUsages::STORAGE)
+    }
+
+    /// Same as [`Self::new`], but with an explicit base buffer usage instead
+    /// of the default `STORAGE` — for pools bound a different way than a
+    /// `#[gpu] Vec<T>` field's usual shader-storage-buffer read (e.g. a
+    /// fixed-function `VERTEX`/`INDEX` buffer). Every derive-generated
+    /// `#[gpu] Vec<T>` field still goes through [`Self::new`] (`STORAGE`,
+    /// unchanged) — this is for direct, non-derive callers like Helio's mesh
+    /// pool that want the SAME pool/freelist mechanics with a different
+    /// underlying buffer usage.
+    pub fn new_with_usage(
+        device: Arc<wgpu::Device>,
+        label: &str,
+        initial_capacity: u32,
+        usage: wgpu::BufferUsages,
+    ) -> Self {
+        let buf = DynamicGpuBuffer::new_with_usage(&device, label, initial_capacity, usage);
         let free = RangeList::new(initial_capacity as u64);
         Self { device, inner: RwLock::new(Inner { buf, free }) }
     }
