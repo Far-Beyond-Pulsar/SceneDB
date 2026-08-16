@@ -276,6 +276,13 @@ pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
     /// See [`DirtyTrackedSceneBuffer::epoch`].
     fn epoch(&self) -> u64;
 
+    /// Type-erased counterpart to [`DirtyTrackedSceneBuffer::get`] — `None`
+    /// if `row` has never been written. Lets a caller that only has a
+    /// `ComponentId` in hand (e.g. [`super::SceneGpuStore::read_dirty_tracked_row_bytes`])
+    /// read a row's current value without needing the concrete `T` to
+    /// downcast to.
+    fn read_row_bytes(&self, row: u32) -> Option<Vec<u8>>;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -455,6 +462,22 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
         f(state.buf.buffer());
     }
 
+    /// Reads `row`'s current CPU-side shadow value — `None` if `row` has
+    /// never been written (past the shadow's current length). Cheap (a read
+    /// lock + one `ShadowRow::get`), no GPU access — the shadow IS the
+    /// source of truth regardless of whether it's been flushed yet.
+    ///
+    /// Exists for [`super::var_len_pool`]'s benefit: freeing a `Vec<T>`
+    /// field's previous pool allocation before writing a new one needs to
+    /// know what that previous allocation *was* (the `VarLenHandle` this
+    /// buffer holds when `T = VarLenHandle`), and a GPU readback for that on
+    /// every write would defeat the entire point of deferred/coalesced
+    /// writes — the CPU shadow already has the answer for free.
+    pub fn get(&self, row: u32) -> Option<T> {
+        let state = self.state.read().expect("DirtyTrackedSceneBuffer lock poisoned");
+        ((row as usize) < state.shadow.len()).then(|| state.shadow[row as usize].get())
+    }
+
     /// Bump count of the underlying GPU buffer since construction — grows
     /// only at [`Self::flush`] (or [`Self::reserve`]), never at
     /// [`Self::mark_dirty`] itself, so this is a direct measure of how many
@@ -494,6 +517,17 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedGpuBufferDispatch for DirtyTrac
 
     fn epoch(&self) -> u64 {
         DirtyTrackedSceneBuffer::epoch(self)
+    }
+
+    fn read_row_bytes(&self, row: u32) -> Option<Vec<u8>> {
+        let value = DirtyTrackedSceneBuffer::get(self, row)?;
+        // SAFETY: `T: Pod` guarantees every byte of `value` is a valid,
+        // fully-initialized byte -- reinterpreting it as its own byte
+        // representation is exactly what `Pod` exists to make sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&value as *const T as *const u8, std::mem::size_of::<T>())
+        };
+        Some(bytes.to_vec())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -5,6 +5,7 @@
 //! The arena retains no CPU copy of geometry; it is residency-only (the asset
 //! system owns the source blobs for any future re-upload).
 
+use super::freelist::RangeList;
 use super::{BufferAccess, BufferKey, BufferRegistrationError, EngineGpuContext, GpuBufferRegistry, MirrorMode};
 
 /// Issue #41's "Collapse map": the documented `BufferKey`s each asset store
@@ -28,60 +29,14 @@ pub enum ArenaError {
     Exhausted,
 }
 
-/// First-fit byte-range suballocator over one buffer (design Rev 2 §3):
-/// whole-mesh allocations at load, frees only on asset unload — no per-frame
-/// churn, so first-fit with free-span coalescing is sufficient.
-struct RangeList {
-    /// Sorted, non-adjacent free spans: (offset, len).
-    free: Vec<(u64, u64)>,
-}
-
-impl RangeList {
-    fn new(total: u64) -> Self {
-        Self { free: vec![(0, total)] }
-    }
-
-    fn alloc(&mut self, len: u64, align: u64) -> Option<u64> {
-        debug_assert!(align.is_power_of_two());
-        for i in 0..self.free.len() {
-            let (off, span) = self.free[i];
-            let aligned = (off + align - 1) & !(align - 1);
-            let pad = aligned - off;
-            if pad + len <= span {
-                // Split: [off, aligned) stays free (alignment pad),
-                // [aligned+len, off+span) stays free (tail).
-                let tail = span - pad - len;
-                self.free.remove(i);
-                if tail > 0 {
-                    self.free.insert(i, (aligned + len, tail));
-                }
-                if pad > 0 {
-                    self.free.insert(i, (off, pad));
-                }
-                return Some(aligned);
-            }
-        }
-        None
-    }
-
-    fn free(&mut self, offset: u64, len: u64) {
-        debug_assert!(
-            self.free.iter().all(|&(o, l)| offset + len <= o || o + l <= offset),
-            "double-free or overlapping free range"
-        );
-        let idx = self.free.partition_point(|&(o, _)| o < offset);
-        self.free.insert(idx, (offset, len));
-        // Coalesce with next, then with previous.
-        if idx + 1 < self.free.len() && self.free[idx].0 + self.free[idx].1 == self.free[idx + 1].0 {
-            self.free[idx].1 += self.free[idx + 1].1;
-            self.free.remove(idx + 1);
-        }
-        if idx > 0 && self.free[idx - 1].0 + self.free[idx - 1].1 == self.free[idx].0 {
-            self.free[idx - 1].1 += self.free[idx].1;
-            self.free.remove(idx);
-        }
-    }
-}
+// `RangeList` (first-fit byte-range suballocator, design Rev 2 §3) now
+// lives in `super::freelist` -- shared with `super::var_len_pool`'s
+// growable variable-length `#[gpu]` field pool, which reuses this exact,
+// already-proven algorithm instead of a second implementation. This
+// arena's own usage is unchanged: whole-mesh allocations at load, frees
+// only on asset unload, hard ceiling (`ArenaError::Exhausted`, never grown)
+// -- `RangeList::extend_total` exists for the growable consumer and is
+// never called here.
 
 /// Global vertex + index buffers for all resident geometry (design Rev 2 §3):
 /// write-once-at-load uploads, byte-range suballocated. No CPU copy is

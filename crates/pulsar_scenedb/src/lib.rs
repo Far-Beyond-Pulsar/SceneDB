@@ -114,7 +114,7 @@ pub use gpu::{
     DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror,
     GpuBufferDispatch, GpuBufferRegistry, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
     GpuMirrorRegistration, GpuUploadSource, GrowableGpuBufferDispatch, GrowableSceneBuffer,
-    MirrorMode, UploadMapperFn,
+    MirrorMode, UploadMapperFn, VarLenGpuPool, VarLenHandle,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`

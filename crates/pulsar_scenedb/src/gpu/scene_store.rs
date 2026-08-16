@@ -415,6 +415,21 @@ pub struct SceneGpuStore {
     /// why an earlier, more "obviously cheap" alternative measured worse in
     /// practice.
     dirty_tracked_gpu_buffers: RwLock<HashMap<ComponentId, Arc<dyn DirtyTrackedGpuBufferDispatch>>>,
+    /// Shared pools backing `Vec<T>`-typed `#[gpu]` fields
+    /// ([`crate::gpu::VarLenGpuPool`]), keyed by [`BufferKey`] directly
+    /// (not `ComponentId`) — the pool itself is the thing multiple fields
+    /// share via `#[gpu(buffer = "key")]`, same sharing intent as
+    /// `owners`/`gpu_buffers` above, kept in its own map rather than folded
+    /// into them: a var-len pool has no fixed per-row stride the way every
+    /// other registration here does (`assert_share_compatible`'s size check
+    /// has no meaning for it), and its "row" concept — an offset/count pair
+    /// into a suballocated pool — is fundamentally different from a plain
+    /// `T`-per-row column. `Arc<dyn Any + Send + Sync>`, downcast by
+    /// [`Self::var_len_pool`] to the caller's own concrete element type —
+    /// the caller always knows `T` statically (it comes from the `Vec<T>`
+    /// field's own declared type), so this is a plain, infallible-in-
+    /// practice downcast, not a real type-erasure boundary.
+    var_len_pools: RwLock<HashMap<BufferKey, Arc<dyn std::any::Any + Send + Sync>>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -500,6 +515,7 @@ impl SceneGpuStore {
             gpu_buffers: RwLock::new(HashMap::new()),
             growable_gpu_buffers: RwLock::new(HashMap::new()),
             dirty_tracked_gpu_buffers: RwLock::new(HashMap::new()),
+            var_len_pools: RwLock::new(HashMap::new()),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -1874,6 +1890,79 @@ impl SceneGpuStore {
             }
             None => false,
         }
+    }
+
+    /// Reads `row`'s current CPU-side shadow value for a column registered
+    /// via [`Self::register_dirty_tracked_gpu_buffer`] — `None` if `id`
+    /// isn't registered dirty-tracked, or if `row` has never been written.
+    /// No GPU access (see [`DirtyTrackedSceneBuffer::get`]'s doc).
+    ///
+    /// Exists for [`crate::gpu::var_len_pool`]'s benefit: the derive-
+    /// generated dispatch for a `Vec<T>`-typed `#[gpu]` field reads the
+    /// entity's PREVIOUS [`crate::gpu::VarLenHandle`] this way before
+    /// writing a new one, so the old pool allocation can be freed rather
+    /// than orphaned.
+    pub fn read_dirty_tracked_row_bytes(&self, id: ComponentId, row: u32) -> Option<Vec<u8>> {
+        self.dirty_tracked_gpu_buffers
+            .read()
+            .expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned")
+            .get(&id)?
+            .read_row_bytes(row)
+    }
+
+    /// Registers (or, for a `key` already registered, adopts) a shared
+    /// [`crate::gpu::VarLenGpuPool<T>`] backing every `Vec<T>`-typed
+    /// `#[gpu]` field declaring this `key` (same `#[gpu(buffer = "key")]`
+    /// sharing intent every other registration method here has — see
+    /// `var_len_pools`'s own doc for why this lives in a separate map
+    /// rather than folding into `owners`).
+    ///
+    /// # Panics
+    ///
+    /// If `key` is already registered with a DIFFERENT element type `T` —
+    /// two fields sharing one pool key must agree on what they're pooling,
+    /// the same "share-compatible" principle
+    /// [`Self::register_dirty_tracked_gpu_buffer`] enforces for plain
+    /// columns (that method's own richer compatibility metadata doesn't
+    /// apply here — a pool has no fixed per-row stride — so this checks the
+    /// one thing that actually matters: is it the same `T`).
+    pub fn register_var_len_gpu_pool<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+        initial_capacity: u32,
+        device: &Arc<wgpu::Device>,
+    ) -> Arc<crate::gpu::VarLenGpuPool<T>> {
+        let mut pools = self.var_len_pools.write().expect("SceneGpuStore var_len_pools lock poisoned");
+        if let Some(existing) = pools.get(&key) {
+            return Arc::clone(existing)
+                .downcast::<crate::gpu::VarLenGpuPool<T>>()
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "var-len GPU pool key {key:?} already registered with a different element type -- \
+                         every #[gpu(buffer = \"{key:?}\")] Vec<T> field sharing this key must declare the same T"
+                    )
+                });
+        }
+        let pool = Arc::new(crate::gpu::VarLenGpuPool::<T>::new(
+            Arc::clone(device),
+            &format!("scenedb-var-len-pool-{key:?}"),
+            initial_capacity,
+        ));
+        pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
+        pool
+    }
+
+    /// Looks up an already-registered [`crate::gpu::VarLenGpuPool<T>`] by
+    /// key. `None` if nothing registered this key yet (auto-registration —
+    /// mirroring every other World-mirrored column — calls
+    /// [`Self::register_var_len_gpu_pool`] on first use instead of calling
+    /// this and panicking).
+    pub fn var_len_pool<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+    ) -> Option<Arc<crate::gpu::VarLenGpuPool<T>>> {
+        let pools = self.var_len_pools.read().expect("SceneGpuStore var_len_pools lock poisoned");
+        pools.get(&key)?.clone().downcast::<crate::gpu::VarLenGpuPool<T>>().ok()
     }
 
     /// Uploads every row marked dirty (via [`Self::mark_gpu_row_dirty`])

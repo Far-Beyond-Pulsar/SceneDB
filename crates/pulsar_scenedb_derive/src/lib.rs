@@ -6,6 +6,7 @@ mod gpu;
 mod replicate;
 mod scene_store;
 mod subsystem;
+mod var_len;
 
 /// Derive `HasTypeToken`, `Pod`, `SceneColumnSet`, and `GpuColumnSet` for a
 /// SceneDB component struct.

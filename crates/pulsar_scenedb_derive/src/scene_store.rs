@@ -212,7 +212,51 @@ pub struct FieldInfo {
     /// (struct, field) pair by construction, so two `#[gpu] f32` fields on
     /// different structs get two distinct, collision-free `ComponentId`s
     /// even though their underlying data is the same shape.
+    ///
+    /// For a variable-length field ([`Self::is_var_len`]), this wraps
+    /// [`crate::var_len::VAR_LEN_HANDLE_PATH`]'s type (`VarLenHandle`), not
+    /// the field's own `Vec<T>` type — see that module's doc for why the
+    /// wrapper always has to be something `Pod`, and a `Vec<T>` itself never
+    /// is.
     pub gpu_wrapper: Option<Ident>,
+    /// `true` iff the field's declared type is syntactically `Vec<_>` (any
+    /// path ending in a `Vec` segment with exactly one angle-bracketed type
+    /// argument — not resolved against the real type, this crate has no
+    /// access to that at macro-expansion time, same limitation every other
+    /// syntactic check in this file already has). Only meaningful when
+    /// [`Self::is_gpu`] is also `true` — a plain (non-`#[gpu]`) `Vec<T>`
+    /// field is just an ordinary CPU-only field, nothing this crate cares
+    /// about. See `crate::var_len` for what routing a field through this
+    /// flag actually generates.
+    pub is_var_len: bool,
+    /// The `T` in `Vec<T>`, present iff [`Self::is_var_len`].
+    pub var_len_elem_ty: Option<Type>,
+}
+
+/// Returns `Some(T)` if `ty` is syntactically `Vec<T>` (any path whose last
+/// segment is literally named `Vec`, with exactly one angle-bracketed type
+/// argument) — a syntactic check, not a real type-resolution one (macro
+/// expansion has no type information to resolve against). A field typed
+/// `some_other_crate::NotAVec<T>` that happens to also be named `Vec` would
+/// be (incorrectly) detected here; not a real-world concern in practice
+/// (nothing in this crate's own field types, or any consumer seen so far,
+/// shadows the name), and the alternative (requiring the literal path
+/// `std::vec::Vec` or `alloc::vec::Vec`) would reject the overwhelmingly
+/// common bare `Vec<T>` spelling most callers actually write.
+fn as_vec_elem_type(ty: &Type) -> Option<Type> {
+    let Type::Path(type_path) = ty else { return None };
+    let last = type_path.path.segments.last()?;
+    if last.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else { return None };
+    if args.args.len() != 1 {
+        return None;
+    }
+    match args.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -278,6 +322,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             )
         });
 
+        let var_len_elem_ty = is_gpu.then(|| as_vec_elem_type(&ty)).flatten();
+        let is_var_len = var_len_elem_ty.is_some();
+
         field_infos.push(FieldInfo {
             ident,
             ty,
@@ -286,6 +333,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             buffer_key,
             heavy,
             gpu_wrapper,
+            is_var_len,
+            var_len_elem_ty,
         });
     }
 
@@ -294,6 +343,39 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             name,
             "SceneStore requires at least one field",
         ));
+    }
+
+    // A struct with any `Vec<T>`-typed `#[gpu]` field forks onto a
+    // completely separate codegen path (`crate::var_len`) -- see that
+    // module's doc for why: `GpuColumnSet`/`SceneColumnSet` both require
+    // `Self: Pod` (`gpu/scene_store.rs`'s and `cell_type.rs`'s own trait
+    // bounds), and a `Vec<T>` field structurally can never be `Pod` (a
+    // heap pointer + length + capacity is not a memcpy-safe byte pattern),
+    // so the WHOLE-STRUCT `Pod`/`SceneColumnSet`/`GpuColumnSet` impls this
+    // function generates below are simply not implementable for such a
+    // struct -- not a limitation to work around, a real soundness
+    // boundary. The var-len path generates a smaller, World-mirror-only
+    // surface instead (no cell-mirrored/`CellStorage` support at all for a
+    // struct with a `Vec<T>` field -- that field only ever makes sense
+    // World-mirrored, same scoping already established for `heavy`
+    // fields).
+    if field_infos.iter().any(|f| f.is_var_len) {
+        let struct_gpu_attr = struct_gpu_attr(&input.attrs);
+        if struct_gpu_attr.layout_packed {
+            return Err(syn::Error::new_spanned(
+                name,
+                "#[gpu(layout = packed)] is not supported on a struct with a Vec<T> #[gpu] field -- \
+                 packed layout is a fixed-size-record concept, which a variable-length field has no \
+                 meaningful interpretation under",
+            ));
+        }
+        return crate::var_len::generate_var_len_bearing_type(
+            name,
+            &impl_generics,
+            &ty_generics,
+            where_clause,
+            &field_infos,
+        );
     }
 
     let field_types: Vec<&Type> = field_infos.iter().map(|f| &f.ty).collect();

@@ -412,6 +412,71 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
     }
 }
 
+/// Writes one `Vec<T>`-typed `#[gpu]` field's current value into its shared
+/// [`crate::gpu::VarLenGpuPool<T>`], entirely separate from
+/// [`write_gpu_columns_at_row`] (which only ever handles fixed-size fields —
+/// completely unaffected by this function's existence, same generated code,
+/// same performance as before variable-length `#[gpu]` fields existed).
+///
+/// Frees the entity's previous allocation first — read back from the handle
+/// table's CPU shadow via [`SceneGpuStore::read_dirty_tracked_row_bytes`],
+/// never a GPU readback — then allocates/writes the new one and records the
+/// resulting [`crate::gpu::VarLenHandle`] into the handle table
+/// (`handle_component_id`, a plain scalar `#[gpu]` column exactly like any
+/// other, registered the normal way).
+///
+/// `#[derive(SceneStore)]` calls this for every `Vec<T>`-typed `#[gpu]`
+/// field it finds, alongside its normal [`write_gpu_columns_at_row`] call
+/// for that type's remaining (fixed-size) `#[gpu]` fields — see
+/// `pulsar_scenedb_derive`'s `gpu.rs` for the codegen that detects `Vec<T>`
+/// field types and routes them here instead of through `GpuColumnDesc`.
+///
+/// A no-op if `pool_key` isn't registered yet (mirrors every other
+/// unregistered-column path in this module: bring-up, not an error) — the
+/// generated dispatch function registers the pool (and the handle table)
+/// once, on this type's first-ever insert, before ever reaching here; see
+/// that generated code for the auto-registration gate.
+pub fn write_var_len_field_at_row<T: crate::page::Pod + Send + Sync + crate::token::HasTypeToken + 'static>(
+    store: &SceneGpuStore,
+    queue: &wgpu::Queue,
+    pool_key: crate::gpu::BufferKey,
+    handle_component_id: ComponentId,
+    row: u32,
+    data: &[T],
+) {
+    let Some(pool) = store.var_len_pool::<T>(pool_key) else {
+        return;
+    };
+    let prev = store
+        .read_dirty_tracked_row_bytes(handle_component_id, row)
+        .map(|bytes| {
+            debug_assert_eq!(
+                bytes.len(),
+                std::mem::size_of::<crate::gpu::VarLenHandle>(),
+                "handle table column {handle_component_id:?} holds the wrong element size for VarLenHandle"
+            );
+            // SAFETY: `bytes` came from `DirtyTrackedSceneBuffer<VarLenHandle>::
+            // read_row_bytes`, exactly `size_of::<VarLenHandle>()` bytes of a
+            // real `VarLenHandle`'s own byte representation (asserted above).
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const crate::gpu::VarLenHandle) }
+        })
+        .unwrap_or_default();
+
+    let handle = pool
+        .write_var_row(queue, prev, data)
+        .expect("var-len GPU pool is never registered with a max_capacity ceiling -- growth cannot fail");
+
+    // SAFETY: `VarLenHandle` is `Pod` (#[repr(C)], two plain u32s) -- every
+    // byte of it is a valid, fully-initialized byte.
+    let handle_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &handle as *const crate::gpu::VarLenHandle as *const u8,
+            std::mem::size_of::<crate::gpu::VarLenHandle>(),
+        )
+    };
+    store.mark_gpu_row_dirty(handle_component_id, row, handle_bytes);
+}
+
 // ── Link-time dispatch registry ─────────────────────────────────────────
 
 /// One `#[derive(SceneStore)]` type's entry in the world-mirror dispatch

@@ -18,6 +18,7 @@ mod context;
 mod dirty;
 mod dirty_tracked_scene_buffer;
 mod dynamic_buffer;
+mod freelist;
 mod growable_scene_buffer;
 mod generation;
 mod grid;
@@ -30,6 +31,7 @@ mod scene_store;
 mod slot_allocator;
 mod system_binding;
 mod tracker;
+mod var_len_pool;
 mod view_upload;
 pub mod world_mirror;
 
@@ -68,8 +70,12 @@ pub use scene_store::{
 pub use slot_allocator::{SlotAllocator, SlotHandle};
 pub use system_binding::{BufferBinding, BufferResolveError, GpuSystemContext};
 pub use tracker::SubmissionTracker;
+pub use var_len_pool::{VarLenGpuPool, VarLenHandle};
 pub use view_upload::ViewTokenBuffers;
-pub use world_mirror::{write_gpu_columns_at_row, GenerationMirror, GpuMirrorHandle, GpuMirrorRegistration};
+pub use world_mirror::{
+    write_gpu_columns_at_row, write_var_len_field_at_row, GenerationMirror, GpuMirrorHandle,
+    GpuMirrorRegistration,
+};
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)
 // and already re-exported at the crate root; re-exported here too so GPU-
 // adjacent consumers (e.g. Helio's `helio-scenedb` seam reflection harness,
