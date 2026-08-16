@@ -70,7 +70,7 @@ pub use scene_store::{
 pub use slot_allocator::{SlotAllocator, SlotHandle};
 pub use system_binding::{BufferBinding, BufferResolveError, GpuSystemContext};
 pub use tracker::SubmissionTracker;
-pub use var_len_pool::{VarLenGpuPool, VarLenHandle};
+pub use var_len_pool::{VarLenBufferRef, VarLenGpuPool, VarLenHandle};
 pub use view_upload::ViewTokenBuffers;
 pub use world_mirror::{
     write_gpu_columns_at_row, write_var_len_field_at_row, GenerationMirror, GpuMirrorHandle,

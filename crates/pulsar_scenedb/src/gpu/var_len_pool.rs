@@ -150,11 +150,35 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
         f(guard.buf.buffer());
     }
 
+    /// Same buffer access as [`Self::with_buffer`], but as a held guard
+    /// instead of a closure — for callers that need a real `&wgpu::Buffer`-
+    /// shaped struct field (e.g. a per-frame bind-group descriptor threaded
+    /// through several passes) rather than a callback. Holds the SAME read
+    /// lock `with_buffer` takes for the guard's lifetime; a concurrent
+    /// `write_var_row`/`free_handle` blocks until it's dropped, exactly like
+    /// any other `RwLock` reader — callers should drop it once the frame's
+    /// draw calls are recorded, not hold it indefinitely.
+    pub fn read_buffer(&self) -> VarLenBufferRef<'_, T> {
+        VarLenBufferRef(self.inner.read().expect("VarLenGpuPool lock poisoned"))
+    }
+
     pub fn as_any(&self) -> &dyn Any
     where
         Self: 'static,
     {
         self
+    }
+}
+
+/// A read-locked handle to a [`VarLenGpuPool`]'s current `wgpu::Buffer`.
+/// `Deref`s straight to it, so `pool.read_buffer().slice(..)` etc. work the
+/// same as if a bare `&wgpu::Buffer` had been borrowed.
+pub struct VarLenBufferRef<'a, T: Pod>(std::sync::RwLockReadGuard<'a, Inner<T>>);
+
+impl<'a, T: Pod> std::ops::Deref for VarLenBufferRef<'a, T> {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &wgpu::Buffer {
+        self.0.buf.buffer()
     }
 }
 
@@ -274,5 +298,27 @@ mod tests {
 
         let h2 = pool.write_var_row(&queue, VarLenHandle::default(), &[9, 9, 9, 9]).unwrap();
         assert_eq!(h2.offset, 0, "the space freed by free_handle must be reusable");
+    }
+
+    #[test]
+    fn read_buffer_derefs_to_the_same_buffer_with_buffer_reaches() {
+        // Proves `read_buffer()` isn't a second, divergent path -- it must
+        // observe the exact same bytes `with_buffer` (the pre-existing,
+        // already-proven-correct accessor) sees, since both just borrow the
+        // same lock-guarded `wgpu::Buffer`. This is the accessor a caller
+        // like Helio's `MeshBuffers<'a>` (which needs a real `&wgpu::Buffer`-
+        // shaped struct field, not a callback) will hold instead.
+        let (device, queue) = test_device();
+        let pool: VarLenGpuPool<u32> = VarLenGpuPool::new(Arc::clone(&device), "test", 8);
+        pool.write_var_row(&queue, VarLenHandle::default(), &[11, 22, 33]).unwrap();
+
+        let via_guard = readback(&device, &queue, &pool.read_buffer(), 3 * 4);
+        let mut via_closure = Vec::new();
+        pool.with_buffer(&mut |b| via_closure = readback(&device, &queue, b, 3 * 4));
+        assert_eq!(via_guard, via_closure);
+
+        let got: Vec<u32> =
+            via_guard.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(got, vec![11, 22, 33]);
     }
 }
