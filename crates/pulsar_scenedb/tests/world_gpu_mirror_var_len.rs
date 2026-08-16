@@ -12,6 +12,7 @@
 
 use pulsar_scenedb::gpu::{
     BufferKey, EngineGpuContext, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore,
+    VarLenHandle,
 };
 use pulsar_scenedb::World;
 use pulsar_scenedb_derive::SceneStore;
@@ -193,4 +194,62 @@ fn the_scalar_sibling_field_still_writes_correctly_on_the_same_struct() {
     let bytes = pool_bytes(&store, &ctx, 4);
     let got = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
     assert_eq!(got, 1, "the Vec field must still be correct alongside the scalar one");
+}
+
+#[test]
+fn values_gpu_handle_finds_the_row_offset_a_draw_time_consumer_needs() {
+    // The accessor a renderer uses to wire a draw call up to an entity's
+    // var-len field directly -- it needs the OFFSET into the shared pool,
+    // not a copy of the data (already GPU-resident via the mirror
+    // dispatch). Proves both the initial write and a later re-write (which
+    // may land at a different offset) are reflected correctly, and that a
+    // never-written row comes back `None`.
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    VarLenTestComponent::register_gpu_columns_growable(&mut store, 16, ctx.device());
+    let store = Arc::new(store);
+
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+
+    let a = world.spawn();
+    let row_a = a.index();
+    assert_eq!(
+        VarLenTestComponent::values_gpu_handle(&store, row_a),
+        Some(VarLenHandle::default()),
+        "a never-written row (within capacity) reads back the buffer's zero-initialized \
+         default -- count == 0 IS the 'no allocation' sentinel (see VarLenHandle's own \
+         doc), not a separate None state at this layer"
+    );
+
+    world.insert(a, VarLenTestComponent { values: vec![10, 20, 30], tag: 0 });
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+
+    let handle_a = VarLenTestComponent::values_gpu_handle(&store, row_a).expect("row was just written");
+    assert_eq!(handle_a, VarLenHandle { offset: 0, count: 3 });
+
+    // Confirm the handle is actually correct, not just non-None: read the
+    // pool at exactly that offset/count and check it matches what was
+    // inserted.
+    let pool = store.var_len_pool::<u32>(BufferKey::of(POOL_KEY)).expect("pool registered");
+    let mut bytes = Vec::new();
+    pool.with_buffer(&mut |b| bytes = readback(&ctx, b, (handle_a.offset as u64 + handle_a.count as u64) * 4));
+    let got: Vec<u32> = bytes[(handle_a.offset as usize * 4)..]
+        .chunks(4)
+        .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, vec![10, 20, 30]);
+
+    // A second entity's row must be independently None until IT is written.
+    let b = world.spawn();
+    let row_b = b.index();
+    assert_ne!(row_a, row_b, "sanity: distinct rows");
+    assert_eq!(VarLenTestComponent::values_gpu_handle(&store, row_b), Some(VarLenHandle::default()));
+
+    // Re-inserting `a` with a different length must update the handle this
+    // accessor returns, not leave it stale.
+    world.insert(a, VarLenTestComponent { values: vec![7, 7], tag: 0 });
+    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+    let handle_a2 = VarLenTestComponent::values_gpu_handle(&store, row_a).expect("row still written");
+    assert_eq!(handle_a2.count, 2, "handle must reflect the NEW write, not the stale one");
 }

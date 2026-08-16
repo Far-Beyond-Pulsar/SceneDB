@@ -230,6 +230,60 @@ pub fn generate_var_len_bearing_type(
         })
         .collect();
 
+    // One `pub fn #{field}_gpu_handle(store, row) -> Option<VarLenHandle>`
+    // per var-len field -- lets a consumer that already has `row` (e.g.
+    // `entity.index()`) find WHERE this entity's data landed in the shared
+    // pool (offset/count), without needing to know the field's own hidden
+    // wrapper type or its `ComponentId`. The motivating case (Pulsar-
+    // Native#561 Phase E): a renderer wiring a `MeshId`/draw call up to
+    // point at an entity's `#[gpu] Vec<T>` field's data directly -- it
+    // needs the OFFSET (to build a slice into the shared pool), not a copy
+    // of the data itself, which is already GPU-resident via the mirror
+    // dispatch. `read_dirty_tracked_row_bytes` is a CPU-shadow-only read
+    // (see its own doc) -- cheap enough to call once per entity per frame,
+    // not a GPU readback.
+    let handle_accessors: Vec<TokenStream> = gpu_fields
+        .iter()
+        .filter(|f| f.is_var_len)
+        .map(|f| {
+            let field_ident = &f.ident;
+            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let accessor_name = quote::format_ident!("{}_gpu_handle", field_ident);
+            quote! {
+                /// Returns this entity's current `VarLenHandle` (offset/count
+                /// into the shared pool) for this field, as of the last
+                /// `World::insert`/mirror dispatch. `None` only when `row`
+                /// is out of the registered column's capacity (never a
+                /// valid row at all) -- a row that's simply never been
+                /// written yet comes back `Some(VarLenHandle::default())`
+                /// (`count == 0`, the same "no allocation" sentinel an
+                /// explicitly-emptied field also produces; the CPU shadow
+                /// is zero-initialized at registration, not sparse). Reads
+                /// a CPU shadow, not the GPU buffer itself -- cheap enough
+                /// to call every frame.
+                pub fn #accessor_name(
+                    store: &::pulsar_scenedb::gpu::SceneGpuStore,
+                    row: u32,
+                ) -> ::std::option::Option<::pulsar_scenedb::gpu::VarLenHandle> {
+                    let id = ::pulsar_scenedb::component::component_id::<#wrapper>();
+                    let bytes = store.read_dirty_tracked_row_bytes(id, row)?;
+                    if bytes.len() != ::std::mem::size_of::<::pulsar_scenedb::gpu::VarLenHandle>() {
+                        return None;
+                    }
+                    let mut handle = ::pulsar_scenedb::gpu::VarLenHandle::default();
+                    unsafe {
+                        ::std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            &mut handle as *mut ::pulsar_scenedb::gpu::VarLenHandle as *mut u8,
+                            bytes.len(),
+                        );
+                    }
+                    ::std::option::Option::Some(handle)
+                }
+            }
+        })
+        .collect();
+
     Ok(quote! {
         #[cfg(feature = "gpu")]
         const _: () = {
@@ -254,6 +308,8 @@ pub fn generate_var_len_bearing_type(
                 {
                     #(#register_growable_calls)*
                 }
+
+                #(#handle_accessors)*
             }
 
             #[doc(hidden)]
