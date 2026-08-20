@@ -87,6 +87,72 @@ fn plain_despawn_and_remove_are_recorded() {
 }
 
 #[test]
+fn remove_records_an_unambiguous_component_removal() {
+    let mut world = World::new();
+    let tracker = SharedChangeTracker::new();
+    world.attach_change_tracker(tracker.clone());
+
+    let e = world.spawn();
+    world.insert(e, Pos(0.0, 0.0, 0.0));
+    world.insert(e, Health(100));
+    let _ = tracker.drain_component_removals(); // isolate what follows
+
+    world.remove::<Pos>(e);
+
+    let removals = tracker.drain_component_removals();
+    assert_eq!(removals.len(), 1, "only the removed component must show up here");
+    assert_eq!(removals[0].0, e);
+    assert_eq!(removals[0].1, pulsar_scenedb::component_id::<Pos>());
+
+    // Health was never removed -- draining again must be empty, and a
+    // second remove::<Pos> (already gone) must record nothing new either.
+    assert!(tracker.drain_component_removals().is_empty());
+}
+
+#[test]
+fn despawn_records_one_removal_per_component_the_entity_had() {
+    let mut world = World::new();
+    let tracker = SharedChangeTracker::new();
+    world.attach_change_tracker(tracker.clone());
+
+    let e = world.spawn();
+    world.insert(e, Pos(0.0, 0.0, 0.0));
+    world.insert(e, Health(100));
+    let _ = tracker.drain_component_removals(); // isolate what follows
+
+    world.despawn(e);
+
+    let mut removals = tracker.drain_component_removals();
+    removals.sort_by_key(|(_, cid)| format!("{cid:?}"));
+    assert_eq!(removals.len(), 2, "despawn must record a removal for every component the entity had");
+    assert!(removals.iter().all(|(entity, _)| *entity == e));
+    let types: std::collections::HashSet<_> = removals.iter().map(|(_, cid)| *cid).collect();
+    assert!(types.contains(&pulsar_scenedb::component_id::<Pos>()));
+    assert!(types.contains(&pulsar_scenedb::component_id::<Health>()));
+}
+
+#[test]
+fn component_removals_is_independent_of_drain_with_world() {
+    // Draining the replication Delta must not also silently consume
+    // component_removals, and vice versa -- two independent lists sharing
+    // one ChangeTracker, not one drain accidentally clearing the other.
+    let mut world = World::new();
+    let tracker = SharedChangeTracker::new();
+    world.attach_change_tracker(tracker.clone());
+
+    let e = world.spawn();
+    world.insert(e, Pos(0.0, 0.0, 0.0));
+    let _ = tracker.drain_with_world(&world); // drains spawned/component_deltas only
+
+    world.remove::<Pos>(e);
+
+    // The Pos insert is long gone from `component_deltas` (drained above),
+    // but the later removal must still be queued and independently drainable.
+    let removals = tracker.drain_component_removals();
+    assert_eq!(removals, vec![(e, pulsar_scenedb::component_id::<Pos>())]);
+}
+
+#[test]
 fn plain_spawn_bundle_is_recorded_with_no_tracked_call() {
     // spawn_bundle/spawn_bundle_tracked route through spawn_inner directly
     // (not through the plain spawn()/insert() wrappers), so this is a
