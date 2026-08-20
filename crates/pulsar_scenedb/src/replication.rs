@@ -430,42 +430,18 @@ impl<T: crate::page::Pod> Replicable for T {
     }
 }
 
-// NOTE: no blanket `impl<T: Pod, const N: usize> Replicable for [T; N]` —
-// same `#[fundamental]`-style coherence conflict as `Box<T>` above, except
-// this one is self-inflicted rather than language-mandated: `[f32; 16]`
-// already implements `Pod` (the C5 mat4-transform special case in
-// `page.rs`), so a generic array blanket would overlap with the `T: Pod`
-// blanket above for that exact concrete type. Fixed-size arrays that aren't
-// individually `Pod` (like the common `[f32; 3]` position/vector shape) get
-// concrete, non-blanket impls instead — no overlap, since `[f32; 3]` etc.
-// don't implement `Pod`.
-macro_rules! impl_replicable_f32_array {
-    ($($n:expr),+ $(,)?) => {
-        $(
-            impl Replicable for [f32; $n] {
-                fn replicate_default() -> Self {
-                    [0.0; $n]
-                }
-                fn replicate_encode(&self, buf: &mut Vec<u8>) {
-                    for v in self {
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
-                    if bytes.len() != $n * 4 {
-                        return Err(ErrorCode::InvalidData);
-                    }
-                    let mut out = [0.0f32; $n];
-                    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-                        out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    }
-                    Ok(out)
-                }
-            }
-        )+
-    };
-}
-impl_replicable_f32_array!(2, 3, 4);
+// NOTE: no separate `impl Replicable for [f32; N]` (N = 2, 3, 4) needed
+// anymore. This used to require its own concrete, LE-explicit impls
+// (`to_le_bytes`/`from_le_bytes`) because `[f32; 3]`/etc. weren't `Pod` —
+// only `[f32; 16]` had a one-off `Pod` impl (the C5 mat4-transform special
+// case), so the blanket `impl<T: Pod> Replicable for T` above didn't reach
+// the smaller, equally common `[f32; 3]` position/color shape. `page.rs`'s
+// blanket `impl<T: Pod, const N: usize> Pod for [T; N]` now covers every
+// fixed-size array of a `Pod` element, `[f32; 2/3/4]` included, so they get
+// `Replicable` for free through the `T: Pod` blanket like every other `Pod`
+// type already does — same native-endian raw-byte encoding the rest of this
+// blanket impl already uses (a de facto no-op change on every real
+// deployment target here, all little-endian; see that impl's own doc).
 
 impl Replicable for String {
     fn replicate_default() -> Self {
