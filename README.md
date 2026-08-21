@@ -703,9 +703,13 @@ impl Component for Health {}
 
 let mut registry = ReplicationRegistry::new();
 
-// `[[f32; 4]; 4]` isn't `Pod` in this crate (only `[f32; 16]`/`[f32; 2/3/4]`
-// are provided) — for a hand-registered (non-derive) type like this, either
-// mark it `unsafe impl Pod for Transform {}` yourself if it's safe to
+// `matrix`'s own type, `[[f32; 4]; 4]`, IS `Pod` (the blanket `impl<T: Pod,
+// const N: usize> Pod for [T; N]` applies recursively — f32 is Pod, so
+// [f32; 4] is, so [[f32; 4]; 4] is too). `Transform` itself still isn't,
+// though: a struct never inherits `Pod` from a Pod-typed field automatically
+// (only `#[derive(SceneStore)]`, or a hand-written impl like this one,
+// grants it) — for a hand-registered (non-derive) type, either mark it
+// `unsafe impl Pod for Transform {}` yourself if it's safe to
 // byte-reinterpret, or implement `Replicable` directly.
 unsafe impl pulsar_scenedb::Pod for Transform {}
 
@@ -738,7 +742,7 @@ pub trait Replicable: Sized {
 }
 ```
 
-Any `Pod` type gets this for free via a blanket impl (plain memcpy). `String`, `Vec<T: Replicable>`, `Option<T: Replicable>`, and `[f32; 2/3/4]` are provided out of the box, self-framing so they compose (`Vec<String>`, `Option<Vec<u32>>`, etc. all just work). This is what makes owned/heap data — not just `Pod` scalars — safe to replicate: `replicate_decode` returns a real, safely-constructed `Self`, never a byte-for-byte reinterpretation of network garbage.
+Any `Pod` type gets this for free via a blanket impl (plain memcpy) — and any fixed-size array of a `Pod` element is itself `Pod` (`impl<T: Pod, const N: usize> Pod for [T; N]`, applying recursively: `[f32; 3]`, `[f32; 4]`, `[[f32; 4]; 4]`, `[u32; 8]`, all just are, no per-size impl needed), so those get `Replicable` through the exact same blanket, not a dedicated array impl. `String`, `Vec<T: Replicable>`, and `Option<T: Replicable>` are the ones that genuinely need their own hand-written `Replicable` impls (provided out of the box) — they're not `Pod` and never will be (owned/heap data). All of the above self-frame so they compose (`Vec<String>`, `Option<Vec<u32>>`, etc. all just work). This is what makes owned/heap data — not just `Pod` scalars — safe to replicate: `replicate_decode` returns a real, safely-constructed `Self`, never a byte-for-byte reinterpretation of network garbage.
 
 > [!CAUTION]
 > **`Box<T>` cannot get a blanket `Replicable` impl — you'll need to write one by hand for your specific boxed type.**
@@ -798,6 +802,32 @@ let delta = witness.run_tracked(&mut world, &mut tracker, |world, tracker| {
 ```
 
 Lower-level building blocks are still there if you're driving the frame loop yourself: `tracker.drain_with_world(&world)` does the draining step alone (real archetype-key blobs, no frame advance); the even lower-level `tracker.drain(&schema, client, &authority)` ignores all three arguments and produces a placeholder (non-reconstructible) spawn blob — prefer `drain_with_world` unless you specifically don't have a `World` reference at the call site.
+
+#### Unambiguous component-removal events
+
+`delta.component_deltas` (what `drain`/`drain_with_world` produce) records *changes* — and `World::remove::<T>` records into that same list, with the identical zero-field-data shape a plain `insert` does. That's fine for replication (a remote peer's `Delta::apply` doesn't need to distinguish the two — see the FAQ), but it means a consumer that specifically needs "did `T`'s lifetime on this entity just end," not just "something about `(entity, T)` changed," can't get that out of `component_deltas` alone without cross-referencing current `World` state by hand.
+
+`ChangeTracker::component_removals` is a second, independent, purely local (non-replication) list for exactly that: `World::remove::<T>` and `World::despawn` (once per component the entity actually had) both record an unambiguous `(Entity, ComponentId)` pair into it, automatically, the same "attach a tracker once, every write already knows" way `component_deltas` itself is populated:
+
+```rust
+use pulsar_scenedb::{World, SharedChangeTracker, component_id};
+
+let mut world = World::new();
+let tracker = SharedChangeTracker::new();
+world.attach_change_tracker(tracker.clone());
+
+struct Health(f32);
+let e = world.spawn();
+world.insert(e, Health(100.0));
+let _ = tracker.drain_component_removals(); // isolate what follows
+
+world.remove::<Health>(e);
+
+let removals = tracker.drain_component_removals();
+assert_eq!(removals, vec![(e, component_id::<Health>())]);
+```
+
+Deliberately not folded into `Delta`/`component_deltas`: touching a schema-driven, network-facing wire format for a signal that's purely local and in-process would be the wrong layer for it. `drain_component_removals` doesn't touch `spawned`/`despawned`/`component_deltas`/`events` at all, so a caller that only cares about removals doesn't have to drain (and discard) everything else to get them, and vice versa — the two lists are independently drainable. This is what lets a downstream consumer give a component type a real removal *lifecycle hook* (Pulsar-Native's `pulsar_world_registry` crate is one such consumer — see that project's docs) without `World`/SceneDB ever needing to know a "component lifecycle" concept exists beyond `Entity` + `ComponentId`.
 
 ### Interest management and condition filtering
 

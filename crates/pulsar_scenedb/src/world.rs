@@ -585,6 +585,18 @@ impl World {
         }
 
         if let Some(t) = tracker {
+            // One removal per component the entity actually had, recorded
+            // before the archetype-level row drop above makes that
+            // information unrecoverable -- `active_cids` is the archetype's
+            // own (row-independent) schema, so reading it here (after
+            // `remove_row`) is exactly as valid as reading it before; this
+            // whole entity is dead either way by the time anyone drains
+            // this list. Same "unambiguous, per-component-type" contract
+            // `remove_inner` uses for the single-component case -- see
+            // `ChangeTracker::component_removals`'s doc.
+            for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
+                t.record_component_removal(entity, cid);
+            }
             t.record_despawn(entity);
         }
 
@@ -882,6 +894,12 @@ impl World {
 
         if let Some(t) = tracker {
             t.record_component_change(entity, cid, 0, Vec::new());
+            // Unambiguous counterpart to the `record_component_change` call
+            // above -- see `ChangeTracker::component_removals`'s doc for why
+            // a consumer that specifically needs "did T's lifetime end here"
+            // (not just "something about (entity, T) changed") drains this
+            // list instead.
+            t.record_component_removal(entity, cid);
         }
 
         Some(removed_val)

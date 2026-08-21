@@ -430,42 +430,18 @@ impl<T: crate::page::Pod> Replicable for T {
     }
 }
 
-// NOTE: no blanket `impl<T: Pod, const N: usize> Replicable for [T; N]` —
-// same `#[fundamental]`-style coherence conflict as `Box<T>` above, except
-// this one is self-inflicted rather than language-mandated: `[f32; 16]`
-// already implements `Pod` (the C5 mat4-transform special case in
-// `page.rs`), so a generic array blanket would overlap with the `T: Pod`
-// blanket above for that exact concrete type. Fixed-size arrays that aren't
-// individually `Pod` (like the common `[f32; 3]` position/vector shape) get
-// concrete, non-blanket impls instead — no overlap, since `[f32; 3]` etc.
-// don't implement `Pod`.
-macro_rules! impl_replicable_f32_array {
-    ($($n:expr),+ $(,)?) => {
-        $(
-            impl Replicable for [f32; $n] {
-                fn replicate_default() -> Self {
-                    [0.0; $n]
-                }
-                fn replicate_encode(&self, buf: &mut Vec<u8>) {
-                    for v in self {
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
-                    if bytes.len() != $n * 4 {
-                        return Err(ErrorCode::InvalidData);
-                    }
-                    let mut out = [0.0f32; $n];
-                    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-                        out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    }
-                    Ok(out)
-                }
-            }
-        )+
-    };
-}
-impl_replicable_f32_array!(2, 3, 4);
+// NOTE: no separate `impl Replicable for [f32; N]` (N = 2, 3, 4) needed
+// anymore. This used to require its own concrete, LE-explicit impls
+// (`to_le_bytes`/`from_le_bytes`) because `[f32; 3]`/etc. weren't `Pod` —
+// only `[f32; 16]` had a one-off `Pod` impl (the C5 mat4-transform special
+// case), so the blanket `impl<T: Pod> Replicable for T` above didn't reach
+// the smaller, equally common `[f32; 3]` position/color shape. `page.rs`'s
+// blanket `impl<T: Pod, const N: usize> Pod for [T; N]` now covers every
+// fixed-size array of a `Pod` element, `[f32; 2/3/4]` included, so they get
+// `Replicable` for free through the `T: Pod` blanket like every other `Pod`
+// type already does — same native-endian raw-byte encoding the rest of this
+// blanket impl already uses (a de facto no-op change on every real
+// deployment target here, all little-endian; see that impl's own doc).
 
 impl Replicable for String {
     fn replicate_default() -> Self {
@@ -1502,6 +1478,23 @@ pub struct ChangeTracker {
     spawned: Vec<Entity>,
     despawned: Vec<Entity>,
     component_changes: Vec<ComponentDelta>,
+    /// `(entity, component_type)` pairs for a component that stopped
+    /// existing on `entity` since the last drain -- `World::remove::<T>`
+    /// (entity survives, just loses `T`) and `World::despawn` (every
+    /// component the entity had, recorded once per `ComponentId` before the
+    /// row disappears). Deliberately separate from `component_changes`:
+    /// that list's entries are ambiguous on their own (`insert_inner` and
+    /// `remove_inner` both record a `ComponentDelta` with the same
+    /// zero-field-data shape -- see each call site), and folding "this was
+    /// specifically a removal" into `Delta`'s replication wire format would
+    /// mean touching a schema-driven, network-facing shape for a purely
+    /// local, in-process signal. A consumer that wants "did this
+    /// component's lifetime end" unambiguously (e.g. a subsystem that
+    /// created external state per-component and needs to tear it down --
+    /// see Pulsar-Native's `pulsar_world_registry::WorldComponentRegistration
+    /// ::on_removed`) drains this instead of cross-referencing
+    /// `component_changes` against current `World` state by hand.
+    component_removals: Vec<(Entity, ComponentId)>,
     events: Vec<ReplicatedEvent>,
     frame: u64,
 }
@@ -1512,6 +1505,7 @@ impl ChangeTracker {
             spawned: Vec::new(),
             despawned: Vec::new(),
             component_changes: Vec::new(),
+            component_removals: Vec::new(),
             events: Vec::new(),
             frame: 0,
         }
@@ -1523,6 +1517,23 @@ impl ChangeTracker {
 
     pub fn record_despawn(&mut self, entity: Entity) {
         self.despawned.push(entity);
+    }
+
+    /// Records that `component_type` stopped existing on `entity` --
+    /// see [`Self::component_removals`]'s doc for why this is a separate,
+    /// unambiguous list rather than folded into [`Self::record_component_change`].
+    pub fn record_component_removal(&mut self, entity: Entity, component_type: ComponentId) {
+        self.component_removals.push((entity, component_type));
+    }
+
+    /// Drains every `(entity, component_type)` removal recorded since the
+    /// last call -- a lightweight, purely local (non-replication) signal;
+    /// unlike [`Self::drain`]/[`Self::drain_with_world`] this doesn't touch
+    /// `spawned`/`despawned`/`component_changes`/`events` at all, so a
+    /// caller only interested in removals doesn't have to drain (and
+    /// discard) everything else too.
+    pub fn drain_component_removals(&mut self) -> Vec<(Entity, ComponentId)> {
+        mem::take(&mut self.component_removals)
     }
 
     pub fn record_component_change(
@@ -1691,6 +1702,12 @@ impl SharedChangeTracker {
     ) {
         self.lock()
             .record_component_change(entity, component_type, field_index, field_bytes);
+    }
+
+    /// Drains every removal recorded so far -- same contract as
+    /// [`ChangeTracker::drain_component_removals`].
+    pub fn drain_component_removals(&self) -> Vec<(Entity, ComponentId)> {
+        self.lock().drain_component_removals()
     }
 
     /// Locks the underlying [`ChangeTracker`] for direct access -- e.g. to

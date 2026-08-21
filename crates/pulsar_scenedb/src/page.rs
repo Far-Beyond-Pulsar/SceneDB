@@ -28,6 +28,20 @@ macro_rules! impl_pod {
     ($($t:ty),*) => { $( unsafe impl Pod for $t {} )* };
 }
 impl_pod!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
+
+/// Any fixed-size array of a `Pod` element is itself `Pod` -- purely
+/// structural (an array has no padding between elements, and "all-zero
+/// bytes valid" for each element trivially implies it for the whole array).
+/// Generalizes what used to be a single one-off `unsafe impl Pod for
+/// [f32; 16] {}` (C5's mat4 transform column) -- that flattening's own
+/// column-major-layout contract (below) is unaffected, since `Pod` is a
+/// marker trait with no methods: this blanket impl makes `[f32; 16]` `Pod`
+/// through a more general rule, not a differently-behaved one. Also covers
+/// every other fixed-size Pod array a `#[gpu]`-mirrored struct might want
+/// (`[f32; 3]`/`[f32; 4]` colors and positions, `[u32; N]`, ...) that
+/// previously had no coverage at all short of a one-off impl per size.
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
 // C5 instance element: 64-byte mat4 transform. Kept in the graphics-free core
 // so the transform column exists independent of the gpu feature.
 //
@@ -47,8 +61,9 @@ impl_pod!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f
 // y = 1.9417 and the instance is visible; the naive row-major reading yields
 // y = 1.7509 and the same instance is frustum-culled. Translation-only
 // transforms are unaffected either way, which is why nothing caught this
-// until a shader first consumed rotations.
-unsafe impl Pod for [f32; 16] {}
+// until a shader first consumed rotations. `[f32; 16]`'s `Pod`-ness now
+// comes from the blanket impl above; this comment stays here, next to the
+// type it's actually about.
 
 // ── Non-Pod column support (pre-work item 1) ─────────────────────────────
 
