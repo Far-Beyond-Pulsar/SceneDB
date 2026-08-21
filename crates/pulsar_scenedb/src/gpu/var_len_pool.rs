@@ -28,12 +28,35 @@
 //! routed through this pool automatically. Every OTHER `#[gpu]` field
 //! (scalars, fixed-size arrays, structs) is completely unaffected — same
 //! generated code, same performance, as before this module existed.
+//!
+//! `T` is allowed to be any `Pod` element, including ones smaller than
+//! `wgpu::COPY_BUFFER_ALIGNMENT` (4 bytes) or whose size doesn't evenly
+//! divide it — e.g. `pulsar_world_registry::GpuRepr<bool>`, 1 byte. Every
+//! allocation this pool hands out is therefore reserved in units of
+//! [`super::dynamic_buffer::elem_align::<T>()`] elements rather than raw
+//! element count, and written through [`DynamicGpuBuffer::write_padded`] —
+//! together these guarantee every `wgpu::Queue::write_buffer` call this
+//! pool issues has a 4-byte-aligned offset AND a 4-byte-aligned length, no
+//! matter how small or oddly-sized `T` is. [`VarLenHandle::count`] always
+//! stays the true, unpadded element count regardless — the padding is
+//! purely a GPU-buffer-layout implementation detail, invisible to callers.
 
-use super::dynamic_buffer::{CapacityError, DynamicGpuBuffer};
+use super::dynamic_buffer::{elem_align, CapacityError, DynamicGpuBuffer};
 use super::freelist::RangeList;
 use crate::page::Pod;
 use std::any::Any;
 use std::sync::{Arc, RwLock};
+
+/// Rounds `count` up to the nearest multiple of `align` — the element count
+/// actually reserved/freed in the freelist for a `count`-element logical
+/// row, once `T` is small enough that individual elements don't line up on
+/// `wgpu::COPY_BUFFER_ALIGNMENT` (4-byte) boundaries on their own. See
+/// [`elem_align`] for where `align` itself comes from. A no-op multiplier
+/// (`align == 1`) for every `T` that existed before `#[gpu]` fields allowed
+/// arbitrary `Copy` types — zero behavior change for the common case.
+fn padded_alloc_len(count: u32, align: u64) -> u64 {
+    (count as u64).next_multiple_of(align.max(1))
+}
 
 /// A `Pod`, per-entity-row handle into a [`VarLenGpuPool`] — what actually
 /// lands in the row-indexed growable column for a `Vec<T>`-typed `#[gpu]`
@@ -103,16 +126,26 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
         prev: VarLenHandle,
         data: &[T],
     ) -> Result<VarLenHandle, CapacityError> {
+        let align = elem_align::<T>();
         let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
         if prev.count > 0 {
-            guard.free.free(prev.offset as u64, prev.count as u64);
+            guard.free.free(prev.offset as u64, padded_alloc_len(prev.count, align));
         }
         if data.is_empty() {
             return Ok(VarLenHandle::default());
         }
 
+        // Reserve `align`-rounded-up space, not just `data.len()` — the
+        // extra tail (if any) is what `DynamicGpuBuffer::write_padded`
+        // pads the actual write into so its byte length stays a multiple
+        // of `wgpu::COPY_BUFFER_ALIGNMENT`; reserving it here (rather than
+        // at write time) is what guarantees that padding never overlaps a
+        // neighboring row's live allocation. `VarLenHandle::count` below
+        // stays the true, unpadded element count — callers/shaders never
+        // see the padding as real data.
         let len = data.len() as u64;
-        let offset = match guard.free.alloc(len, 1) {
+        let alloc_len = padded_alloc_len(data.len() as u32, align);
+        let offset = match guard.free.alloc(alloc_len, align) {
             Some(offset) => offset,
             None => {
                 // Exhausted -- grow the backing buffer (existing
@@ -121,21 +154,21 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
                 // to match the ACTUAL new capacity (which may be larger
                 // than the bare minimum requested -- `ensure_capacity`
                 // doubles), and retry. Must succeed: the new capacity is
-                // guaranteed >= old_total + len by construction.
+                // guaranteed >= old_total + alloc_len by construction.
                 let old_total = guard.buf.capacity() as u64;
-                let min_capacity = old_total.saturating_add(len).min(u32::MAX as u64) as u32;
+                let min_capacity = old_total.saturating_add(alloc_len).min(u32::MAX as u64) as u32;
                 guard.buf.ensure_capacity(&self.device, queue, min_capacity)?;
                 let new_total = guard.buf.capacity() as u64;
                 guard.free.extend_total(old_total, new_total);
                 guard
                     .free
-                    .alloc(len, 1)
+                    .alloc(alloc_len, align)
                     .expect("freelist must satisfy an allocation immediately after extending past it")
             }
         };
 
-        guard.buf.write(queue, offset as u32, data);
-        Ok(VarLenHandle { offset: offset as u32, count: data.len() as u32 })
+        guard.buf.write_padded(queue, offset as u32, data);
+        Ok(VarLenHandle { offset: offset as u32, count: len as u32 })
     }
 
     /// Frees `handle`'s allocation without writing a replacement — the
@@ -146,8 +179,9 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
         if handle.count == 0 {
             return;
         }
+        let align = elem_align::<T>();
         let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
-        guard.free.free(handle.offset as u64, handle.count as u64);
+        guard.free.free(handle.offset as u64, padded_alloc_len(handle.count, align));
     }
 
     /// Overwrites `data` at `offset` in place — no allocation, no freelist
@@ -166,7 +200,7 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
     /// hold the matching `VarLenHandle` for.
     pub fn write_at_offset(&self, queue: &wgpu::Queue, offset: u32, data: &[T]) {
         let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
-        guard.buf.write(queue, offset, data);
+        guard.buf.write_padded(queue, offset, data);
     }
 
     pub fn epoch(&self) -> u64 {
@@ -387,5 +421,136 @@ mod tests {
         // offset -- write_at_offset must not have freed it.
         let h3 = pool.write_var_row(&queue, VarLenHandle::default(), &[7]).unwrap();
         assert_eq!(h3.offset, 6, "h1's range was never freed, so h3 must append past both live allocations");
+    }
+
+    // --- Odd-sized-element stress tests -------------------------------
+    //
+    // `T` is allowed to be ANY `Pod` element, not just 4-byte-or-larger
+    // ones -- these push genuinely awkward shapes through the pool to prove
+    // `elem_align`/`write_padded` (dynamic_buffer.rs) hold up: 1-byte and
+    // 3-byte elements (neither divides 4 evenly), and a small fixed-size
+    // "2D block" per row as the honest GPU-representable stand-in for
+    // jagged/nested data. A real `Vec<Vec<T>>` field can never reach this
+    // pool at all -- `Vec` isn't `Copy`, so it fails `GpuRepr<T>`'s `T:
+    // Copy` bound at COMPILE time, before any of this runs. That's Rust's
+    // own rule, not a gap: heap-recursive data has no fixed byte layout to
+    // copy in the first place. A `Vec<[T; N]>` (this pool already supports
+    // arbitrarily many, arbitrarily-shaped fixed rows) is the correct way
+    // to put row-major 2D/3D data on the GPU through this mechanism.
+
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    struct OneByte(u8);
+    unsafe impl Pod for OneByte {}
+
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    struct ThreeBytes([u8; 3]);
+    unsafe impl Pod for ThreeBytes {}
+
+    #[test]
+    fn one_byte_elements_survive_every_count_from_zero_through_nine() {
+        // 1-byte T: elem_align::<OneByte>() == 4 (see dynamic_buffer.rs's
+        // own unit test) -- every count here either divides evenly into
+        // that or doesn't, deliberately walking both cases.
+        let (device, queue) = test_device();
+        let pool: VarLenGpuPool<OneByte> = VarLenGpuPool::new(Arc::clone(&device), "test", 4);
+
+        let mut prev = VarLenHandle::default();
+        for count in 0..=9u8 {
+            let data: Vec<OneByte> = (0..count).map(OneByte).collect();
+            prev = pool.write_var_row(&queue, prev, &data).unwrap_or_else(|e| {
+                panic!("count {count} failed to allocate/write: {e}")
+            });
+            assert_eq!(prev.count, count as u32);
+
+            if count > 0 {
+                // `copy_buffer_to_buffer` (what `readback` uses) has the
+                // exact same COPY_BUFFER_ALIGNMENT size requirement as
+                // `write_buffer` -- round the READBACK request up too; this
+                // is a test-harness constraint, unrelated to the pool's own
+                // (already-padded) internal storage.
+                let readback_len = ((prev.offset + prev.count) as u64).next_multiple_of(4);
+                let mut bytes = Vec::new();
+                pool.with_buffer(&mut |b| bytes = readback(&device, &queue, b, readback_len));
+                let got = &bytes[prev.offset as usize..(prev.offset + prev.count) as usize];
+                let expected: Vec<u8> = (0..count).collect();
+                assert_eq!(got, expected.as_slice(), "count {count} round-tripped the wrong bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn three_byte_elements_never_corrupt_a_neighboring_allocation() {
+        // The sharpest version of the risk this fix exists for: T's size
+        // (3) shares no common factor with 4 beyond 1, so naive offsets
+        // land unaligned almost immediately. Two INTERLEAVED entities each
+        // repeatedly resize -- if padding ever escaped its own reserved
+        // span, this cross-contaminates the other entity's live bytes.
+        let (device, queue) = test_device();
+        let pool: VarLenGpuPool<ThreeBytes> = VarLenGpuPool::new(Arc::clone(&device), "test", 4);
+
+        let row = |tag: u8, count: u8| -> Vec<ThreeBytes> {
+            (0..count).map(|i| ThreeBytes([tag, i, tag.wrapping_add(i)])).collect()
+        };
+
+        let mut a = pool.write_var_row(&queue, VarLenHandle::default(), &row(0xAA, 3)).unwrap();
+        let mut b = pool.write_var_row(&queue, VarLenHandle::default(), &row(0xBB, 1)).unwrap();
+
+        for round in 0..12u8 {
+            let a_count = 1 + (round * 7) % 5; // 1..=5, deliberately non-monotonic
+            let b_count = 1 + (round * 3) % 4; // 1..=4
+            a = pool.write_var_row(&queue, a, &row(0xAA, a_count)).unwrap();
+            b = pool.write_var_row(&queue, b, &row(0xBB, b_count)).unwrap();
+
+            let mut bytes = Vec::new();
+            pool.with_buffer(&mut |buf| {
+                bytes = readback(&device, &queue, buf, pool.capacity() as u64 * 3);
+            });
+
+            let a_bytes = &bytes[a.offset as usize * 3..(a.offset as usize + a.count as usize) * 3];
+            let expected_a: Vec<u8> = row(0xAA, a_count).iter().flat_map(|e| e.0).collect();
+            assert_eq!(a_bytes, expected_a.as_slice(), "round {round}: entity A's live bytes got clobbered");
+
+            let b_bytes = &bytes[b.offset as usize * 3..(b.offset as usize + b.count as usize) * 3];
+            let expected_b: Vec<u8> = row(0xBB, b_count).iter().flat_map(|e| e.0).collect();
+            assert_eq!(b_bytes, expected_b.as_slice(), "round {round}: entity B's live bytes got clobbered");
+        }
+    }
+
+    #[test]
+    fn fixed_size_2d_blocks_per_row_stand_in_for_jagged_nested_data() {
+        // `Vec<[u16; 3]>` -- each logical element is itself a small
+        // fixed-shape row (a triangle's 3 UV components, a bone's 3
+        // weights, whatever). 6 bytes/element, not a multiple of 4, so
+        // this exercises the same padding machinery with a compound
+        // element type rather than a single-field newtype.
+        let (device, queue) = test_device();
+        let pool: VarLenGpuPool<[u16; 3]> = VarLenGpuPool::new(Arc::clone(&device), "test", 4);
+
+        let blocks: Vec<[u16; 3]> = vec![[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        let handle = pool.write_var_row(&queue, VarLenHandle::default(), &blocks).unwrap();
+        assert_eq!(handle.count, 3);
+
+        // Same COPY_BUFFER_ALIGNMENT rounding as the 1-byte-element test
+        // above -- this is `readback`'s own copy size, not the pool's.
+        let readback_len = ((handle.offset + handle.count) as u64 * 6).next_multiple_of(4);
+        let mut bytes = Vec::new();
+        pool.with_buffer(&mut |b| bytes = readback(&device, &queue, b, readback_len));
+        let region = &bytes[handle.offset as usize * 6..(handle.offset as usize + 3) * 6];
+        let got: Vec<[u16; 3]> = region
+            .chunks_exact(6)
+            .map(|c| [
+                u16::from_ne_bytes([c[0], c[1]]),
+                u16::from_ne_bytes([c[2], c[3]]),
+                u16::from_ne_bytes([c[4], c[5]]),
+            ])
+            .collect();
+        assert_eq!(got, blocks);
+
+        // A second entity's block must land right after, not overlapping
+        // the first's padded tail.
+        let h2 = pool.write_var_row(&queue, VarLenHandle::default(), &[[10, 11, 12]]).unwrap();
+        assert!(h2.offset >= handle.offset + handle.count, "second allocation must not overlap the first");
     }
 }

@@ -39,6 +39,49 @@ impl std::fmt::Display for CapacityError {
 
 impl std::error::Error for CapacityError {}
 
+/// The element-count alignment that guarantees a `T`-element index's BYTE
+/// address (`index * size_of::<T>()`) is always a multiple of
+/// `wgpu::COPY_BUFFER_ALIGNMENT` (4) — e.g. 4 for a 1-byte `T`, 2 for a
+/// 2-byte `T`, 1 (no constraint at all) for any `T` whose own size is
+/// already a multiple of 4, which covers every `#[gpu]` field type that
+/// existed before `T` was allowed to be an arbitrary `Copy` type.
+///
+/// Exists because `wgpu::Queue::write_buffer` requires BOTH the destination
+/// offset and the byte length of every write to be 4-byte aligned, and
+/// `pulsar_world_registry::GpuRepr<T>` deliberately supports `T` smaller
+/// than 4 bytes (`bool`) or whose size doesn't evenly divide 4. Padding the
+/// WRITE SIZE alone ([`DynamicGpuBuffer::write_padded`]) only helps once
+/// every row/allocation already starts on a 4-byte boundary — this is the
+/// piece that guarantees that. [`super::var_len_pool::VarLenGpuPool`] is
+/// the one caller that needs it, allocating every row's element count
+/// rounded up to a multiple of this value.
+pub(crate) fn elem_align<T>() -> u64 {
+    let size = std::mem::size_of::<T>().max(1) as u64;
+    4 / gcd(size, 4)
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+#[cfg(test)]
+mod elem_align_tests {
+    use super::elem_align;
+
+    #[test]
+    fn matches_hand_worked_cases() {
+        assert_eq!(elem_align::<u8>(), 4, "1-byte T needs 4 elements to guarantee a 4-byte-aligned byte address");
+        assert_eq!(elem_align::<[u8; 2]>(), 2, "2-byte T needs 2 elements");
+        assert_eq!(elem_align::<[u8; 3]>(), 4, "3-byte T: gcd(3,4)=1, needs 4 elements (12 bytes)");
+        assert_eq!(elem_align::<u32>(), 1, "4-byte T is already always aligned — no padding needed");
+        assert_eq!(elem_align::<[u8; 16]>(), 1, "any multiple of 4 is already always aligned");
+    }
+}
+
 /// Growable counterpart to [`super::SceneBuffer`], for callers whose
 /// required row count isn't known ahead of time and isn't tied to any
 /// `Entity`/`ComponentId`. Doubles on demand (capped by an optional
@@ -261,6 +304,73 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         if !data.is_empty() {
             queue.write_buffer(&self.buf, offset as u64 * std::mem::size_of::<T>() as u64, super::as_bytes(data));
         }
+    }
+
+    /// Same as [`Self::write`], but tolerates `data`'s byte length not being
+    /// a multiple of `wgpu::COPY_BUFFER_ALIGNMENT` (4) — required once `T`
+    /// is allowed to be ANY `Copy` type (`pulsar_world_registry::GpuRepr<T>`
+    /// wraps it for exactly this reason), including ones smaller than 4
+    /// bytes or whose size doesn't evenly divide 4 (a `GpuRepr<bool>` is 1
+    /// byte). `wgpu::Queue::write_buffer` rejects a write whose byte length
+    /// isn't 4-aligned outright — this pads the write with zero bytes up to
+    /// the next 4-byte boundary before issuing it. The padding bytes' VALUE
+    /// never matters (nothing reads past the caller's own logical element
+    /// count — see [`super::var_len_pool::VarLenHandle::count`], which
+    /// always holds the true count, never the padded one).
+    ///
+    /// This only fixes the SIZE half of `write_buffer`'s alignment
+    /// requirement. Callers MUST separately ensure `offset`'s byte address
+    /// (`offset * size_of::<T>()`) is itself a multiple of 4 — a 3-byte
+    /// write at byte offset 5 is just as invalid as one at offset 4, for a
+    /// different reason this method has no way to detect on its own. See
+    /// [`elem_align`] — [`super::var_len_pool::VarLenGpuPool`] (the one
+    /// caller that needs this) allocates every row on an `elem_align`-
+    /// element boundary specifically so every offset it passes here is
+    /// already byte-aligned.
+    ///
+    /// # Panics
+    ///
+    /// If the padded write would extend past this buffer's actual
+    /// allocation (`capacity * size_of::<T>()` bytes) — i.e. the caller
+    /// must reserve capacity for the PADDED element count, not just the
+    /// logical one, or this has no safe room to round up into. Same
+    /// "call `ensure_capacity` first" contract as [`Self::write`].
+    pub fn write_padded(&self, queue: &wgpu::Queue, offset: u32, data: &[T]) {
+        assert!(
+            offset as u64 + data.len() as u64 <= self.capacity as u64,
+            "write [{offset}, +{}) exceeds capacity {} — call ensure_capacity first",
+            data.len(),
+            self.capacity
+        );
+        if data.is_empty() {
+            return;
+        }
+        let elem_size = std::mem::size_of::<T>() as u64;
+        let byte_offset = offset as u64 * elem_size;
+        let bytes = super::as_bytes(data);
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let padded_len = (bytes.len() as u64).next_multiple_of(align);
+        if padded_len == bytes.len() as u64 {
+            // The overwhelmingly common case (any T whose size is already a
+            // multiple of 4) — no padding needed, identical to `write`.
+            queue.write_buffer(&self.buf, byte_offset, bytes);
+            return;
+        }
+        debug_assert_eq!(
+            byte_offset % align,
+            0,
+            "write_padded requires a 4-byte-aligned offset — see this method's own doc"
+        );
+        let buffer_end_bytes = self.capacity as u64 * elem_size;
+        assert!(
+            byte_offset + padded_len <= buffer_end_bytes,
+            "write_padded [{byte_offset}, +{padded_len}) exceeds this buffer's real allocation \
+             ({buffer_end_bytes} bytes) — the caller must reserve capacity padded to a 4-byte \
+             multiple, not just the logical element count"
+        );
+        let mut padded = vec![0u8; padded_len as usize];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        queue.write_buffer(&self.buf, byte_offset, &padded);
     }
 
     pub fn buffer(&self) -> &wgpu::Buffer {
