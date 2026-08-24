@@ -4,7 +4,7 @@
 use pulsar_scenedb::gpu::EngineGpuContext;
 use pulsar_scenedb::gpu::SceneBuffer;
 use pulsar_scenedb::gpu::DirtyMask;
-use pulsar_scenedb::gpu::{CellSlot, FrameDriver, RegionClassConfig, SceneGpuConfig, SceneGpuStore, SimulateA};
+use pulsar_scenedb::gpu::{CellCoord, CellSlot, FrameDriver, RegionClassConfig, SceneGpuConfig, SceneGpuStore, SimulateA};
 use pulsar_scenedb::{CellStorage, CellType, InstanceInfo, TypeToken};
 use std::sync::Arc;
 
@@ -1292,7 +1292,7 @@ fn run_ram_boundary(
 #[test]
 fn ram_tier_lifecycle_loads_once_and_retains_through_gpu_roundtrip() {
     use pulsar_scenedb::gpu::{
-        Domain, GridConfig, RamHooks, RegionClassConfig, StreamingBudget, StreamingGrid,
+        CellCoord, Domain, GridConfig, RamHooks, RegionClassConfig, StreamingBudget, StreamingGrid,
         WarmTierConfig,
     };
     use std::collections::HashMap;
@@ -1380,8 +1380,12 @@ fn ram_tier_lifecycle_loads_once_and_retains_through_gpu_roundtrip() {
     assert_eq!(loads.load(Ordering::SeqCst), 1, "second promotion, still no reload");
     assert!(grid.gpu_id(c0).is_some());
 
-    // ── Stage 5: retreat past warm_demote (center −400 < −360): Warm→Outer.
-    // The ONLY evict of the whole lifecycle.
+    // ── Stage 5: retreat far past both floors (center −400 < −190, −360).
+    // The single-step machine takes TWO boundaries: Margin→Warm, then
+    // Warm→Outer — whose evict is the ONLY one of the whole lifecycle.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, -400.0);
+    assert_eq!(s.demoted, 1, "first step: GPU teardown back into the warm pool");
+    assert_eq!(evicts.load(Ordering::SeqCst), 0);
     let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, -400.0);
     assert_eq!(s.cooled, 1);
     assert_eq!(evicts.load(Ordering::SeqCst), 1);
@@ -1396,7 +1400,7 @@ fn ram_tier_lifecycle_loads_once_and_retains_through_gpu_roundtrip() {
 #[test]
 fn legacy_executor_declines_queued_warm_transition_without_hooks() {
     use pulsar_scenedb::gpu::{
-        execute_transitions, Domain, GridConfig, RegionClassConfig, StreamingBudget,
+        execute_transitions, CellCoord, Domain, GridConfig, RegionClassConfig, StreamingBudget,
         StreamingGrid, WarmTierConfig,
     };
     use std::collections::HashMap;
