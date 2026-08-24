@@ -1198,13 +1198,15 @@ fn transitions_execute_at_boundary_and_metadata_mirrors_state() {
     let mut store = SceneGpuStore::new(&ctx, scene_cfg());
     let mut frames = FrameDriver::new();
     let mut grid = StreamingGrid::new(
-        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0 },
+        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0, warm: None },
         StreamingBudget {
             vram_hlod_budget: u64::MAX,
             vram_geometry_budget: u64::MAX,
             max_materialized_cells: 16,
             proxy_mesh_bytes: 1,
             mean_cell_geometry_bytes: 1,
+            ram_budget: u64::MAX,
+            max_ram_cached_cells: 16,
         },
         &[RegionClassConfig { capacity: 64, max_resident_cells: 4 }],
     )
@@ -1245,6 +1247,216 @@ fn transitions_execute_at_boundary_and_metadata_mirrors_state() {
     let domain = u32::from_le_bytes(meta[4..8].try_into().unwrap());
     assert!((alpha - 0.5).abs() < 1e-6);
     assert_eq!(domain, 1, "Margin encodes as 1");
+}
+
+/// Issue #43: one boundary helper shared by the RAM-tier lifecycle tests —
+/// classify → retire → execute (with hooks) → prompt recycle → compact/sync,
+/// mirroring stress_gpu's eviction-timing precedent.
+fn run_ram_boundary(
+    frames: &mut FrameDriver,
+    grid: &mut pulsar_scenedb::gpu::StreamingGrid,
+    store: &mut SceneGpuStore,
+    cells: &mut std::collections::HashMap<CellCoord, pulsar_scenedb::SpatialCell>,
+    hooks: &pulsar_scenedb::gpu::RamHooks<'_>,
+    observer_x: f32,
+) -> pulsar_scenedb::gpu::TransitionStats {
+    use pulsar_scenedb::gpu::execute_transitions_with_ram;
+
+    grid.classify(&[pulsar_scenedb::Aabb {
+        min: [observer_x - 10.0, -1.0, -1.0],
+        max: [observer_x + 10.0, 1.0, 1.0],
+    }]);
+    let sim = frames.begin();
+    let b = sim.end().end().end();
+    let (retired, _) = b.retire(store, &mut []);
+    let serial = store.tracker().next_serial();
+    let stats =
+        execute_transitions_with_ram(grid, store, cells, &|_| 0, Some(hooks), serial, &retired);
+    store.tracker().force_complete(serial);
+    retired.compact(store, &mut []).sync(store, &mut []);
+    stats
+}
+
+/// Issue #43 acceptance criteria 1+2, end-to-end against a real store:
+/// the load hook fires exactly once per cold cell; Warm→Margin promotes
+/// straight off the staged copy (no reload, twice); Margin→Warm frees VRAM
+/// but retains the copy (no evict); only the final Warm→Outer cools.
+///
+/// Band math for cell (0,0), base x ∈ [0,100], warm radius 300 / wpad 10 /
+/// whyst 40 (grid.rs `warm_cfg` precedent), observer half-width 10,
+/// approaching along −x:
+///   warm_promote   zone [−310, 410] ⟺ center > −320
+///   margin_promote zone [−160, 260]
+///   margin_demote  zone [−180, 280] ⟺ holds while center ≥ −190
+///   warm_demote    zone [−350, 450] ⟺ holds while center ≥ −360
+#[test]
+fn ram_tier_lifecycle_loads_once_and_retains_through_gpu_roundtrip() {
+    use pulsar_scenedb::gpu::{
+        Domain, GridConfig, RamHooks, RegionClassConfig, StreamingBudget, StreamingGrid,
+        WarmTierConfig,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    let mut frames = FrameDriver::new();
+
+    let mut grid = StreamingGrid::new(
+        GridConfig {
+            cell_width: 100.0,
+            margin_radius: 150.0,
+            pad_fraction: 0.10,
+            hysteresis: 20.0,
+            warm: Some(WarmTierConfig { radius: 300.0, pad_fraction: 0.10, hysteresis: 40.0 }),
+        },
+        StreamingBudget {
+            vram_hlod_budget: u64::MAX,
+            vram_geometry_budget: u64::MAX,
+            max_materialized_cells: 16,
+            proxy_mesh_bytes: 1,
+            mean_cell_geometry_bytes: 1,
+            ram_budget: u64::MAX,
+            max_ram_cached_cells: 16,
+        },
+        &[RegionClassConfig { capacity: 64, max_resident_cells: 4 }],
+    )
+    .unwrap();
+
+    let c0 = CellCoord { x: 0, z: 0 };
+    grid.materialize(c0);
+    let mut cells = HashMap::new();
+    cells.insert(c0, pulsar_scenedb::SpatialCell::with_transform(64).unwrap());
+
+    let loads = AtomicUsize::new(0);
+    let evicts = AtomicUsize::new(0);
+    let hooks = RamHooks {
+        load: &|_| {
+            loads.fetch_add(1, Ordering::SeqCst);
+            true
+        },
+        evict: &|_| {
+            evicts.fetch_add(1, Ordering::SeqCst);
+        },
+    };
+
+    // ── Stage 1: Outer→Warm (center −200: past warm_promote −320, short of
+    // margin_promote). Load fires; no GPU registration.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, -200.0);
+    assert_eq!(s.warmed, 1);
+    assert_eq!(s.promoted, 0);
+    assert_eq!(s.ram_declined, 0);
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(grid.domain(c0), Some(Domain::Warm));
+    assert_eq!(grid.gpu_id(c0), None);
+    assert_eq!(grid.ram_cached_count(), 1);
+
+    // Shader-visible state of a warm cell: identical to Outer (code 0, α 0).
+    grid.write_cell_metadata(ctx.queue(), store.cell_metadata_buffer());
+    let meta = readback(&ctx, store.cell_metadata_buffer(), 8);
+    assert_eq!(f32::from_le_bytes(meta[0..4].try_into().unwrap()), 0.0, "warm α stays 0");
+    assert_eq!(u32::from_le_bytes(meta[4..8].try_into().unwrap()), 0, "warm encodes as not-resident");
+
+    // ── Stage 2: Warm→Margin. Registers from the staged copy — NO reload.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, 50.0);
+    assert_eq!(s.promoted, 1);
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "GPU promotion must reuse the resident copy");
+    assert!(grid.gpu_id(c0).is_some());
+    assert_eq!(grid.domain(c0), Some(Domain::Margin));
+
+    // ── Stage 3: retreat past margin_demote (center −200 < −190): Margin→Warm.
+    // VRAM freed; evict does NOT fire — retaining the copy is the feature.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, -200.0);
+    assert_eq!(s.demoted, 1);
+    assert_eq!(evicts.load(Ordering::SeqCst), 0, "Margin→Warm retains the RAM copy");
+    assert_eq!(grid.gpu_id(c0), None);
+    assert_eq!(grid.domain(c0), Some(Domain::Warm));
+    assert_eq!(grid.ram_cached_count(), 1);
+
+    // ── Stage 4: backtrack in again. Still exactly one lifetime load — the
+    // cheap re-promote the tier exists for.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, 50.0);
+    assert_eq!(s.promoted, 1);
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "second promotion, still no reload");
+    assert!(grid.gpu_id(c0).is_some());
+
+    // ── Stage 5: retreat past warm_demote (center −400 < −360): Warm→Outer.
+    // The ONLY evict of the whole lifecycle.
+    let s = run_ram_boundary(&mut frames, &mut grid, &mut store, &mut cells, &hooks, -400.0);
+    assert_eq!(s.cooled, 1);
+    assert_eq!(evicts.load(Ordering::SeqCst), 1);
+    assert_eq!(grid.domain(c0), Some(Domain::Outer));
+    assert_eq!(grid.ram_cached_count(), 0);
+}
+
+/// Issue #43 acceptance criterion: legacy callers that don't opt into the
+/// RAM tier degrade gracefully — `execute_transitions` (no hooks) DECLINES
+/// a queued Outer→Warm instead of mis-executing it; the cell stays put and
+/// the next classification re-derives intent.
+#[test]
+fn legacy_executor_declines_queued_warm_transition_without_hooks() {
+    use pulsar_scenedb::gpu::{
+        execute_transitions, Domain, GridConfig, RegionClassConfig, StreamingBudget,
+        StreamingGrid, WarmTierConfig,
+    };
+    use std::collections::HashMap;
+
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    let mut frames = FrameDriver::new();
+    let mut grid = StreamingGrid::new(
+        GridConfig {
+            cell_width: 100.0,
+            margin_radius: 150.0,
+            pad_fraction: 0.10,
+            hysteresis: 20.0,
+            warm: Some(WarmTierConfig { radius: 300.0, pad_fraction: 0.10, hysteresis: 40.0 }),
+        },
+        StreamingBudget {
+            vram_hlod_budget: u64::MAX,
+            vram_geometry_budget: u64::MAX,
+            max_materialized_cells: 16,
+            proxy_mesh_bytes: 1,
+            mean_cell_geometry_bytes: 1,
+            ram_budget: u64::MAX,
+            max_ram_cached_cells: 16,
+        },
+        &[RegionClassConfig { capacity: 64, max_resident_cells: 4 }],
+    )
+    .unwrap();
+    let c0 = CellCoord { x: 0, z: 0 };
+    grid.materialize(c0);
+    let mut cells = HashMap::new();
+    cells.insert(c0, pulsar_scenedb::SpatialCell::with_transform(64).unwrap());
+
+    // Observer inside the warm-only ring (center −200: warm_promote yes,
+    // margin_promote no): queues Outer→Warm.
+    grid.classify(&[pulsar_scenedb::Aabb { min: [-210.0, -1.0, -1.0], max: [-190.0, 1.0, 1.0] }]);
+
+    let sim = frames.begin();
+    let b = sim.end().end().end();
+    let (retired, _) = b.retire(&mut store, &mut []);
+    let serial = store.tracker().next_serial();
+    let stats = execute_transitions(&mut grid, &mut store, &mut cells, &|_| 0, serial, &retired);
+    assert_eq!(stats.ram_declined, 1, "no hooks → decline, not mis-execute");
+    assert_eq!(stats.warmed, 0);
+    assert_eq!(stats.promoted, 0);
+    assert_eq!(stats.dropped_stale, 0);
+    assert_eq!(grid.domain(c0), Some(Domain::Outer), "decline leaves the cell put");
+    assert_eq!(grid.ram_cached_count(), 0);
+
+    // The next boundary re-queues from committed state (drain-every-
+    // boundary contract intact).
+    grid.classify(&[pulsar_scenedb::Aabb { min: [-210.0, -1.0, -1.0], max: [-190.0, 1.0, 1.0] }]);
+    let ts = grid.take_transitions();
+    assert_eq!(
+        ts,
+        vec![pulsar_scenedb::gpu::Transition {
+            coord: c0,
+            from: Domain::Outer,
+            to: Domain::Warm,
+        }]
+    );
 }
 
 #[test]
