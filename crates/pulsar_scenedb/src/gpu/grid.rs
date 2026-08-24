@@ -1,8 +1,11 @@
 //! Concentric streaming grid — pure logic (design Rev 2 §4, spec §5/§5.3/§5.5).
 //!
 //! Classifies each tracked cell into a residency [`Domain`] (`Outer` →
-//! `Margin` → `Inner`) from the observer set, with §5.5 hysteresis to damp
-//! boundary jitter, and tracks a per-cell cross-fade `alpha` (§5.2).
+//! `Warm`* → `Margin` → `Inner`) from the observer set, with §5.5 hysteresis
+//! to damp boundary jitter, and tracks a per-cell cross-fade `alpha` (§5.2).
+//! (*`Warm` — a system-RAM residency tier between "not tracked anywhere" and
+//! "GPU-resident" — is OPT-IN via [`GridConfig::warm`]; without it the
+//! machine is exactly the legacy `Outer`/`Margin`/`Inner` ladder.)
 //! Classification itself (`classify`, `commit_transition`, `advance_crossfade`)
 //! stays PURE LOGIC: it decides *what* should transition and queues the
 //! decision as a [`Transition`], touching neither `SceneGpuStore` nor wgpu.
@@ -30,24 +33,36 @@
 //! discipline; see `spatial.rs`). Let `pad = pad_fraction × cell_width`
 //! (§5.5 Δpad) and `hyst = hysteresis` (§5.5 δhyst).
 //!
-//! Per cell, four concentric zones are derived from the base bounds, each
-//! tested for intersection against the observer union (any-of):
+//! Per cell, up to six concentric zones are derived from the base bounds,
+//! each tested for intersection against the observer union (any-of):
 //!
-//! | zone             | base grown by                | role                   |
-//! |------------------|------------------------------|------------------------|
-//! | `inner_promote`  | `pad`                        | Margin→Inner trigger   |
-//! | `inner_demote`   | `pad + hyst`                 | Inner→Margin hold zone |
-//! | `margin_promote` | `margin_radius + pad`        | Outer→Margin trigger   |
-//! | `margin_demote`  | `margin_radius + pad + hyst` | Margin→Outer hold zone |
+//! | zone             | base grown by                       | role                        |
+//! |------------------|-------------------------------------|-----------------------------|
+//! | `inner_promote`  | `pad`                               | Margin→Inner trigger        |
+//! | `inner_demote`   | `pad + hyst`                        | Inner→Margin hold zone      |
+//! | `margin_promote` | `margin_radius + pad`               | Outer/Warm→Margin trigger   |
+//! | `margin_demote`  | `margin_radius + pad + hyst`        | Margin→{Outer,Warm} hold    |
+//! | `warm_promote`*  | `warm.radius + warm.pad_fraction·w` | Outer→Warm trigger          |
+//! | `warm_demote`*   | `warm.radius + warm pad + warm hyst`| Warm→Outer hold zone        |
+//!
+//! (*opt-in RAM tier only — see the tier section below.)
 //!
 //! Transition rules — **at most one step per `classify` call**, evaluated
-//! from the cell's *committed* domain only:
+//! from the cell's *committed* domain only. With the RAM tier OFF:
 //!
 //! - `Outer`: intersects `margin_promote` → queue `→Margin`. Else nothing.
 //! - `Margin`: intersects `inner_promote` → queue `→Inner`; else if NOT
 //!   intersecting `margin_demote` → queue `→Outer`; else nothing.
 //! - `Inner`: NOT intersecting `inner_demote` → queue `→Margin`. Else
 //!   nothing.
+//!
+//! With the RAM tier ON (full rules in the tier section below): `Outer`
+//! additionally checks `warm_promote` (after `margin_promote`, which keeps
+//! its fast path), `Warm` promotes on `margin_promote` and cools to `Outer`
+//! past `warm_demote`, and `Margin` demotes to `Warm` instead of `Outer`.
+//! Every GPU-residency boundary (`margin_promote`, `margin_demote`,
+//! `inner_*`) keeps its exact legacy threshold either way — the tier only
+//! changes what happens *between* those boundaries.
 //!
 //! The promotion boundary stands `pad` proud of the unpadded region edge
 //! (§5.5 PromotionBoundary = CellBounds + Δpad: an observer promotes

@@ -125,6 +125,13 @@ required-features = ["gpu"]
 name = "gpu_derive_field_collision"
 required-features = ["gpu"]
 
+# NOTE: this file is auto-discovered WITHOUT a [[test]] entry unless it is
+# registered here -- it needs wgpu/`--features gpu`, so without this entry a
+# plain `cargo test -p pulsar_scenedb` fails to compile it.
+[[test]]
+name = "massive_mesh_load_stress"
+required-features = ["gpu"]
+
 [[test]]
 name = "world_gpu_mirror"
 required-features = ["gpu"]
