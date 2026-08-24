@@ -84,6 +84,7 @@ pub mod schedule;
 pub mod simd;
 pub mod snapshot;
 pub mod spatial;
+pub mod subscriptions;
 pub mod time;
 pub mod token;
 pub mod world;
@@ -155,6 +156,7 @@ pub use registry::{HandleRegistry, NULL_ROW};
 pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
 pub use schedule::Schedule;
 pub use snapshot::{LivenessSnapshot, RevocationFlag};
+pub use subscriptions::{ComponentChangeEvent, ComponentChangeKind, SubscriptionId};
 pub use spatial::{
     Aabb, Frustum, InstanceInfo, SpatialCell, INSTANCE_INFO_COLUMN, SPATIAL_COLUMNS,
     TRANSFORM_COLUMN,
