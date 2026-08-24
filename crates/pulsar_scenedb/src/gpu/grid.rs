@@ -1229,4 +1229,217 @@ mod tests {
         assert!(ts.is_empty(), "pinned Outer cell does not promote despite nearby observer");
         assert_eq!(g.domain(c), Some(Domain::Outer));
     }
+
+    // ── System-RAM residency tier (`Warm`, opt-in) tests ──────────────────
+    //
+    // warm_cfg(): cell_width 100, margin_radius 150, pad 10, hyst 20;
+    // warm: radius 300, pad_fraction 0.10 (wpad = 10), hysteresis 40.
+    // Cell (5,0): base x ∈ [500, 600]; observer half-width 10.
+    //
+    //   warm_promote   = base ± (300+10)     = [190, 910]  ⟺ center ≥ 180
+    //   margin_promote = base ± (150+10)     = [340, 760]  ⟺ center ≥ 330
+    //   margin_demote  = base ± (150+10+20)  = [320, 780]  ⟺ holds ≥ 310
+    //   warm_demote    = base ± (300+10+40)  = [150, 950]  ⟺ holds ≥ 140
+
+    fn warm_cfg() -> GridConfig {
+        GridConfig {
+            cell_width: 100.0,
+            margin_radius: 150.0,
+            pad_fraction: 0.10,
+            hysteresis: 20.0,
+            warm: Some(WarmTierConfig { radius: 300.0, pad_fraction: 0.10, hysteresis: 40.0 }),
+        }
+    }
+
+    #[test]
+    fn warm_tier_stages_holds_and_cools_on_its_own_bands() {
+        let mut g = StreamingGrid::new(warm_cfg(), budget(), &[]).unwrap();
+        let far = CellCoord { x: 5, z: 0 }; // base x ∈ [500, 600]
+        g.materialize(far);
+
+        // Just below warm_promote (center 179 < 180): nothing.
+        g.classify(&[observer_at(179.0)]);
+        assert!(g.take_transitions().is_empty(), "179 < padded warm threshold 180");
+
+        // Cross it (center 200): exactly one step — Outer→Warm, NOT Margin.
+        g.classify(&[observer_at(200.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Outer, to: Domain::Warm }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.domain(far), Some(Domain::Warm));
+        assert_eq!(g.ram_cached(far), Some(true));
+        assert_eq!(g.ram_cached_count(), 1);
+        assert_eq!(g.alpha(far), Some(0.0), "RAM residency has no on-screen content");
+
+        // Jitter inside the warm hold band [140, 330): zero transitions.
+        for i in 0..100 {
+            let center = 160.0 + ((i % 5) as f32 - 2.0) * 8.0; // ∈ [144, 176]
+            g.classify(&[observer_at(center)]);
+            assert!(
+                g.take_transitions().is_empty(),
+                "warm-band frame {i} (center {center}) caused a transition"
+            );
+        }
+
+        // Sprint in past margin_promote (center 340 ≥ 330): Warm→Margin, one
+        // step — GPU promotion straight off the already-resident warm copy.
+        g.classify(&[observer_at(340.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Warm, to: Domain::Margin }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.domain(far), Some(Domain::Margin));
+        assert_eq!(g.gpu_id(far), None, "executor records ids; pure grid leaves it unset");
+        assert_eq!(g.ram_cached_count(), 0, "GPU-resident cells leave the Warm pool count");
+        // α NOW lights up: crossing into GPU residency targets 1.0.
+        g.advance_crossfade(50.0, 100.0);
+        assert!((g.alpha(far).unwrap() - 0.5).abs() < 1e-6);
+
+        // Retreat past the UNCHANGED margin_demote floor (305 < 310): drops
+        // to Warm — RAM retained — instead of all the way to Outer.
+        g.classify(&[observer_at(305.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Margin, to: Domain::Warm }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached(far), Some(true));
+
+        // Retreat past warm_demote (139 < 140): Warm→Outer, the cool-down.
+        g.classify(&[observer_at(139.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Warm, to: Domain::Outer }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached_count(), 0);
+    }
+
+    #[test]
+    fn sprint_in_skips_warm_staging_entirely() {
+        let mut g = StreamingGrid::new(warm_cfg(), budget(), &[]).unwrap();
+        let far = CellCoord { x: 5, z: 0 };
+        g.materialize(far);
+        // Observer jumps straight into the margin zone (center 400 ≥ 330),
+        // never touching the warm-only ring [180, 330).
+        g.classify(&[observer_at(400.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(
+            ts,
+            vec![Transition { coord: far, from: Domain::Outer, to: Domain::Margin }],
+            "fast path: sprint-in registers straight away — no RAM staging step, legacy latency"
+        );
+        g.commit_transition(ts[0]);
+        // The legacy two-step cascade continues unchanged from there.
+        g.classify(&[observer_at(505.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Margin, to: Domain::Inner }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.domain(far), Some(Domain::Inner));
+    }
+
+    #[test]
+    fn warm_cap_holds_staging_until_room_frees() {
+        let mut b = budget();
+        b.max_ram_cached_cells = 1;
+        let mut g = StreamingGrid::new(warm_cfg(), b, &[]).unwrap();
+        // Rings kept disjoint along the observer path: `a`'s warm_promote
+        // triggers at center ≥ 180; `c` (mirrored across the origin) at
+        // center ≤ −300 — so any position qualifying one disqualifies the
+        // other and assertions stay order-independent.
+        let a = CellCoord { x: 5, z: 0 }; // base [500, 600]
+        let c = CellCoord { x: -6, z: 0 }; // base [-700, -600]: warm ⟺ center ≤ -300
+        g.materialize(a);
+        g.materialize(c);
+
+        // Only `a` is inside its warm ring (center 200): warms, cap 1/1.
+        g.classify(&[observer_at(200.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: a, from: Domain::Outer, to: Domain::Warm }]);
+        g.commit_transition(ts[0]);
+
+        // `a` holds (300 ≥ 140, below margin_promote) and `c` is not yet
+        // eligible (300 > −300): the boundary produces nothing anyway.
+        g.classify(&[observer_at(300.0)]);
+        assert!(g.take_transitions().is_empty());
+
+        // Walk left past a's warm_demote floor (130 < 140): a cools and
+        // frees the slot; c still ineligible (130 > −300).
+        g.classify(&[observer_at(130.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: a, from: Domain::Warm, to: Domain::Outer }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached_count(), 0);
+
+        // Now c stages (−310 ≤ −300; a back to Outer but −310 < 180 keeps
+        // it ineligible): the freed cap admits exactly the new tenant.
+        g.classify(&[observer_at(-310.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: c, from: Domain::Outer, to: Domain::Warm }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached_count(), 1);
+    }
+
+    #[test]
+    fn warm_budget_validation_fails_construction() {
+        // Cap exceeding materialized cells cannot be bounded.
+        let mut b = budget();
+        b.max_ram_cached_cells = b.max_materialized_cells + 1;
+        assert_eq!(
+            StreamingGrid::new(cfg(), b, &[]).unwrap_err(),
+            BudgetError::RamCapExceedsMaterialized
+        );
+
+        // Worst-case warm bytes over the RAM ceiling.
+        let mut b = budget(); // mean_cell_geometry_bytes = 1 MiB
+        b.max_ram_cached_cells = 1024;
+        b.ram_budget = 1023 * (1 << 20);
+        assert_eq!(StreamingGrid::new(cfg(), b, &[]).unwrap_err(), BudgetError::RamOverBudget);
+
+        // Ladder ordering: the warm boundary must sit strictly BEYOND the
+        // margin boundary, else the concentric zones interleave.
+        let bad = GridConfig {
+            warm: Some(WarmTierConfig { radius: 150.0, pad_fraction: 0.10, hysteresis: 40.0 }),
+            ..cfg()
+        };
+        assert_eq!(
+            StreamingGrid::new(bad, budget(), &[]).unwrap_err(),
+            BudgetError::WarmRadiusNotBeyondMargin
+        );
+    }
+
+    #[test]
+    fn pin_to_warm_forces_ram_residency_past_any_observer() {
+        let mut g = StreamingGrid::new(warm_cfg(), budget(), &[]).unwrap();
+        let c = CellCoord { x: 0, z: 0 };
+        g.materialize(c);
+        assert!(g.pin(c, Domain::Warm));
+        // Pins bypass concentric rules (and the warm cap, like every rule):
+        // forced staging regardless of distance.
+        g.classify(&[observer_at(10_000.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: c, from: Domain::Outer, to: Domain::Warm }]);
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached(c), Some(true));
+        g.classify(&[observer_at(10_000.0)]);
+        assert!(g.take_transitions().is_empty(), "stays pinned Warm");
+    }
+
+    #[test]
+    fn tier_off_margin_drops_straight_to_outer_no_warm_rung() {
+        // Same geometry as the tier-on walk, but warm: None — the demote
+        // target at the unchanged margin_demote floor must be Outer, and no
+        // Warm state may appear anywhere.
+        let mut g = StreamingGrid::new(cfg(), budget(), &[]).unwrap();
+        let far = CellCoord { x: 5, z: 0 };
+        g.materialize(far);
+        g.classify(&[observer_at(480.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(ts, vec![Transition { coord: far, from: Domain::Outer, to: Domain::Margin }]);
+        g.commit_transition(ts[0]);
+        g.classify(&[observer_at(305.0)]);
+        let ts = g.take_transitions();
+        assert_eq!(
+            ts,
+            vec![Transition { coord: far, from: Domain::Margin, to: Domain::Outer }],
+            "tier off: full teardown at the legacy floor, no intermediate Warm"
+        );
+        g.commit_transition(ts[0]);
+        assert_eq!(g.ram_cached(far), Some(false));
+    }
 }
