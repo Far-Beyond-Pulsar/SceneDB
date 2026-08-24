@@ -1198,13 +1198,15 @@ fn transitions_execute_at_boundary_and_metadata_mirrors_state() {
     let mut store = SceneGpuStore::new(&ctx, scene_cfg());
     let mut frames = FrameDriver::new();
     let mut grid = StreamingGrid::new(
-        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0 },
+        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0, warm: None },
         StreamingBudget {
             vram_hlod_budget: u64::MAX,
             vram_geometry_budget: u64::MAX,
             max_materialized_cells: 16,
             proxy_mesh_bytes: 1,
             mean_cell_geometry_bytes: 1,
+            ram_budget: u64::MAX,
+            max_ram_cached_cells: 16,
         },
         &[RegionClassConfig { capacity: 64, max_resident_cells: 4 }],
     )

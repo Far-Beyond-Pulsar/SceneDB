@@ -73,11 +73,62 @@
 //! therefore takes two `classify` calls — one step each — as does the
 //! symmetric demotion cascade.
 //!
-//! **α**: a promoting transition (`to` more resident than `from`) sets
-//! `alpha_target = 1.0`; a demoting transition sets `alpha_target = 0.0`
-//! (applied in [`StreamingGrid::commit_transition`], never in `classify`).
+//! **α**: a transition crossing INTO GPU residency (`to` ∈ {`Margin`,
+//! `Inner`}, more resident than `from`) sets `alpha_target = 1.0`; every
+//! other transition — demotions, and promotions into the RAM tier, which
+//! has no on-screen content — sets `alpha_target = 0.0` (applied in
+//! [`StreamingGrid::commit_transition`], never in `classify`).
 //! [`StreamingGrid::advance_crossfade`] moves `alpha` linearly toward
 //! `alpha_target` by `distance / fade_distance`, clamped to `[0, 1]`.
+//!
+//! ## The system-RAM residency tier (`Warm`) — opt-in (issue #43)
+//!
+//! Between "not tracked anywhere" (`Outer`: no GPU buffer, nothing staged)
+//! and "GPU-resident" (`Margin`/`Inner`) sits an optional third residency
+//! state: `Warm`, a cell whose source data is loaded into **system RAM**,
+//! ready for a cheap GPU promote, occupying no VRAM. Design decisions
+//! (resolving the open questions in issue #43):
+//!
+//! - **One state machine, not an orthogonal flag.** `Warm` is a [`Domain`]
+//!   variant (`Outer < Warm < Margin < Inner` by [`domain_rank`]), so the
+//!   existing single-step/hysteresis/drain machinery governs the RAM tier
+//!   too; no parallel promotion path to keep in sync.
+//! - **Band geometry.** `warm_promote`/`warm_demote` reuse the §5.5 pad +
+//!   hysteresis construction with their OWN radius/pad/hysteresis pair
+//!   ([`WarmTierConfig`] — typically wider than the GPU pair). Two
+//!   deliberate asymmetries preserve legacy GPU timing exactly:
+//!   *promotion fast path* — `Outer` checks `margin_promote` FIRST, so an
+//!   observer sprinting in skips RAM staging entirely and registers straight
+//!   away (`Outer→Margin→Inner`, two steps, as today); *graded teardown* —
+//!   leaving drops GPU first at the unchanged `margin_demote`
+//!   (`Margin→Warm`, VRAM freed, RAM retained), then RAM one wider band
+//!   later (`Warm→Outer`). A player who steps just outside the margin and
+//!   back re-promotes from the warm copy without any reload.
+//! - **SceneDB owns accounting, not bytes.** The grid tracks the state and
+//!   a count ([`StreamingGrid::ram_cached_count`]); the actual cached bytes
+//!   stay in an engine-side asset cache, reached through caller-supplied
+//!   hooks ([`RamHooks`]) passed to [`execute_transitions_with_ram`] — the
+//!   same callback shape as `execute_transitions`' `class_of`. Disk/network
+//!   asset delivery stays out of scope exactly as before.
+//! - **Budget.** [`StreamingBudget::ram_budget`] /
+//!   [`StreamingBudget::max_ram_cached_cells`] are validated against each
+//!   other (and `max_materialized_cells`) once at construction, mirroring
+//!   the VRAM checks. At runtime, `classify` refuses to queue `Outer→Warm`
+//!   while `max_ram_cached_cells` warm cells exist (graceful hold-and-retry,
+//!   §8-style); LRU-style eviction of warm cells under pressure is future
+//!   work. Pins bypass the cap, as they bypass every concentric rule.
+//! - **Shader-visible encoding is unchanged.** [`StreamingGrid::
+//!   write_cell_metadata`] encodes `Warm` as `0` — indistinguishable from
+//!   `Outer`, correct since neither has VRAM content — and α stays 0, so
+//!   the M3 stipple pass needs no knowledge of the tier.
+//!
+//! With `GridConfig::warm = None` (the default shape for callers that don't
+//! opt in) the machine, thresholds, executor behavior, and metadata bytes
+//! are bit-for-bit identical to the pre-tier implementation. One documented
+//! asymmetry when the tier IS on: a cell that sprinted in via the fast path
+//! never had its copy staged by this tier, yet its eventual `Warm→Outer`
+//! still fires `RamHooks::evict` — engines treat evict as a hint and no-op
+//! on cache misses (the hook contract below).
 //!
 //! ## Drain-every-boundary contract
 //!
@@ -113,6 +164,26 @@ pub struct GridConfig {
     pub pad_fraction: f32,
     /// §5.5 δhyst, world units beyond the pad, demotion-only.
     pub hysteresis: f32,
+    /// Opt-in system-RAM residency tier between `Outer` and `Margin`
+    /// (`None` = disabled: the machine is exactly the legacy
+    /// `Outer`/`Margin`/`Inner` ladder). See the module-doc tier section.
+    pub warm: Option<WarmTierConfig>,
+}
+
+/// The opt-in RAM-tier's own §5.5-style tunables ([`GridConfig::warm`]).
+/// Deliberately a separate pair from the GPU pad/hysteresis: the warm band
+/// sits further out and typically wants wider jitter damping — its promote
+/// boundary must lie strictly beyond the GPU one
+/// (`radius > margin_radius`, validated at [`StreamingGrid::new`]).
+#[derive(Clone, Copy, Debug)]
+pub struct WarmTierConfig {
+    /// World units beyond the base bounds that count as `Warm`.
+    pub radius: f32,
+    /// Δpad fraction of `cell_width` for the `warm_promote` boundary;
+    /// same construction as [`GridConfig::pad_fraction`].
+    pub pad_fraction: f32,
+    /// δhyst, world units beyond the warm pad, demotion-only.
+    pub hysteresis: f32,
 }
 
 /// Dense grid coordinate: cell `(x, z)` spans world
@@ -124,22 +195,34 @@ pub struct CellCoord {
     pub z: i32,
 }
 
-/// Residency domain, ordered `Outer < Margin < Inner` (least to most
-/// resident). The enum's declared variant order is documentation-only —
+/// Residency domain, ordered `Outer < Warm < Margin < Inner` (least to most
+/// resident; `Warm` is the opt-in system-RAM tier — see the module-doc
+/// tier section). The enum's declared variant order is documentation-only —
 /// [`domain_rank`] is the authoritative ordering used for the α-target
 /// promotion/demotion distinction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Domain {
     Inner,
     Margin,
+    Warm,
     Outer,
 }
 
 fn domain_rank(d: Domain) -> u8 {
     match d {
         Domain::Outer => 0,
-        Domain::Margin => 1,
-        Domain::Inner => 2,
+        Domain::Warm => 1,
+        Domain::Margin => 2,
+        Domain::Inner => 3,
+    }
+}
+
+impl Domain {
+    /// Whether a cell in this domain is GPU-resident (`Margin`/`Inner`):
+    /// registered with `SceneGpuStore` and carrying VRAM content. `Warm`
+    /// cells hold system-RAM copies only, and `Outer` cells hold nothing.
+    pub fn is_gpu_resident(self) -> bool {
+        matches!(self, Domain::Margin | Domain::Inner)
     }
 }
 
@@ -155,7 +238,10 @@ pub struct Transition {
 
 /// §5.3 VRAM budget inputs, checked once at construction (α-audit
 /// bounded-extent input: `max_materialized_cells` bounds the HLOD term
-/// regardless of how large the world actually is).
+/// regardless of how large the world actually is). The `ram_*` fields bound
+/// the opt-in system-RAM tier the same way; they are validated even when
+/// [`GridConfig::warm`] is `None`, mirroring how the VRAM fields are
+/// validated unconditionally.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingBudget {
     pub vram_hlod_budget: u64,
@@ -164,6 +250,14 @@ pub struct StreamingBudget {
     pub max_materialized_cells: u32,
     pub proxy_mesh_bytes: u64,
     pub mean_cell_geometry_bytes: u64,
+    /// System-RAM ceiling for the warm tier's cached cell data.
+    /// Accounting-only: SceneDB tracks the bookkeeping (see
+    /// [`StreamingGrid::ram_cached_count`]) while an engine-side asset cache
+    /// owns the actual memory (module-doc tier section).
+    pub ram_budget: u64,
+    /// Bounded worst-case count of simultaneously warm (RAM-cached) cells;
+    /// enforced at runtime by `classify` as a hold-and-retry cap.
+    pub max_ram_cached_cells: u32,
 }
 
 /// §5.3 budget-validation failures, surfaced at [`StreamingGrid::new`].
@@ -171,6 +265,16 @@ pub struct StreamingBudget {
 pub enum BudgetError {
     HlodOverBudget,
     GeometryOverBudget,
+    /// `max_ram_cached_cells × mean_cell_geometry_bytes` exceeds
+    /// `ram_budget`.
+    RamOverBudget,
+    /// `max_ram_cached_cells` exceeds `max_materialized_cells`.
+    RamCapExceedsMaterialized,
+    /// The warm tier's promote boundary would sit at or inside the GPU
+    /// margin boundary (`warm.radius ≤ margin_radius`) — the ladder must be
+    /// strictly ordered `Outer < Warm < Margin` for the band machine to
+    /// terminate sensibly.
+    WarmRadiusNotBeyondMargin,
 }
 
 #[derive(Debug)]
@@ -184,12 +288,13 @@ struct GridCellState {
     dense_id: u32,
     alpha: f32,
     alpha_target: f32,
-    /// The store-side region assignment while resident (Margin/Inner);
-    /// `None` while `Outer`. Set by [`execute_transitions`] at a successful
-    /// Outer→Margin promotion, cleared at Margin→Outer eviction — the grid
-    /// never allocates or frees this itself, only records what the executor
-    /// reports (module docs: `execute_transitions` is the one place this
-    /// module touches `SceneGpuStore`).
+    /// The store-side region assignment while GPU-resident (`Margin`/
+    /// `Inner`); `None` while `Outer` or `Warm`. Set by
+    /// [`execute_transitions`] at a successful promotion into GPU residency,
+    /// cleared at a demotion out of it — the grid never allocates or frees
+    /// this itself, only records what the executor reports (module docs:
+    /// `execute_transitions` is the one place this module touches
+    /// `SceneGpuStore`).
     gpu_id: Option<CellId>,
 }
 
@@ -201,6 +306,15 @@ pub struct StreamingGrid {
     cells: HashMap<CellCoord, GridCellState>,
     next_dense_id: u32,
     transitions: Vec<Transition>,
+    /// Runtime warm-tier cap, copied from `StreamingBudget::
+    /// max_ram_cached_cells` at construction: `classify` holds `Outer→Warm`
+    /// promotions while this many cells are warm (hold-and-retry, §8-style).
+    max_ram_cached_cells: u32,
+    /// Current count of `Warm`-domain cells — the live side of the
+    /// `max_ram_cached_cells` accounting. Maintained only by
+    /// [`StreamingGrid::commit_transition`] (the single writer of committed
+    /// domain state).
+    warm_count: u32,
     /// Test 13 instrumentation (see `upload_count` below). `write_cell_metadata`
     /// takes `&self` (it only reads `cells`/`next_dense_id`, no mutation), so
     /// this needs interior mutability — `AtomicU64` with `Relaxed` ordering,
@@ -216,7 +330,10 @@ impl StreamingGrid {
     /// Validates the §5.3 budget once, up front: `max_materialized_cells ×
     /// proxy_mesh_bytes ≤ vram_hlod_budget` (HLOD/proxy term) and
     /// `(Σ inner_classes.max_resident_cells) × mean_cell_geometry_bytes ≤
-    /// vram_geometry_budget` (resident-geometry term).
+    /// vram_geometry_budget` (resident-geometry term). The warm-tier
+    /// equivalents (`max_ram_cached_cells` against `max_materialized_cells`
+    /// and `ram_budget`) are validated unconditionally, as is the tier
+    /// ladder ordering when [`GridConfig::warm`] is enabled.
     pub fn new(
         cfg: GridConfig,
         budget: StreamingBudget,
@@ -234,11 +351,25 @@ impl StreamingGrid {
         if geometry_used > budget.vram_geometry_budget {
             return Err(BudgetError::GeometryOverBudget);
         }
+        if budget.max_ram_cached_cells > budget.max_materialized_cells {
+            return Err(BudgetError::RamCapExceedsMaterialized);
+        }
+        let ram_used = budget.max_ram_cached_cells as u64 * budget.mean_cell_geometry_bytes;
+        if ram_used > budget.ram_budget {
+            return Err(BudgetError::RamOverBudget);
+        }
+        if let Some(warm) = &cfg.warm {
+            if warm.radius <= cfg.margin_radius {
+                return Err(BudgetError::WarmRadiusNotBeyondMargin);
+            }
+        }
         Ok(Self {
             cfg,
             cells: HashMap::new(),
             next_dense_id: 0,
             transitions: Vec::new(),
+            max_ram_cached_cells: budget.max_ram_cached_cells,
+            warm_count: 0,
             upload_count: AtomicU64::new(0),
         })
     }
@@ -319,6 +450,22 @@ impl StreamingGrid {
         }
     }
 
+    /// Whether a tracked coord currently holds a warm (system-RAM-cached,
+    /// not GPU-resident) copy — i.e. its domain is [`Domain::Warm`].
+    /// `None` for an untracked coord. Accounting only: whether real bytes
+    /// are cached is the engine-side cache's truth (module-doc tier
+    /// section); the grid tracks the residency *decision*.
+    pub fn ram_cached(&self, coord: CellCoord) -> Option<bool> {
+        self.cells.get(&coord).map(|s| s.domain == Domain::Warm)
+    }
+
+    /// Current count of warm (RAM-cached) cells — the runtime side of
+    /// `StreamingBudget::max_ram_cached_cells`. Maintained by
+    /// [`Self::commit_transition`] only.
+    pub fn ram_cached_count(&self) -> u32 {
+        self.warm_count
+    }
+
     /// §5 classification via the §5.5 hysteresis band machine (module docs).
     /// Queues at most one single-step [`Transition`] per cell; applies NO
     /// state change to `domain`/`alpha_target` — that happens only in
@@ -355,20 +502,60 @@ impl StreamingGrid {
             let base = base_bounds(coord, cell_width);
             let to = match state.domain {
                 Domain::Outer => {
-                    // margin_promote: base + (margin_radius + pad)
+                    // margin_promote first: an observer sprinting in keeps
+                    // the legacy fast path and skips RAM staging entirely.
                     if any_intersect(&grow(base, mr + pad), observer_aabbs) {
                         Some(Domain::Margin)
+                    } else if let Some(warm) = self.cfg.warm {
+                        // warm_promote: base + (warm.radius + warm pad).
+                        // The runtime cap holds the promotion (stay Outer,
+                        // retry on a later boundary) — §8-style graceful
+                        // degradation for the RAM tier.
+                        let wpad = warm.pad_fraction * cell_width;
+                        if self.warm_count < self.max_ram_cached_cells
+                            && any_intersect(&grow(base, warm.radius + wpad), observer_aabbs)
+                        {
+                            Some(Domain::Warm)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 }
+                Domain::Warm => match self.cfg.warm {
+                    Some(warm) => {
+                        let wpad = warm.pad_fraction * cell_width;
+                        // margin_promote: GPU promotion straight from the
+                        // warm copy.
+                        if any_intersect(&grow(base, mr + pad), observer_aabbs) {
+                            Some(Domain::Margin)
+                        // warm_demote: base + (warm.radius + wpad + whyst)
+                        } else if !any_intersect(
+                            &grow(base, warm.radius + wpad + warm.hysteresis),
+                            observer_aabbs,
+                        ) {
+                            Some(Domain::Outer)
+                        } else {
+                            None // inside the Warm band: hold
+                        }
+                    }
+                    // Tier withdrawn while cells are warm (pin path): cool
+                    // them immediately rather than panicking on the missing
+                    // config. Unreachable via concentric flow — Warm is only
+                    // queued when the tier is on.
+                    None => Some(Domain::Outer),
+                },
                 Domain::Margin => {
                     // inner_promote: base + pad
                     if any_intersect(&grow(base, pad), observer_aabbs) {
                         Some(Domain::Inner)
-                    // margin_demote: base + (margin_radius + pad + hyst)
+                    // margin_demote: base + (margin_radius + pad + hyst) —
+                    // the UNCHANGED legacy GPU-teardown boundary; with the
+                    // tier on it drops to Warm (RAM retained) instead of
+                    // all the way to Outer.
                     } else if !any_intersect(&grow(base, mr + pad + hyst), observer_aabbs) {
-                        Some(Domain::Outer)
+                        Some(if self.cfg.warm.is_some() { Domain::Warm } else { Domain::Outer })
                     } else {
                         None // inside the Margin band: hold
                     }
@@ -399,13 +586,25 @@ impl StreamingGrid {
 
     /// Confirm an executed transition (caller reports success/decline by
     /// simply not calling this for a declined one). Sets the cell's domain
-    /// to `t.to` and its α target: promotion (`to` more resident than
-    /// `from`) → 1.0, demotion → 0.0.
+    /// to `t.to` and its α target: 1.0 only when crossing INTO GPU
+    /// residency (`to` ∈ {`Margin`, `Inner`} and more resident than `from`)
+    /// — every other transition, including promotions into the RAM tier,
+    /// targets 0.0 (module-doc tier section: `Warm` has no on-screen
+    /// content). Also maintains [`Self::ram_cached_count`].
     pub fn commit_transition(&mut self, t: Transition) {
         if let Some(state) = self.cells.get_mut(&t.coord) {
+            if state.domain == Domain::Warm {
+                self.warm_count = self
+                    .warm_count
+                    .checked_sub(1)
+                    .expect("warm_count underflow: committed transition out of Warm with count 0");
+            }
             state.domain = t.to;
+            if state.domain == Domain::Warm {
+                self.warm_count += 1;
+            }
             state.alpha_target =
-                if domain_rank(t.to) > domain_rank(t.from) { 1.0 } else { 0.0 };
+                if t.to.is_gpu_resident() && domain_rank(t.to) > domain_rank(t.from) { 1.0 } else { 0.0 };
         }
     }
 
@@ -426,7 +625,10 @@ impl StreamingGrid {
 
     /// Packs `(f32 alpha, u32 domain)` for every materialized cell into
     /// `buf` at byte offset `dense_id * 8` — the M3 stipple-pass contract.
-    /// Domain encoding: `Outer` = 0, `Margin` = 1, `Inner` = 2.
+    /// Domain encoding: `Outer` = 0, `Margin` = 1, `Inner` = 2 — and the
+    /// RAM-tier's `Warm` ALSO encodes as 0: it has no VRAM content, so
+    /// shaders see exactly what an `Outer` cell looks like (module-doc tier
+    /// section; the pass needs no knowledge of the tier).
     ///
     /// Simple full rewrite of every materialized entry's 8 bytes on every
     /// call (bounded by `next_dense_id ≤ max_cells_metadata`, §8);
@@ -436,7 +638,7 @@ impl StreamingGrid {
         let mut data = vec![0u8; self.next_dense_id as usize * 8];
         for state in self.cells.values() {
             let domain_code: u32 = match state.domain {
-                Domain::Outer => 0,
+                Domain::Outer | Domain::Warm => 0,
                 Domain::Margin => 1,
                 Domain::Inner => 2,
             };
@@ -464,15 +666,18 @@ impl StreamingGrid {
     }
 }
 
-/// Outcome tally for one [`execute_transitions`] call.
+/// Outcome tally for one [`execute_transitions`]/
+/// [`execute_transitions_with_ram`] call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TransitionStats {
-    /// Outer→Margin transitions that succeeded (`register_cell` returned
-    /// `Ok`).
+    /// GPU registrations that succeeded (`register_cell` returned `Ok`) —
+    /// both legacy `Outer→Margin` promotions and RAM-tier `Warm→Margin`
+    /// promotions (which register straight from the warm copy, no reload).
     pub promoted: u32,
-    /// Margin→Outer transitions executed (`unregister_cell`).
+    /// GPU teardowns executed (`unregister_cell`): `Margin→Outer` (legacy)
+    /// and, with the tier on, `Margin→Warm` (VRAM freed, RAM retained).
     pub demoted: u32,
-    /// Outer→Margin transitions that `register_cell` declined
+    /// GPU registrations that `register_cell` declined
     /// (`Err(RegionError)`, §8 graceful degradation) — the cell stays in its
     /// current domain and is re-classified on the next `classify` call.
     pub declined: u32,
@@ -481,22 +686,67 @@ pub struct TransitionStats {
     /// stale-queue hole). A dropped transition is safe by construction —
     /// the next `classify()` re-derives intent from committed state.
     pub dropped_stale: u32,
+    /// RAM-tier: `Outer→Warm` transitions whose [`RamHooks::load`] reported
+    /// success. The engine-side cache now holds the cell's source bytes.
+    pub warmed: u32,
+    /// RAM-tier: `Warm→Outer` transitions whose [`RamHooks::evict`] ran.
+    pub cooled: u32,
+    /// RAM-tier: `Outer→Warm` transitions refused — no hooks were supplied
+    /// to the executor, `load` returned `false`, or the runtime warm cap
+    /// held the promotion at `classify` time (the last case never reaches
+    /// the executor). The cell stays in its current domain; the next
+    /// `classify` re-queues when conditions allow.
+    pub ram_declined: u32,
+}
+
+/// Caller-supplied system-RAM residency hooks for
+/// [`execute_transitions_with_ram`] — the RAM-tier analog of the existing
+/// `class_of` callback shape. SceneDB owns the *decisions* and the
+/// *bookkeeping* ([`StreamingGrid::ram_cached_count`]); these hooks own the
+/// bytes. Disk/network asset delivery stays the engine's job exactly as
+/// before (module-doc tier section).
+pub struct RamHooks<'a> {
+    /// Populate the RAM-resident source data for `coord` in the engine's
+    /// cache. Return `false` to refuse (cache miss, pressure, …): the
+    /// transition is not committed and the cell stays in its current
+    /// domain, re-queued on a later boundary.
+    pub load: &'a dyn Fn(CellCoord) -> bool,
+    /// Drop the RAM-resident copy for `coord`. Infallible hint semantics:
+    /// fired on every committed `Warm→Outer` demotion, which — via the
+    /// sprint-in fast path — can occur for a coord this tier never loaded
+    /// (module-doc tier section). Engines no-op the miss.
+    pub evict: &'a dyn Fn(CellCoord),
 }
 
 /// Boundary transition executor (M2b-β T5): drains
 /// [`StreamingGrid::take_transitions`] and applies each against `store` and
-/// `cells`, reporting outcomes via [`TransitionStats`].
+/// `cells`, reporting outcomes via [`TransitionStats`]. Legacy entry point:
+/// identical to [`execute_transitions_with_ram`] with no [`RamHooks`] — an
+/// `Outer→Warm` transition can then only be *declined* (`stats.
+/// ram_declined`), so callers that never enable [`GridConfig::warm`] see
+/// bit-for-bit legacy behavior through this function.
 ///
-/// - **Outer→Margin**: `store.register_cell(cell.storage(), class_of(coord))`.
-///   `Ok(id)` → commit the transition and record `id` via
+/// - **Into GPU residency** (`from` ∈ {`Outer`, `Warm`} → `to` ∈
+///   {`Margin`, `Inner`}, including pin jumps): `store.register_cell(cell.
+///   storage(), class_of(coord))`. From `Warm` this registers straight from
+///   the already-RAM-resident copy — **no loader round-trip**, the point of
+///   the tier. `Ok(id)` → commit the transition and record `id` via
 ///   [`StreamingGrid::set_gpu_id`] (`stats.promoted += 1`). `Err(RegionError)`
 ///   → DECLINE: the transition is not committed (the cell stays in its
 ///   current domain, grid state unchanged), `stats.declined += 1`, and a
 ///   `tracing::warn!` records the exhaustion (§8 graceful degradation).
-/// - **Margin→Outer**: `store.unregister_cell(id, cell.storage_mut(),
-///   eviction_serial)` using the `id` recorded at promotion, then clears it
-///   via `set_gpu_id(coord, None)` and commits (`stats.demoted += 1`).
-/// - **Margin↔Inner**: commit-only — a domain-flag change with no store
+/// - **Out of GPU residency into `Warm`**: `store.unregister_cell(id, …)`
+///   using the id recorded at promotion, cleared via `set_gpu_id(coord,
+///   None)` (`stats.demoted += 1`). The RAM copy is deliberately NOT
+///   evicted — that retention is the feature.
+/// - **`Margin/Inner → Outer`**: same unregister, full teardown (legacy
+///   shape, still produced by pins and by tier-off grids).
+/// - **`Outer → Warm`** (`stats.warmed += 1` on success): `(hooks.load)(
+///   coord)`; `false`/absent hooks → DECLINE (`stats.ram_declined += 1`,
+///   warn), cell unchanged.
+/// - **`Warm → Outer`**: `(hooks.evict)(coord)` (hint — see [`RamHooks::
+///   evict`]), commit (`stats.cooled += 1`).
+/// - **`Margin↔Inner`**: commit-only — a domain-flag change with no store
 ///   interaction.
 ///
 /// `_w: &RetiredPhase` is a witness, not a value read here: it proves the
@@ -517,13 +767,30 @@ pub struct TransitionStats {
 /// it against the store's configured class count. A `class_of` that returns
 /// an index outside the range the `SceneGpuStore` was constructed with (its
 /// `SceneGpuConfig::classes` length) panics inside `register_cell` on the
-/// next Outer→Margin promotion, not here — the caller owns keeping
+/// next promotion into GPU residency, not here — the caller owns keeping
 /// `class_of`'s range in sync with the store's class configuration.
 pub fn execute_transitions(
     grid: &mut StreamingGrid,
     store: &mut SceneGpuStore,
     cells: &mut HashMap<CellCoord, SpatialCell>,
     class_of: &dyn Fn(CellCoord) -> usize,
+    eviction_serial: u64,
+    _w: &RetiredPhase,
+) -> TransitionStats {
+    execute_transitions_with_ram(grid, store, cells, class_of, None, eviction_serial, _w)
+}
+
+/// [`execute_transitions`] with the opt-in RAM tier's [`RamHooks`] attached
+/// (`ram: None` ≡ [`execute_transitions`]). See that function's doc for the
+/// per-transition contract; the hooks only ever fire on `Outer→Warm`
+/// (`load`) and `Warm→Outer` (`evict`) — GPU registrations/unregistrations
+/// are unchanged store interactions.
+pub fn execute_transitions_with_ram(
+    grid: &mut StreamingGrid,
+    store: &mut SceneGpuStore,
+    cells: &mut HashMap<CellCoord, SpatialCell>,
+    class_of: &dyn Fn(CellCoord) -> usize,
+    ram: Option<&RamHooks<'_>>,
     eviction_serial: u64,
     _w: &RetiredPhase,
 ) -> TransitionStats {
@@ -539,7 +806,10 @@ pub fn execute_transitions(
             .get_mut(&t.coord)
             .expect("execute_transitions: materialized coord must have a tracked SpatialCell");
         match (t.from, t.to) {
-            (Domain::Outer, Domain::Margin) => {
+            // ── Into GPU residency (incl. pin jumps like Outer→Inner):
+            // register from the cell's CPU-side storage. From Warm this
+            // consumes the already-resident RAM copy — no loader round-trip.
+            (from, to) if !from.is_gpu_resident() && to.is_gpu_resident() => {
                 let class = class_of(t.coord);
                 match store.register_cell(cell.storage(), class) {
                     Ok(id) => {
@@ -552,23 +822,70 @@ pub fn execute_transitions(
                         tracing::warn!(
                             coord = ?t.coord,
                             error = ?err,
-                            "region exhausted — declining Outer→Margin promotion; cell stays Outer"
+                            "region exhausted — declining promotion into GPU residency; cell stays where it is"
                         );
                     }
                 }
             }
-            (Domain::Margin, Domain::Outer) => {
+            // ── Out of GPU residency into the RAM tier: free VRAM, keep the
+            // RAM copy (that retention is the feature). No evict hook here.
+            (from, Domain::Warm) if from.is_gpu_resident() => {
                 let id = grid
                     .gpu_id(t.coord)
-                    .expect("Margin cell must carry a gpu_id assigned at its Outer→Margin promotion");
+                    .expect("GPU-resident cell must carry a gpu_id assigned at its promotion");
                 store.unregister_cell(id, cell.storage_mut(), eviction_serial);
                 grid.set_gpu_id(t.coord, None);
                 grid.commit_transition(t);
                 stats.demoted += 1;
             }
+            // ── Full GPU teardown (tier-off Margin→Outer, or pin-to-Outer):
+            // legacy shape — unregister, no RAM-tier interaction.
+            (from, Domain::Outer) if from.is_gpu_resident() => {
+                let id = grid
+                    .gpu_id(t.coord)
+                    .expect("GPU-resident cell must carry a gpu_id assigned at its promotion");
+                store.unregister_cell(id, cell.storage_mut(), eviction_serial);
+                grid.set_gpu_id(t.coord, None);
+                grid.commit_transition(t);
+                stats.demoted += 1;
+            }
+            // ── RAM population: stage the source bytes via the engine's
+            // cache. Refusal (or no hooks at all) leaves the cell put.
+            (Domain::Outer, Domain::Warm) => {
+                match ram {
+                    Some(hooks) if (hooks.load)(t.coord) => {
+                        grid.commit_transition(t);
+                        stats.warmed += 1;
+                    }
+                    Some(_) => {
+                        stats.ram_declined += 1;
+                        tracing::debug!(
+                            coord = ?t.coord,
+                            "RAM-tier load refused — cell stays Outer; will retry on a later boundary"
+                        );
+                    }
+                    None => {
+                        stats.ram_declined += 1;
+                        tracing::warn!(
+                            coord = ?t.coord,
+                            "RAM-tier transition queued but no RamHooks supplied — \
+                             pass them to execute_transitions_with_ram; cell stays Outer"
+                        );
+                    }
+                }
+            }
+            // ── RAM eviction: drop the staged copy (hint semantics — may be
+            // a cache miss after a sprint-in fast path; engines no-op it).
+            (Domain::Warm, Domain::Outer) => {
+                if let Some(hooks) = ram {
+                    (hooks.evict)(t.coord);
+                }
+                grid.commit_transition(t);
+                stats.cooled += 1;
+            }
+            // ── Margin↔Inner: domain-flag change only, no store
+            // interaction (module docs).
             _ => {
-                // Margin↔Inner: domain-flag change only, no store
-                // interaction (module docs).
                 grid.commit_transition(t);
             }
         }
@@ -612,7 +929,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> GridConfig {
-        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0 }
+        GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0, warm: None }
     }
 
     fn budget() -> StreamingBudget {
@@ -622,6 +939,8 @@ mod tests {
             max_materialized_cells: 1024,
             proxy_mesh_bytes: 1024,
             mean_cell_geometry_bytes: 1 << 20,
+            ram_budget: u64::MAX,
+            max_ram_cached_cells: 1024,
         }
     }
 

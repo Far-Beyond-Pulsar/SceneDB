@@ -167,13 +167,15 @@ fn storm1_hysteresis_thrash_guard_under_60hz_equivalent_jitter() {
     const UNPADDED_PROMOTE: f32 = 340.0;
     const BAND_WIDTH: f32 = PADDED_PROMOTE - DEMOTE_FLOOR; // 20.0
 
-    let cfg = GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0 };
+    let cfg = GridConfig { cell_width: 100.0, margin_radius: 150.0, pad_fraction: 0.10, hysteresis: 20.0, warm: None };
     let budget = StreamingBudget {
         vram_hlod_budget: u64::MAX,
         vram_geometry_budget: u64::MAX,
         max_materialized_cells: 16,
         proxy_mesh_bytes: 1,
         mean_cell_geometry_bytes: 1,
+        ram_budget: u64::MAX,
+        max_ram_cached_cells: 16,
     };
     let classes = [RegionClassConfig { capacity: 64, max_resident_cells: 4 }];
     let far = CellCoord { x: 5, z: 0 };

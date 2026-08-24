@@ -53,8 +53,8 @@ pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
 pub use growable_scene_buffer::{GrowableGpuBufferDispatch, GrowableSceneBuffer};
 pub use generation::GenerationBuffer;
 pub use grid::{
-    execute_transitions, BudgetError, CellCoord, Domain, GridConfig, StreamingBudget,
-    StreamingGrid, Transition, TransitionStats,
+    execute_transitions, execute_transitions_with_ram, BudgetError, CellCoord, Domain, GridConfig,
+    RamHooks, StreamingBudget, StreamingGrid, Transition, TransitionStats, WarmTierConfig,
 };
 pub use harvest::{
     revalidate_run, HarvestLease, HarvestPipeline, HarvestStaging, HarvestStats, MeshClass, View,
