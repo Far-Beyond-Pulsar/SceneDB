@@ -303,6 +303,46 @@ world.insert_bundle(e, (Pos(1.0, 1.0, 1.0), Vel(0.0, 0.0, 0.0)));
 
 `spawn_bundle`/`insert_bundle` have `_tracked` counterparts (`spawn_bundle_tracked`, `insert_bundle_tracked`) that additionally record every component into a `ChangeTracker`, exactly like `spawn_tracked`/`insert_tracked` — see [Change tracking at the frame boundary](#change-tracking-at-the-frame-boundary).
 
+### Component subscriptions: `subscribe`/`take_component_change_events`
+
+When a consumer outside your frame loop reads `World` directly (an editor properties panel, any live UI), it otherwise has no way to know whether a value it already read actually changed — so it re-polls on every redraw. Subscriptions fix that: arm one per `(Entity, ComponentType)` key you display, cache the value, and re-pull only when an event for that key arrives.
+
+```rust
+use pulsar_scenedb::{ComponentChangeKind, World, component_id};
+
+let mut world = World::new();
+let e = world.spawn();
+world.insert(e, Health(100));
+
+// Arm once, when the card/panel mounts:
+let sub = world.subscribe::<Health>(e).unwrap();
+// ...or by ComponentId, for callers that resolve types at runtime
+// (e.g. through a reflection registry):
+let sub_erased = world.subscribe_id(e, component_id::<Health>()).unwrap();
+
+// Mutations queue events; nothing calls back into you mid-drop.
+world.get_mut::<Health>(e).unwrap().0 = 42; // real write -> 1 event
+// A get_mut that never writes through DerefMut fires NOTHING.
+
+// Once per frame, at your frame boundary: drain and re-pull what changed.
+for event in world.take_component_change_events() {
+    if event.subscription == sub {
+        // (entity = e, Health) changed -- invalidate the cached snapshot.
+    }
+}
+
+world.unsubscribe(sub); // when the card unmounts
+```
+
+Delivery contract, in short:
+
+- **Granularity** is the exact `(Entity, ComponentId)` pair — other entities and other components stay silent; several subscribers to one key each get their own event.
+- **Batched, never callbacks**: mutations append to a bounded pending queue (`MAX_PENDING_EVENTS`; overflow drops the oldest events and counts them via `dropped_component_change_events()`), so a listener can never re-enter `World` while a `Mut` guard's drop is unwinding.
+- **Kinds**: `Inserted` (insert / bundle insert / in-place overwrite), `Mutated` (`get_mut` written through `DerefMut`, or `into_inner`), `Removed` (`remove`, or `despawn` — which also auto-unsubscribes that entity's subscriptions).
+- **Cost with no subscribers**: one `Option::is_none()` check per mutating call — same shape as the attached-mirror/attached-tracker short-circuits.
+
+This sits alongside [`ChangeTracker`](#change-tracking-at-the-frame-boundary), not instead of it: replication captures batched new-state diffs for a specific target, while a subscription is a push notification to arbitrary live consumers about one specific key.
+
 ---
 
 ## Macro system
