@@ -477,6 +477,107 @@ pub fn write_var_len_field_at_row<T: crate::page::Pod + Send + Sync + crate::tok
     store.mark_gpu_row_dirty(handle_component_id, row, handle_bytes);
 }
 
+/// Content-addressed counterpart to [`write_var_len_field_at_row`] — for a
+/// `#[gpu(mirror = Once, content_id = "sibling")]` field. Computes the
+/// sibling value's [`crate::handle_ledger::ContentAddressed::content_id`]
+/// and routes the write through
+/// [`crate::gpu::InternedVarLenPool::upsert_row`] instead of the plain
+/// pool's per-row allocate/free cycle — see that type's module doc for the
+/// dedup mechanics. The row-indexed handle-table column is written exactly
+/// the same way as the plain path (same `mark_gpu_row_dirty` call, same
+/// `VarLenHandle` shape): existing row-indexed readers (the derive's
+/// `..._gpu_handle` accessors) need no changes to observe the sharing, since
+/// the VALUE now sometimes returned is a range shared with other rows.
+///
+/// A no-op if `pool_key` isn't registered as an INTERNED pool yet (same
+/// bring-up tolerance every other unregistered-column path in this module
+/// has) — the generated dispatch function's auto-registration gate covers
+/// this on first insert, same as the plain var-len path.
+pub fn write_interned_var_len_field_at_row<
+    T: crate::page::Pod + Send + Sync + crate::token::HasTypeToken + 'static,
+    S: crate::handle_ledger::ContentAddressed,
+>(
+    store: &SceneGpuStore,
+    queue: &wgpu::Queue,
+    pool_key: crate::gpu::BufferKey,
+    handle_component_id: ComponentId,
+    row: u32,
+    content_source: &S,
+    data: &[T],
+) {
+    let Some(pool) = store.interned_var_len_pool::<T>(pool_key) else {
+        return;
+    };
+    let id = content_source.content_id();
+    let handle = pool.upsert_row(queue, row, id, data);
+
+    // SAFETY: same argument as `write_var_len_field_at_row`'s identical
+    // block — `VarLenHandle` is `Pod`, exactly `size_of::<VarLenHandle>()`
+    // bytes, every byte a valid read.
+    let handle_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &handle as *const crate::gpu::VarLenHandle as *const u8,
+            std::mem::size_of::<crate::gpu::VarLenHandle>(),
+        )
+    };
+    store.mark_gpu_row_dirty(handle_component_id, row, handle_bytes);
+}
+
+/// Despawn/removal release for a PLAIN (non-interned) `Vec<T>`-typed
+/// `#[gpu]` field — fixes the pre-existing gap where neither
+/// `World::despawn_inner` nor `World::remove_inner` ever freed a var-len
+/// field's pool allocation (only a routine REWRITE did, via
+/// `write_var_len_field_at_row`'s "free prev" step; an entity that despawns
+/// without ever being reinserted into the same recycled row leaked its
+/// range permanently — see Far-Beyond-Pulsar/SceneDB#57).
+///
+/// Reads the row's current handle from the CPU-shadowed handle-table column
+/// (never a GPU readback -- same source `write_var_len_field_at_row` reads
+/// its own "prev" from), frees it via the pool's ordinary `free_handle`, and
+/// zeroes the handle-table column entry. That zeroing matters beyond
+/// tidiness: `row` is `entity.index()`, which SceneDB's slot allocator
+/// recycles -- if the stale `{offset, count}` were left in place, the NEXT
+/// entity to reuse this index would have its first var-len write read that
+/// stale value as its own "prev" and free an already-freed range (a double
+/// free) the moment it's next rewritten.
+pub fn free_var_len_field_at_row<T: crate::page::Pod + Send + Sync + crate::token::HasTypeToken + 'static>(
+    store: &SceneGpuStore,
+    pool_key: crate::gpu::BufferKey,
+    handle_component_id: ComponentId,
+    row: u32,
+) {
+    let Some(pool) = store.var_len_pool::<T>(pool_key) else { return };
+    let Some(bytes) = store.read_dirty_tracked_row_bytes(handle_component_id, row) else { return };
+    if bytes.len() != std::mem::size_of::<crate::gpu::VarLenHandle>() {
+        return;
+    }
+    // SAFETY: length just checked above; `read_dirty_tracked_row_bytes`
+    // returns a byte-for-byte copy of a real `VarLenHandle`'s
+    // representation (the same source `write_var_len_field_at_row` trusts
+    // for its own "prev" read).
+    let handle = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const crate::gpu::VarLenHandle) };
+    pool.free_handle(handle);
+    store.mark_gpu_row_dirty(handle_component_id, row, super::as_bytes(&[crate::gpu::VarLenHandle::default()]));
+}
+
+/// Despawn/removal release for an INTERNED (`content_id = "..."`-linked)
+/// `Vec<T>`-typed `#[gpu]` field — the interned counterpart to
+/// [`free_var_len_field_at_row`]. Delegates entirely to
+/// [`crate::gpu::InternedVarLenPool::release_row`], which owns its own
+/// per-row content-id shadow independent of the handle-table column, then
+/// zeroes the handle-table column for the same slot-reuse reason
+/// `free_var_len_field_at_row` does.
+pub fn free_interned_var_len_field_at_row<T: crate::page::Pod + Send + Sync + crate::token::HasTypeToken + 'static>(
+    store: &SceneGpuStore,
+    pool_key: crate::gpu::BufferKey,
+    handle_component_id: ComponentId,
+    row: u32,
+) {
+    let Some(pool) = store.interned_var_len_pool::<T>(pool_key) else { return };
+    pool.release_row(row);
+    store.mark_gpu_row_dirty(handle_component_id, row, super::as_bytes(&[crate::gpu::VarLenHandle::default()]));
+}
+
 // ── Link-time dispatch registry ─────────────────────────────────────────
 
 /// One `#[derive(SceneStore)]` type's entry in the world-mirror dispatch
@@ -529,6 +630,43 @@ fn registry_map() -> &'static HashMap<ComponentId, DispatchFn> {
 #[inline]
 pub(crate) fn dispatch_for(id: ComponentId) -> Option<DispatchFn> {
     registry_map().get(&id).copied()
+}
+
+/// Despawn/removal counterpart to [`DispatchFn`]/[`GpuMirrorRegistration`]:
+/// `row` = `entity.index()`, same key every other World-mirror row uses.
+/// Only emitted by the derive for var-len-bearing structs (see
+/// `pulsar_scenedb_derive::var_len`'s "release_arms") — a struct whose only
+/// `#[gpu]` fields are fixed-size scalars has nothing pool-allocated to
+/// free, so it submits no registration here at all, same "absent means
+/// absent" cost shape [`GpuMirrorRegistration`] itself already has.
+pub type ReleaseFn = fn(&GpuMirrorHandle, u32);
+
+pub struct VarLenReleaseRegistration {
+    pub component_id: fn() -> ComponentId,
+    pub release: ReleaseFn,
+}
+
+pulsar_reflection::inventory::collect!(VarLenReleaseRegistration);
+
+fn release_registry_map() -> &'static HashMap<ComponentId, ReleaseFn> {
+    static MAP: OnceLock<HashMap<ComponentId, ReleaseFn>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>()
+            .map(|r| ((r.component_id)(), r.release))
+            .collect()
+    })
+}
+
+/// Looks up `id`'s var-len release function, if the derive generated one
+/// (i.e. the type has at least one `Vec<T>`-typed `#[gpu]` field, interned
+/// or not). Called from `World::despawn_inner`/`remove_inner` — see those
+/// call sites' docs for why a dedicated registry, rather than folding this
+/// into [`dispatch_for`]'s existing one, is the right shape (a type with
+/// ONLY scalar `#[gpu]` fields has a dispatch entry but no release entry,
+/// and the two dispatch signatures take different arguments).
+#[inline]
+pub(crate) fn release_dispatch_for(id: ComponentId) -> Option<ReleaseFn> {
+    release_registry_map().get(&id).copied()
 }
 
 #[cfg(test)]

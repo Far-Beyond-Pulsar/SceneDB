@@ -23,6 +23,15 @@ pub struct GpuAttr {
     /// -- checked at macro-expansion time, not here (this struct doesn't see
     /// the field's default mirror mode when `mirror` is omitted).
     pub heavy: bool,
+    /// `#[gpu(content_id = "sibling_field")]` on a `Vec<T>` field -- names a
+    /// SIBLING field (by ident, on the same struct) whose type implements
+    /// `pulsar_scenedb::handle_ledger::ContentAddressed`. Routes this
+    /// field's var-len GPU allocation through the content-id-interned pool
+    /// (`gpu::interned_pool`) instead of the plain per-row one: rows sharing
+    /// the sibling's content id share ONE allocation, refcounted, freed at
+    /// zero. Only valid on a `Vec<T>` `#[gpu]` field -- checked in
+    /// `var_len.rs` (which is where `is_var_len` is known), not here.
+    pub content_id: Option<syn::Ident>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +45,7 @@ impl Parse for GpuAttr {
         let mut mirror_mode = None;
         let mut buffer_key = None;
         let mut heavy = false;
+        let mut content_id = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             match key.to_string().as_str() {
@@ -63,10 +73,17 @@ impl Parse for GpuAttr {
                     // Bare flag -- no `= value`, unlike `mirror`/`buffer`.
                     heavy = true;
                 }
+                "content_id" => {
+                    let _: syn::Token![=] = input.parse()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    content_id = Some(Ident::new(&lit.value(), lit.span()));
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown #[gpu] option `{other}` (expected `mirror`, `buffer`, or `heavy`)"),
+                        format!(
+                            "unknown #[gpu] option `{other}` (expected `mirror`, `buffer`, `heavy`, or `content_id`)"
+                        ),
                     ))
                 }
             }
@@ -76,7 +93,7 @@ impl Parse for GpuAttr {
                 break;
             }
         }
-        Ok(GpuAttr { mirror_mode, buffer_key, heavy })
+        Ok(GpuAttr { mirror_mode, buffer_key, heavy, content_id })
     }
 }
 
@@ -229,8 +246,25 @@ pub struct FieldInfo {
     /// about. See `crate::var_len` for what routing a field through this
     /// flag actually generates.
     pub is_var_len: bool,
+    /// `true` iff the field's declared type is syntactically `HandleId`
+    /// (any path ending in a bare `HandleId` segment with no type
+    /// arguments). Same detection philosophy as [`Self::is_var_len`] below
+    /// -- a last-segment name match, because macro expansion has no real
+    /// type information to resolve against; see `as_handle_id_field`'s doc
+    /// for why that's the established trade here too. Unlike var-len,
+    /// handle fields are perfectly ordinary `Pod` data: detection does NOT
+    /// reroute the struct onto another codegen path, it only adds ONE extra
+    /// link-time registration (the ledger event collector) alongside every
+    /// classic/var-len artifact the struct already gets.
+    pub is_handle: bool,
     /// The `T` in `Vec<T>`, present iff [`Self::is_var_len`].
     pub var_len_elem_ty: Option<Type>,
+    /// See [`GpuAttr::content_id`]'s doc -- carried through unchanged, plus
+    /// the RESOLVED sibling field's own type (looked up by ident against
+    /// the struct's other fields once every field has been scanned; `None`
+    /// until `var_len.rs`'s validation pass fills it in, alongside checking
+    /// the sibling actually exists and this field is `is_var_len`).
+    pub content_id_field: Option<Ident>,
 }
 
 /// Returns `Some(T)` if `ty` is syntactically `Vec<T>` (any path whose last
@@ -256,6 +290,84 @@ fn as_vec_elem_type(ty: &Type) -> Option<Type> {
     match args.args.first()? {
         syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
+    }
+}
+
+/// Whether `ty` is syntactically `HandleId` (a path whose last segment is
+/// literally named `HandleId`, with NO angle-bracketed arguments -- the
+/// type is a plain non-generic newtype, so any generic arguments at all
+/// mean it isn't the handle type). The same syntactic trade
+/// `as_vec_elem_type` documents: a user type shadowing the name would be
+/// misdetected, which nothing in practice does, and requiring the full
+/// `pulsar_scenedb::handle_ledger::HandleId` spelling would reject the bare
+/// import every real caller writes.
+fn as_handle_id_field(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else { return false };
+    let Some(last) = type_path.path.segments.last() else { return false };
+    if last.ident != "HandleId" {
+        return false;
+    }
+    matches!(last.arguments, syn::PathArguments::None)
+}
+
+/// Generates the link-time handle-ledger registration for a struct with at
+/// least one `HandleId`-typed field: one pure collector fn (copies each
+/// handle field's current value onto the caller's buffer, declaration
+/// order) plus an `inventory::submit!`'d
+/// [`pulsar_scenedb::handle_ledger::HandleLedgerRegistration`] under the
+/// struct's own `ComponentId`. Mirrors `gpu.rs`'s world-mirror dispatch
+/// registration shape exactly -- same inventory mechanism, same
+/// non-generic-fn-with-concrete-T reasoning (see `gpu::world_mirror`'s
+/// module doc for why that's required inside `World::insert_inner`'s
+/// generic body).
+///
+/// Deliberately NOT gated behind the `gpu` feature: handles are a
+/// domain-neutral concept with no wgpu dependency, and the registration is
+/// pure link-time metadata -- a type with handle fields in a
+/// `--no-default-features` build still gets its collector, and it simply
+/// never fires unless someone attaches a ledger. Empty input (no handle
+/// fields) produces an empty stream: such structs submit NOTHING and are
+/// indistinguishable, cost-wise, from types the derive never saw.
+fn generate_handle_registration(
+    name: &Ident,
+    ty_generics: &syn::TypeGenerics,
+    field_infos: &[FieldInfo],
+) -> TokenStream {
+    let handle_fields: Vec<&Ident> = field_infos
+        .iter()
+        .filter(|f| f.is_handle)
+        .map(|f| &f.ident)
+        .collect();
+    if handle_fields.is_empty() {
+        return quote! {};
+    }
+
+    let collect_fn_name = quote::format_ident!("__scenedb_handle_collect_{}", name);
+    quote! {
+        const _: () = {
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            fn #collect_fn_name(
+                value: *const (),
+                out: &mut ::std::vec::Vec<::pulsar_scenedb::handle_ledger::HandleId>,
+            ) {
+                // SAFETY: `CollectHandlesFn`'s own contract -- the sole
+                // caller (`World`'s four handle-reporting sites) only ever
+                // passes a pointer obtained from a live, correctly-aligned
+                // `#name` (column element, moved-out removal value, or the
+                // guard target), reached via this exact registration's
+                // `component_id`.
+                let data = unsafe { &*(value as *const #name #ty_generics) };
+                #( out.push(::pulsar_scenedb::handle_ledger::HandleId(data.#handle_fields.0)); )*
+            }
+
+            ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+                ::pulsar_scenedb::handle_ledger::HandleLedgerRegistration {
+                    component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                    collect_from_value: #collect_fn_name,
+                }
+            }
+        };
     }
 }
 
@@ -291,6 +403,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let mut mirror_mode = MirrorModeAttr::DirtyTracked;
         let mut buffer_key: Option<String> = None;
         let mut heavy = false;
+        let mut content_id_field: Option<Ident> = None;
 
         for attr in &field.attrs {
             if attr.path().is_ident("gpu") {
@@ -303,6 +416,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                         buffer_key = Some(key);
                     }
                     heavy = gpu_attr.heavy;
+                    content_id_field = gpu_attr.content_id;
                 }
             }
         }
@@ -324,6 +438,10 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
         let var_len_elem_ty = is_gpu.then(|| as_vec_elem_type(&ty)).flatten();
         let is_var_len = var_len_elem_ty.is_some();
+        // Handle detection is independent of `#[gpu]` and of the var-len
+        // fork: a `HandleId` field is ordinary Pod data wherever it
+        // appears. It only ever ADDS the ledger registration below.
+        let is_handle = as_handle_id_field(&ty);
 
         field_infos.push(FieldInfo {
             ident,
@@ -334,9 +452,33 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             heavy,
             gpu_wrapper,
             is_var_len,
+            is_handle,
             var_len_elem_ty,
+            content_id_field,
         });
     }
+
+    // `content_id = "..."` only has a meaning on a `Vec<T>` `#[gpu]` field
+    // (see `GpuAttr::content_id`'s doc) -- reject it elsewhere at
+    // macro-expansion time rather than silently ignoring it (a field typo'd
+    // onto a scalar column would otherwise look accepted and just never do
+    // anything, the worst kind of silent no-op).
+    for f in &field_infos {
+        if f.content_id_field.is_some() && !f.is_var_len {
+            let field_name = &f.ident;
+            return Err(syn::Error::new_spanned(
+                field_name,
+                "#[gpu(content_id = \"...\")] is only valid on a Vec<T> #[gpu] field -- \
+                 it names the content-identity source for that field's interned var-len GPU pool",
+            ));
+        }
+    }
+
+    // Emitted for BOTH codegen paths below (classic and var-len-bearing):
+    // the ledger collector + link-time registration, or nothing at all for
+    // structs without handle fields. Computed before the var-len early
+    // return so both branches share it -- one source, no drift.
+    let handle_registration = generate_handle_registration(name, &ty_generics, &field_infos);
 
     if field_infos.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -375,7 +517,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             &ty_generics,
             where_clause,
             &field_infos,
-        );
+        )
+        .map(|tokens| {
+            // The var-len struct's handle registration rides on the same
+            // output -- see `generate_handle_registration`'s doc for why
+            // this is unconditional (not gpu-gated) like the collector's
+            // runtime it targets.
+            quote! { #tokens #handle_registration }
+        });
     }
 
     let field_types: Vec<&Type> = field_infos.iter().map(|f| &f.ty).collect();
@@ -444,6 +593,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #pod_impl
+
+        #handle_registration
 
         #[cfg(feature = "gpu")]
         const _: () = {

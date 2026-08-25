@@ -98,6 +98,24 @@ pub struct World {
     /// no allocation, nothing on any drop path. Not feature-gated: live-UI
     /// consumers are always available (CONTRACTS C0).
     subscriptions: Option<crate::subscriptions::SubscriptionRegistryHandle>,
+    /// Counted-handle bookkeeping (see [`crate::handle_ledger`]) -- ALWAYS
+    /// present, unlike the three optional capabilities above it. There is no
+    /// attach/detach ceremony: handle counting must simply be correct with
+    /// zero setup (see the module doc's "Internalized, not attached"
+    /// section for why an attach-based seam was the wrong shape for this
+    /// specifically). Every mutating path pays one `HashMap` probe
+    /// (`collect_fn_for`) per touched component type to find that type's
+    /// macro-generated handle collector; a miss (the overwhelming majority
+    /// of component types, which have no `HandleId`/content-id-linked
+    /// fields) costs nothing further. `Arc<Mutex<..>>`, not a bare
+    /// `HashMap`, purely so [`Mut`]'s drop-time hook can hold an owned
+    /// handle independent of `self`'s borrow -- same reason
+    /// `change_tracker`/`subscriptions` above are `Arc`-wrapped, same
+    /// `std::sync::Mutex` + `.lock().expect(..)` convention as
+    /// `SharedChangeTracker`/`SubscriptionRegistryHandle`. Not
+    /// feature-gated: handles are a domain-neutral concept with no GPU
+    /// dependency whatsoever.
+    handle_counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
 }
 
 /// A mutable borrow of component `T` on some entity, returned by
@@ -145,6 +163,16 @@ pub struct Mut<'a, T> {
     /// already does when a tracker is attached — no `_tracked` call, no
     /// separate `get_mut_tracked` method to remember.
     change_hook: Option<ChangeMutHook>,
+    /// Precomputed at [`World::get_mut`] time: `None` whenever `T` has no
+    /// `HandleId`/content-id-linked fields (handle counting itself is
+    /// always on -- see `World::handle_counts`'s doc -- so the only miss
+    /// here is "this type has nothing to count"). Captures the OLD handle
+    /// values at construction (after that point they are unrecoverable --
+    /// the caller is holding `&mut T`) so [`Drop::drop`] can report a
+    /// proper swap instead of silently losing accounting for handle fields
+    /// mutated through `DerefMut`. See [`HandleMutHook`] for why this fires
+    /// only on an actual write, unlike the GPU hook above.
+    handle_hook: Option<HandleMutHook>,
 }
 
 #[cfg(feature = "gpu")]
@@ -174,6 +202,48 @@ struct SubMutHook {
     registry: crate::subscriptions::SubscriptionRegistryHandle,
     entity: Entity,
     component_id: ComponentId,
+}
+
+/// See [`Mut::handle_hook`]'s doc. Holds an owned clone of `World`'s
+/// `handle_counts` handle (independent of `self`'s borrow -- `Mut` already
+/// holds `value: &'a mut T` derived from `self`, so reaching back into
+/// `self.handle_counts` directly in `Drop` would need an aliasing argument
+/// this crate's safe-Rust discipline doesn't want to make; cloning the
+/// `Arc<Mutex<..>>` sidesteps the question entirely, same reason
+/// `GpuMutHook`/`ChangeMutHook`/`SubMutHook` above each hold their own
+/// owned handle rather than a borrow of `self`), the OLD handle values
+/// captured when `get_mut` handed out the guard, and the concrete type's
+/// collector fn (resolved once here, not re-probed in `Drop`). Firing is a
+/// [`crate::handle_ledger::report_captured_swap`] call: fields whose value
+/// survived the mutation produce nothing; changed fields release-old /
+/// acquire-new exactly like an in-place insert would have.
+///
+/// Deliberately fires ONLY when the guard was actually written through
+/// (`mutated_via_deref_mut`), unlike the GPU hook which re-dispatches on
+/// every drop: a borrow-only `get_mut` leaves old and new identical by
+/// definition, so firing it could only ever be a no-op comparison -- and
+/// unlike the GPU path there is no "Once must re-upload on explicit
+/// mutation" subtlety to preserve. Skipping the work entirely keeps a
+/// read-heavy `get_mut` workload allocation-free (the capture Vec exists
+/// only while a guard is live).
+struct HandleMutHook {
+    counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
+    /// Old values, field-declaration order (the collector's contract), as
+    /// of `get_mut` time.
+    captured: Vec<crate::handle_ledger::HandleId>,
+    collect: crate::handle_ledger::CollectHandlesFn,
+}
+
+impl HandleMutHook {
+    fn fire(&self, current_value: *const ()) {
+        let mut counts = self.counts.lock().expect("World handle_counts: mutex poisoned");
+        crate::handle_ledger::report_captured_swap(
+            &mut counts,
+            self.collect,
+            &self.captured,
+            current_value,
+        );
+    }
 }
 
 impl SubMutHook {
@@ -233,6 +303,14 @@ impl<'a, T> Mut<'a, T> {
         if let Some(hook) = self.gpu_hook.take() {
             (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
         }
+        // Same "run me immediately" boundary the GPU hook above treats
+        // `into_inner` as: handing the unique `&mut T` out ends all further
+        // automatic observation, so fire now against whatever is in the
+        // field right now -- unconditionally (NOT gated on
+        // `mutated_via_deref_mut`, matching this method's other hooks).
+        if let Some(hook) = self.handle_hook.take() {
+            hook.fire(self.value as *const T as *const ());
+        }
         if let Some(hook) = self.change_hook.take() {
             hook.tracker.record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
@@ -260,6 +338,15 @@ impl<'a, T> Mut<'a, T> {
 
 impl<'a, T> Drop for Mut<'a, T> {
     fn drop(&mut self) {
+        // Handle-ledger swap report -- gated on an ACTUAL write (see
+        // `HandleMutHook`'s doc for why this differs from the GPU hook's
+        // unconditional fire: a borrow-only guard cannot have changed any
+        // handle value, so the comparison would be a guaranteed no-op).
+        if self.mutated_via_deref_mut {
+            if let Some(hook) = &self.handle_hook {
+                hook.fire(self.value as *const T as *const ());
+            }
+        }
         #[cfg(feature = "gpu")]
         if let Some(hook) = &self.gpu_hook {
             // `is_new_insert = true`: from `write_gpu_columns_at_row`'s
@@ -307,6 +394,9 @@ impl World {
             gpu_mirror: None,
             change_tracker: None,
             subscriptions: None,
+            handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::handle_ledger::HandleCounts::default(),
+            )),
         }
     }
 
@@ -485,6 +575,66 @@ impl World {
         }
     }
 
+    // ── Handle counting (counted-handle capability) ─────────────────────────
+    //
+    // No attach/detach here -- see `handle_counts`'s field doc and
+    // `handle_ledger`'s module doc ("Internalized, not attached") for why.
+    // Counting is unconditional from `World::new()` onward.
+
+    /// Current live reference count for `id` across every component in this
+    /// `World` -- `0` for an id never acquired or already fully released.
+    /// O(1): one lock + one `HashMap` probe, no scan. This is the FAST path;
+    /// see [`Self::handle_audit`] for the independent ground-truth version
+    /// tests cross-check it against.
+    pub fn handle_ref_count(&self, id: crate::handle_ledger::HandleId) -> i64 {
+        self.handle_counts
+            .lock()
+            .expect("World handle_counts: mutex poisoned")
+            .get(id)
+    }
+
+    /// Ground-truth handle-reference audit: walks every archetype and every
+    /// row, re-collecting handle-typed (and content-id-linked) field values
+    /// directly from live component data, and tallies them from scratch --
+    /// deliberately NOT a dump of the incremental `handle_counts` table, so
+    /// tests can use this to catch a real accounting bug in the fast path
+    /// rather than only ever confirming the fast path agrees with itself.
+    /// Not on any hot path: for tests and tooling, O(total component
+    /// instances across the whole `World`).
+    ///
+    /// Returns only ids with a nonzero tally, sorted by `HandleId`'s bit
+    /// pattern (deterministic order for snapshot-style test assertions).
+    pub fn handle_audit(&self) -> Vec<(crate::handle_ledger::HandleId, i64)> {
+        let mut tally: std::collections::HashMap<crate::handle_ledger::HandleId, i64> =
+            std::collections::HashMap::new();
+        let mut scratch = Vec::new();
+        for arch in &self.archetypes {
+            for (i, col) in arch.columns.iter().enumerate() {
+                let Some(col) = col else { continue };
+                let Some(collect) = crate::handle_ledger::collect_fn_for(ComponentId(i as u32)) else {
+                    continue;
+                };
+                for row in 0..col.len() {
+                    // SAFETY: `row` is in `[0, col.len())`, freshly queried
+                    // from this exact column -- the same contract
+                    // `despawn_inner`'s identical collector-walk loop
+                    // relies on.
+                    let ptr = unsafe { col.get_raw(row) };
+                    scratch.clear();
+                    (collect)(ptr, &mut scratch);
+                    for &id in scratch.iter() {
+                        if !id.is_zero() {
+                            *tally.entry(id).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<_> = tally.into_iter().filter(|(_, n)| *n != 0).collect();
+        out.sort_by_key(|(id, _)| id.0);
+        out
+    }
+
     /// Attach a [`crate::gpu::GpuMirrorHandle`] so that every future
     /// `insert`/`insert_tracked` call automatically mirrors any `#[gpu]`
     /// fields of the inserted component to their registered GPU buffer, at
@@ -548,6 +698,39 @@ impl World {
             m.generations().flush(queue);
             m.store().flush_gpu_mirror(queue)
         })
+    }
+
+    /// Tier demand verb (`touch(id | row, range | whole, target_tier)`),
+    /// threaded to the attached mirror's store. Movement happens at the
+    /// next [`Self::flush_gpu_mirror`] — see `gpu::tier`'s module doc for
+    /// the full contract and the ordering promise. Requires a mirror to be
+    /// attached; otherwise a loud [`TierError::NotConfigured`](crate::gpu::TierError)
+    /// (a `World` with no GPU seam has no tiers to move).
+    #[cfg(feature = "gpu")]
+    pub fn touch_tier(
+        &self,
+        sel: crate::gpu::TierSelector,
+        span: crate::gpu::TierSpan,
+        target: crate::gpu::Tier,
+    ) -> Result<(), crate::gpu::TierError> {
+        match &self.gpu_mirror {
+            Some(m) => m.store().touch_tier(sel, span, target),
+            None => Err(crate::gpu::TierError::NotConfigured),
+        }
+    }
+
+    /// Withdraw-demand counterpart to [`Self::touch_tier`] — see that
+    /// method and `gpu::tier`'s module doc.
+    #[cfg(feature = "gpu")]
+    pub fn release_tier(
+        &self,
+        sel: crate::gpu::TierSelector,
+        span: crate::gpu::TierSpan,
+    ) -> Result<(), crate::gpu::TierError> {
+        match &self.gpu_mirror {
+            Some(m) => m.store().release_tier(sel, span),
+            None => Err(crate::gpu::TierError::NotConfigured),
+        }
     }
 
     /// Reserves capacity `n` on every registered World-mirrored GPU buffer
@@ -740,6 +923,80 @@ impl World {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
         };
+
+        // Var-len GPU-pool despawn release (SceneDB#57): free every
+        // Vec<T>-typed #[gpu] field's pool allocation the dying entity
+        // held, interned or not. Keyed by `entity.index()` -- NOT the
+        // archetype `row` above -- because that's what every GPU-mirror
+        // row-indexed structure (the handle-table column, an
+        // `InternedVarLenPool`'s own row shadow) is keyed by; it's stable
+        // across archetype migration, which archetype row is not. Must run
+        // before `remove_row` below for the same "the moved entity that
+        // replaces this row is a different story" reason the handle-count
+        // block below it does -- though in practice this dispatch reads
+        // only GPU-mirror-side shadows, never the CPU archetype column
+        // itself, so the ordering constraint here is about not racing a
+        // LATER despawn of the row that replaces this one, not about this
+        // row's own CPU data.
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            let arch = &self.archetypes[arch_id.0 as usize];
+            for (i, col) in arch.columns.iter().enumerate() {
+                if col.is_some() {
+                    if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(ComponentId(i as u32)) {
+                        release(mirror, entity.index());
+                    }
+                }
+            }
+        }
+
+        // Handle-count despawn fast path: collect EVERY handle field of
+        // EVERY component the dying entity carries -- across all of its
+        // archetype's columns, in one pass -- and release the whole set
+        // ONCE. Must run BEFORE `remove_row` below (that swap-removes the
+        // dying row's values out from under us; the moved entity that
+        // replaces it is a different story and must not be touched).
+        // Duplicates in the slice are meaningful: two components on one
+        // entity referencing the same content release TWO references --
+        // multiset semantics (see `handle_ledger`'s module doc); this site
+        // only reports faithfully. One `HashMap` probe per column type;
+        // types without handle/content-id-linked fields miss and cost
+        // nothing beyond it.
+        {
+            let arch = &self.archetypes[arch_id.0 as usize];
+            crate::handle_ledger::with_scratch(|dying| {
+                for (i, col) in arch.columns.iter().enumerate() {
+                    if let Some(col) = col {
+                        if let Some(collect) =
+                            crate::handle_ledger::collect_fn_for(ComponentId(i as u32))
+                        {
+                            // SAFETY: `row` indexes a live row of this
+                            // exact column: the entity was alive when we
+                            // read `(arch_id, row)` above, and
+                            // `Archetype::remove_row` (which would shift
+                            // rows) has not run yet.
+                            let value_ptr = unsafe { col.get_raw(row) };
+                            (collect)(value_ptr, dying);
+                        }
+                    }
+                }
+                if !dying.is_empty() {
+                    // Zero-value convention enforced AT THE BOUNDARY (the
+                    // last place it can be): default/never-set fields
+                    // collected above must never reach the count table as
+                    // fake references. `retain` is in-place -- no
+                    // allocation, which keeps this whole path inside the
+                    // no-alloc steady-state guarantee.
+                    dying.retain(|id| !id.is_zero());
+                    if !dying.is_empty() {
+                        let mut counts =
+                            self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                        crate::handle_ledger::release_row(&mut counts, dying);
+                    }
+                }
+            });
+        }
+
         let swapped = self.archetypes[arch_id.0 as usize].remove_row(row);
         if let Some(moved) = swapped {
             self.entity_slots[moved.index() as usize].row = row as u32;
@@ -904,6 +1161,13 @@ impl World {
         let cid = crate::component::component_id::<T>();
         assert!(self.is_alive(entity), "insert on dead entity {entity}");
 
+        // NOT cloned unconditionally here (unlike the change-tracker guard
+        // below) -- `collect_fn_for(cid)` is checked FIRST at each of the
+        // two reporting sites, and the `Arc::clone` + lock only happen on a
+        // hit, so a component type with no handle/content-id-linked fields
+        // (the overwhelming majority) pays exactly the one `HashMap` miss
+        // the module doc's cost model promises, nothing more.
+
         let (old_arch_id, old_row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
@@ -947,13 +1211,30 @@ impl World {
 
         // In-place update: entity already has this component in this archetype.
         if !is_new_insert {
+            let col = self.archetypes[old_arch_id.0 as usize].column_mut::<T>();
+
+            // Handle-ledger swap detection (rehydrate-replace included --
+            // this branch IS the replace): read the OUTGOING value BEFORE
+            // it is overwritten, then report old-vs-new per handle field.
+            // Equal ids ⇒ nothing (a routine re-insert of the same asset
+            // must not churn counts); different ⇒ release old unless zero,
+            // acquire new unless zero. See `handle_ledger::report_value_swap`
+            // for why the rule lives in exactly one shared place. Runs only
+            // when `T` actually has handle/content-id-linked fields (one
+            // `HashMap` miss otherwise).
+            if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
+                let old_ptr = &col.data[old_row] as *const T as *const ();
+                let new_ptr = &value as *const T as *const ();
+                let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                crate::handle_ledger::report_value_swap(&mut counts, collect, old_ptr, new_ptr);
+            }
+
             if let Some(t) = tracker.as_deref_mut() {
                 // Capture bytes before the value is moved into the column.
                 let len = std::mem::size_of::<T>();
                 let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
                 t.record_component_change(entity, cid, 0, bytes.to_vec());
             }
-            let col = self.archetypes[old_arch_id.0 as usize].column_mut::<T>();
             col.data[old_row] = value;
             // Subscription delivery (SceneDB#47): an in-place overwrite IS a
             // real change to `(entity, T)`. Reported as `Inserted` -- from a
@@ -1011,14 +1292,30 @@ impl World {
         // Phase 2: push the new value.  The destination entity vec has
         // already grown by one, so this keeps all column lengths in sync.
         let new_arch = &mut self.archetypes[new_arch_id.0 as usize];
-        new_arch.columns[idx]
-            .as_mut()
-            .unwrap()
-            .as_any_mut()
-            .downcast_mut::<Column<T>>()
-            .unwrap()
-            .data
-            .push(value);
+        {
+            let col_data = &mut new_arch.columns[idx]
+                .as_mut()
+                .unwrap()
+                .as_any_mut()
+                .downcast_mut::<Column<T>>()
+                .unwrap()
+                .data;
+            col_data.push(value);
+
+            // Handle-ledger acquisition (FIRST insert of `T` onto this
+            // entity): acquire every nonzero handle the freshly-pushed
+            // value carries. No swap comparison here by definition -- there
+            // is no old value of THIS component type to release (other
+            // components migrating alongside move verbatim and change no
+            // counts; handles are keyed by content, not row position).
+            // Reported from the pushed element (not the moved-out `value`,
+            // which is gone) so the event reflects committed state.
+            if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
+                let new_ptr = col_data.last().expect("just pushed above") as *const T as *const ();
+                let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                crate::handle_ledger::report_value_acquire(&mut counts, collect, new_ptr);
+            }
+        }
 
         if let Some(t) = tracker {
             // The value was moved into the column, so we can't read it anymore.
@@ -1080,6 +1377,17 @@ impl World {
             return None;
         }
 
+        // Var-len GPU-pool release for the ONE component type being
+        // removed (SceneDB#57) -- `T`'s lifetime on this entity is ending,
+        // same trigger as the despawn-wide version above, scoped to just
+        // this component. Keyed by `entity.index()`, same reasoning.
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(cid) {
+                release(mirror, entity.index());
+            }
+        }
+
         // Pull the value out of the column. `remove_inner<T>` already knows
         // the concrete type -- unlike `migrate_row`'s type-erased column
         // carry-over (which genuinely doesn't know the OTHER components'
@@ -1095,6 +1403,18 @@ impl World {
             .column_mut::<T>()
             .data
             .swap_remove(old_row);
+
+        // Handle-ledger release: `T`'s lifetime on this entity just ended,
+        // so every nonzero handle it carried loses one reference -- the
+        // exact inverse of insert_inner's first-insert acquisition. Fires
+        // before the migration below (which only moves OTHER components'
+        // values verbatim and is irrelevant to counts), from the extracted
+        // value itself.
+        if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
+            let value_ptr = &removed_val as *const T as *const ();
+            let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+            crate::handle_ledger::report_value_release(&mut counts, collect, value_ptr);
+        }
 
         // Archetype-graph edge cache -- see `insert_inner`'s identical use
         // of `add_edge`/`Archetype::add_edges`'s doc for the shared
@@ -1206,6 +1526,23 @@ impl World {
             component_id: cid,
         });
 
+        // Handle hook: capture the OLD handle values NOW (the caller is one
+        // `DerefMut` away from overwriting them, and there is no shadow to
+        // re-read them from -- plain component fields have no CPU-side copy
+        // outside the archetype column). Only built when `T` actually has
+        // handle/content-id-linked fields; a miss costs one probe, nothing
+        // else. The capture Vec is small (one entry per handle field of T)
+        // and lives only as long as the guard.
+        let handle_hook = crate::handle_ledger::collect_fn_for(cid).map(|collect| {
+            let mut captured = Vec::new();
+            (collect)(&*value as *const T as *const (), &mut captured);
+            HandleMutHook {
+                counts: std::sync::Arc::clone(&self.handle_counts),
+                captured,
+                collect,
+            }
+        });
+
         Some(Mut {
             value,
             mutated_via_deref_mut: false,
@@ -1213,6 +1550,7 @@ impl World {
             #[cfg(feature = "gpu")]
             gpu_hook,
             change_hook,
+            handle_hook,
         })
     }
 

@@ -173,6 +173,14 @@ impl<T: Pod> SceneBuffer<T> {
                 gap_len = 0;
             } else if let Some(start) = run_start {
                 gap_len += 1;
+                // `GAP_MERGE_THRESHOLD` is deliberately pinned at `u32::MIN`
+                // today (see its own doc: "0 collapses this to the original
+                // strict-adjacency loop exactly") -- a real, load-bearing
+                // degenerate case, not a mistake, so the always-true
+                // comparison clippy flags here is a false positive against
+                // this crate's own documented tuning knob, not a bug to fix
+                // by changing the logic.
+                #[allow(clippy::absurd_extreme_comparisons)]
                 if gap_len >= GAP_MERGE_THRESHOLD {
                     self.flush(queue, cpu, region_base, start, run_end, stride, &mut stats);
                     run_start = None;

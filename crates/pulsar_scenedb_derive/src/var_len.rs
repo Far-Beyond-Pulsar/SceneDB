@@ -40,7 +40,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::Ident;
+use syn::{Ident, Type};
 
 use crate::scene_store::{FieldInfo, MirrorModeAttr};
 
@@ -49,6 +49,33 @@ fn mirror_mode_tokens(mode: MirrorModeAttr) -> TokenStream {
         MirrorModeAttr::DirtyTracked => quote! { ::pulsar_scenedb::gpu::MirrorMode::DirtyTracked },
         MirrorModeAttr::Once => quote! { ::pulsar_scenedb::gpu::MirrorMode::Once },
     }
+}
+
+/// Resolves a `#[gpu(content_id = "sibling")]` field's named sibling
+/// against the struct's full field list -- errors (macro-expansion time,
+/// not a runtime panic) if no field with that ident exists. Returns the
+/// sibling's own `Type` for splicing into the generated
+/// `<SiblingTy as ContentAddressed>::content_id(&data.sibling)`-shaped
+/// call -- the compiler enforces the trait bound on THAT call, so a sibling
+/// whose type doesn't implement `ContentAddressed` is still a clear
+/// compile error, just one message later than this check.
+fn resolve_content_id_sibling<'a>(
+    field: &FieldInfo,
+    sibling_ident: &Ident,
+    field_infos: &'a [FieldInfo],
+) -> syn::Result<&'a Type> {
+    field_infos
+        .iter()
+        .find(|f| &f.ident == sibling_ident)
+        .map(|f| &f.ty)
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                &field.ident,
+                format!(
+                    "#[gpu(content_id = \"{sibling_ident}\")] names a field that doesn't exist on this struct"
+                ),
+            )
+        })
 }
 
 pub fn generate_var_len_bearing_type(
@@ -108,12 +135,31 @@ pub fn generate_var_len_bearing_type(
                 // also want to share -- not the per-field handle table,
                 // which is never a sharing target).
                 let handle_key = format!("{key}::handles");
+                // Interned (`content_id = "..."`) fields register through
+                // the content-addressed pool instead of the plain one --
+                // see `gpu::interned_pool`'s module doc. The handle-table
+                // registration is IDENTICAL either way: the row-indexed
+                // column always holds a plain `VarLenHandle`, whether or not
+                // the range it names is shared with other rows.
+                let pool_register = if f.content_id_field.is_some() {
+                    quote! {
+                        store.register_interned_var_len_gpu_pool::<#elem_ty>(
+                            ::pulsar_scenedb::gpu::BufferKey::of(#key),
+                            initial_capacity,
+                            device,
+                        );
+                    }
+                } else {
+                    quote! {
+                        store.register_var_len_gpu_pool::<#elem_ty>(
+                            ::pulsar_scenedb::gpu::BufferKey::of(#key),
+                            initial_capacity,
+                            device,
+                        );
+                    }
+                };
                 quote! {
-                    store.register_var_len_gpu_pool::<#elem_ty>(
-                        ::pulsar_scenedb::gpu::BufferKey::of(#key),
-                        initial_capacity,
-                        device,
-                    );
+                    #pool_register
                     store.register_dirty_tracked_gpu_buffer::<#wrapper, ::pulsar_scenedb::gpu::VarLenHandle>(
                         initial_capacity,
                         device,
@@ -142,14 +188,31 @@ pub fn generate_var_len_bearing_type(
     // generically without `Self: Pod`).
     let write_arms: Vec<TokenStream> = gpu_fields
         .iter()
-        .map(|f| {
+        .map(|f| -> syn::Result<TokenStream> {
             let field_ident = &f.ident;
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
             if f.is_var_len {
                 let elem_ty = f.var_len_elem_ty.as_ref().expect("is_var_len implies var_len_elem_ty");
                 let field_name = f.ident.to_string();
                 let key = f.buffer_key.clone().unwrap_or_else(|| format!("{name}::{field_name}"));
-                quote! {
+                if let Some(sibling_ident) = &f.content_id_field {
+                    let sibling_ty = resolve_content_id_sibling(f, sibling_ident, field_infos)?;
+                    return Ok(quote! {
+                        {
+                            let handle_id = ::pulsar_scenedb::component::component_id::<#wrapper>();
+                            ::pulsar_scenedb::gpu::write_interned_var_len_field_at_row::<#elem_ty, #sibling_ty>(
+                                store,
+                                queue,
+                                ::pulsar_scenedb::gpu::BufferKey::of(#key),
+                                handle_id,
+                                row,
+                                &data.#sibling_ident,
+                                &data.#field_ident,
+                            );
+                        }
+                    });
+                }
+                Ok(quote! {
                     {
                         let handle_id = ::pulsar_scenedb::component::component_id::<#wrapper>();
                         ::pulsar_scenedb::gpu::write_var_len_field_at_row::<#elem_ty>(
@@ -161,7 +224,7 @@ pub fn generate_var_len_bearing_type(
                             &data.#field_ident,
                         );
                     }
-                }
+                })
             } else {
                 let ty = &f.ty;
                 let body = quote! {
@@ -181,19 +244,51 @@ pub fn generate_var_len_bearing_type(
                     let id = ::pulsar_scenedb::component::component_id::<#wrapper>();
                     store.mark_gpu_row_dirty(id, row, bytes);
                 };
-                match f.mirror_mode {
+                Ok(match f.mirror_mode {
                     MirrorModeAttr::Once => quote! {
                         if is_new_insert {
                             #body
                         }
                     },
                     MirrorModeAttr::DirtyTracked => body,
+                })
+            }
+        })
+        .collect::<syn::Result<Vec<TokenStream>>>()?;
+
+    // Despawn/remove release dispatch -- one arm per var-len field (plain
+    // or interned; scalar `#[gpu]` fields have no pool allocation to free,
+    // so they contribute nothing here). Emitted only when at least one
+    // var-len field exists, which is always true on this codegen path (it's
+    // why this path was chosen at all) -- so this registration is
+    // unconditional for every var-len-bearing struct, matching
+    // `VarLenReleaseRegistration`'s "absent means the type never submitted
+    // one" cost contract exactly (a struct with zero var-len fields never
+    // reaches `generate_var_len_bearing_type` in the first place).
+    let release_arms: Vec<TokenStream> = gpu_fields
+        .iter()
+        .filter(|f| f.is_var_len)
+        .map(|f| {
+            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let elem_ty = f.var_len_elem_ty.as_ref().expect("is_var_len implies var_len_elem_ty");
+            let field_name = f.ident.to_string();
+            let key = f.buffer_key.clone().unwrap_or_else(|| format!("{name}::{field_name}"));
+            let free_fn = if f.content_id_field.is_some() {
+                quote! { ::pulsar_scenedb::gpu::free_interned_var_len_field_at_row::<#elem_ty> }
+            } else {
+                quote! { ::pulsar_scenedb::gpu::free_var_len_field_at_row::<#elem_ty> }
+            };
+            quote! {
+                {
+                    let handle_id = ::pulsar_scenedb::component::component_id::<#wrapper>();
+                    #free_fn(store, ::pulsar_scenedb::gpu::BufferKey::of(#key), handle_id, row);
                 }
             }
         })
         .collect();
 
     let mirror_dispatch_fn_name = quote::format_ident!("__scenedb_gpu_mirror_dispatch_{}", name);
+    let release_dispatch_fn_name = quote::format_ident!("__scenedb_gpu_release_dispatch_{}", name);
 
     // Auto-registration-on-first-use gate: reuses `SceneGpuStore::
     // buffer_key_for` (the same primitive `SceneGpuStore::is_registered`
@@ -346,10 +441,24 @@ pub fn generate_var_len_bearing_type(
                 #(#write_arms)*
             }
 
+            #[doc(hidden)]
+            #[allow(non_snake_case, unused_variables)]
+            fn #release_dispatch_fn_name(mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle, row: u32) {
+                let store = mirror.store();
+                #(#release_arms)*
+            }
+
             ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
                 ::pulsar_scenedb::gpu::GpuMirrorRegistration {
                     component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
                     dispatch: #mirror_dispatch_fn_name,
+                }
+            }
+
+            ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+                ::pulsar_scenedb::gpu::VarLenReleaseRegistration {
+                    component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                    release: #release_dispatch_fn_name,
                 }
             }
         };

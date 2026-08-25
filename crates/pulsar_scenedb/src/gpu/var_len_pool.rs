@@ -43,8 +43,10 @@
 
 use super::dynamic_buffer::{elem_align, CapacityError, DynamicGpuBuffer};
 use super::freelist::RangeList;
+use super::tier::{ByteRange, TierAuditKey, TierAuditRecord, TierEngine, TieredPoolHooks, NO_SLOT};
 use crate::page::Pod;
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Rounds `count` up to the nearest multiple of `align` — the element count
@@ -63,7 +65,7 @@ fn padded_alloc_len(count: u32, align: u64) -> u64 {
 /// field. `count == 0` means "no allocation" (an empty or never-written
 /// `Vec`) — `offset` is meaningless in that case, never dereferenced.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct VarLenHandle {
     pub offset: u32,
     pub count: u32,
@@ -75,6 +77,55 @@ unsafe impl Pod for VarLenHandle {}
 struct Inner<T: Pod> {
     buf: DynamicGpuBuffer<T>,
     free: RangeList,
+    /// Tier sidecar (#61 §1): one residency record per LIVE allocation,
+    /// keyed by the allocation's pool offset — parallel to the freelist
+    /// bookkeeping exactly as the issue specifies. `Off` until
+    /// [`VarLenGpuPool::set_tier_participation`] flips it on (the store's
+    /// plain-pool registration path does; interned underlays and standalone
+    /// pools stay Off, costing nothing beyond one enum discriminant).
+    tier: PoolTierState<T>,
+}
+
+/// One live allocation's residency record — the extended entry from #61 §1:
+/// `{offset(=key), count, tier, resident_ranges, generation, last_use}`.
+pub(crate) struct PoolTierRecord {
+    /// True element count of the live allocation (identity half: a recycled
+    /// offset whose new tenant declares a different count is detectably NOT
+    /// the same resource).
+    pub count: u32,
+    /// Monotonic identity generation from a pool-level counter that never
+    /// resets — strictly increases across offset reuse, which is what makes
+    /// the flush liveness guard sound (a queued intent captured before a
+    /// free can NEVER validate against the recycled tenant).
+    pub generation: u64,
+    /// Last-demand stamp (engine clock).
+    pub last_use: u64,
+    /// Newest executed intent-sequence stamp for this slot (freshness
+    /// filter for cross-batch stale intents).
+    pub last_seq: u64,
+    /// Current authoritative residency of the payload bytes.
+    pub tier: super::tier::Tier,
+    /// RAM-arena staging slot (`NO_SLOT` = unstaged), or disk-arena export
+    /// slot once spilled (`spilled == true`).
+    pub staging: u32,
+    pub spilled: bool,
+    /// Resident VRAM rank-prefix watermark (index into the flight plan,
+    /// not a rank value — plans are rebuilt deterministically).
+    pub resident_units: Vec<(u32, ByteRange)>,
+}
+
+enum PoolTierState<T: Pod> {
+    Off,
+    On {
+        engine: Arc<TierEngine>,
+        /// This pool's own registration key — audit labels + texture
+        /// materialization lookup.
+        key: crate::gpu::BufferKey,
+        /// Identity-generation counter (monotonic, never reset).
+        next_generation: u64,
+        recs: HashMap<u64 /*offset*/, PoolTierRecord>,
+        _elem: std::marker::PhantomData<T>,
+    },
 }
 
 /// Shared growable pool backing every entity's `Vec<T>`-typed `#[gpu]`
@@ -111,7 +162,102 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
     ) -> Self {
         let buf = DynamicGpuBuffer::new_with_usage(&device, label, initial_capacity, usage);
         let free = RangeList::new(initial_capacity as u64);
-        Self { device, inner: RwLock::new(Inner { buf, free }) }
+        Self { device, inner: RwLock::new(Inner { buf, free, tier: PoolTierState::Off }) }
+    }
+
+    /// Attaches the tier engine to this pool (the store's plain-pool
+    /// registration path calls this; interned underlays deliberately do not
+    /// — statics have no tier data plane). Idempotent; the LAST call wins.
+    /// Registration-time only — never reachable on a per-frame path.
+    pub(crate) fn set_tier_participation(&self, engine: Arc<TierEngine>, key: crate::gpu::BufferKey) {
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        if matches!(&guard.tier, PoolTierState::On { key: existing, .. } if *existing == key) {
+            return;
+        }
+        guard.tier = PoolTierState::On {
+            engine,
+            key,
+            next_generation: 0,
+            recs: HashMap::new(),
+            _elem: std::marker::PhantomData,
+        };
+    }
+
+    /// Removes and drops the record at `offset` together with its staging
+    /// bytes — the fate of an emptied-out or freed allocation.
+    fn tier_drop_record(tier: &mut PoolTierState<T>, offset: u64) {
+        let PoolTierState::On { engine, recs, .. } = tier else { return };
+        if let Some(prev) = recs.remove(&offset) {
+            if prev.staging != NO_SLOT {
+                if prev.spilled {
+                    engine.discard_disk_export(prev.staging);
+                } else {
+                    engine.discard_ram(prev.staging);
+                }
+            }
+        }
+    }
+
+    /// Detaches the record at `offset` WITHOUT dropping its staging,
+    /// returning the RAM slot for in-place reuse by the next staging of a
+    /// same-or-smaller payload — the mechanism that keeps steady-state
+    /// rewrites allocation-free. Spilled exports are dropped (their owner
+    /// is being rewritten; the frozen snapshot is obsolete).
+    fn tier_detach_for_reuse(tier: &mut PoolTierState<T>, offset: u64) -> Option<u32> {
+        let PoolTierState::On { engine, recs, .. } = tier else { return None };
+        match recs.remove(&offset) {
+            Some(prev) => {
+                if prev.spilled {
+                    engine.discard_disk_export(prev.staging);
+                    None
+                } else {
+                    Some(prev.staging).filter(|&s| s != NO_SLOT)
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Stages `data`'s bytes and inserts the sidecar record for the live
+    /// allocation at `offset` — the write-path half of #61 §1's "default
+    /// tier on write is RAM". `reuse` is a detached staging slot eligible
+    /// for in-place overwrite (`Self::tier_detach_for_reuse`).
+    fn tier_insert_record(
+        tier: &mut PoolTierState<T>,
+        offset: u64,
+        count: u32,
+        data: &[T],
+        reuse: Option<u32>,
+    ) {
+        let PoolTierState::On { engine, recs, next_generation, .. } = tier else { return; };
+        debug_assert!(
+            !recs.contains_key(&offset),
+            "stale tier record at a freshly allocated pool offset -- prior tenant was never freed"
+        );
+        let byte_len = std::mem::size_of::<T>() as u64 * data.len() as u64;
+        let generation = *next_generation;
+        *next_generation += 1;
+        let last_use = engine.stamp();
+        let staging = engine.restage_ram(reuse.filter(|_| byte_len > 0), super::as_bytes(data));
+        recs.insert(
+            offset,
+            PoolTierRecord {
+                count,
+                generation,
+                last_use,
+                tier: super::tier::Tier::Ram,
+                staging: if byte_len == 0 { NO_SLOT } else { staging },
+                spilled: false,
+                resident_units: Vec::new(),
+                last_seq: 0,
+            },
+        );
+    }
+
+    /// Drops the sidecar record for a freed allocation (if any), returning
+    /// its staging bytes to the arena's free pool with them.
+    fn tier_record_free(tier: &mut PoolTierState<T>, offset: u64) {
+        Self::tier_drop_record(tier, offset)
     }
 
     /// Frees `prev`'s allocation (if any — `count == 0` is a no-op, so this
@@ -132,6 +278,7 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
             guard.free.free(prev.offset as u64, padded_alloc_len(prev.count, align));
         }
         if data.is_empty() {
+            Self::tier_record_free(&mut guard.tier, prev.offset as u64);
             return Ok(VarLenHandle::default());
         }
 
@@ -167,14 +314,29 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
             }
         };
 
+        // Detach the previous tenant's staging for in-place reuse BEFORE
+        // the new allocation — wherever it lived (same offset first-fit
+        // reuse, or a relocated one), its box can serve the new payload.
+        // ONLY for an actual previous allocation (`prev.count > 0`): a
+        // never-written row's default handle names offset 0, and detaching
+        // THAT would steal whoever legitimately owns offset 0 today.
+        let reuse = if prev.count > 0 {
+            Self::tier_detach_for_reuse(&mut guard.tier, prev.offset as u64)
+        } else {
+            None
+        };
+
         guard.buf.write_padded(queue, offset as u32, data);
+        Self::tier_insert_record(&mut guard.tier, offset, len as u32, data, reuse);
         Ok(VarLenHandle { offset: offset as u32, count: len as u32 })
     }
 
     /// Frees `handle`'s allocation without writing a replacement — the
     /// despawn/removal path (an entity going away, or its `Vec` field being
     /// removed outright, has nothing new to write, only old space to give
-    /// back). No-op if `handle.count == 0`.
+    /// back). No-op if `handle.count == 0`. Also drops the allocation's
+    /// tier sidecar record together with its staging bytes, so a freed
+    /// range never leaves orphaned residency behind (#61 test-4 contract).
     pub fn free_handle(&self, handle: VarLenHandle) {
         if handle.count == 0 {
             return;
@@ -182,6 +344,7 @@ impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
         let align = elem_align::<T>();
         let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
         guard.free.free(handle.offset as u64, padded_alloc_len(handle.count, align));
+        Self::tier_record_free(&mut guard.tier, handle.offset as u64);
     }
 
     /// Overwrites `data` at `offset` in place — no allocation, no freelist
@@ -250,6 +413,233 @@ impl<'a, T: Pod> std::ops::Deref for VarLenBufferRef<'a, T> {
     fn deref(&self) -> &wgpu::Buffer {
         self.0.buf.buffer()
     }
+}
+
+/// The flush executor's type-erased view over one participating pool — see
+/// [`TieredPoolHooks`] (in `tier.rs`) for the seam contract. Granularity
+/// note: rank-unit slices against a POOL payload must be 4-byte aligned in
+/// payload-relative terms (the strictest `wgpu::Queue::write_buffer`
+/// demands, matched exactly); misaligned layouts are a registration-author
+/// error and panic loudly at first flight rather than silently rounding.
+impl<T: Pod + Send + Sync + 'static> TieredPoolHooks for VarLenGpuPool<T> {
+    fn payload_type(&self) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    fn slot_state(&self, offset: u64) -> Option<super::tier::SlotState> {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        match &guard.tier {
+            PoolTierState::On { recs, .. } => {
+                let rec = recs.get(&offset)?;
+                Some(super::tier::SlotState {
+                    generation: rec.generation,
+                    count: rec.count,
+                    tier: rec.tier,
+                    staged_len: rec.count as u64 * std::mem::size_of::<T>() as u64,
+                    spilled: rec.spilled,
+                    vram_bytes: rec.resident_units.iter().map(|(_, rng)| rng.len).sum(),
+                    last_use: rec.last_use,
+                })
+            }
+            PoolTierState::Off => None,
+        }
+    }
+
+    fn stamp_slot(&self, offset: u64) -> u64 {
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { engine, recs, .. } = &mut guard.tier else { return 0 };
+        let stamp = engine.stamp();
+        if let Some(rec) = recs.get_mut(&offset) {
+            rec.last_use = stamp;
+        }
+        stamp
+    }
+
+    fn claim_seq(&self, offset: u64, seq: u64) -> bool {
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &mut guard.tier else { return false };
+        match recs.get_mut(&offset) {
+            Some(rec) if seq > rec.last_seq => {
+                rec.last_seq = seq;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn copy_staged_window(&self, offset: u64, rel: u64, out: &mut [u8]) -> bool {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { engine, recs, .. } = &guard.tier else { return false };
+        let Some(rec) = recs.get(&offset) else { return false };
+        if rec.staging == NO_SLOT {
+            return false;
+        }
+        if rec.spilled {
+            engine.copy_disk_window(rec.staging, rel, out)
+        } else {
+            engine.copy_ram_window(rec.staging, rel, out)
+        }
+    }
+
+    fn admit_rank_unit(
+        &self,
+        queue: &wgpu::Queue,
+        offset: u64,
+        rank: u32,
+        packed: &[u8],
+        slices: &[(u64, u64)],
+    ) -> ByteRange {
+        let elem_size = std::mem::size_of::<T>().max(1) as u64;
+        let align = elem_align::<T>();
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        // Reserve element units exactly like any payload of the same size,
+        // so the freelist never mixes unit systems with ordinary writes.
+        let elems = (packed.len() as u64).div_ceil(elem_size);
+        let alloc_len = padded_alloc_len(elems as u32, align);
+        let alloc_off = match guard.free.alloc(alloc_len, align) {
+            Some(off) => off,
+            None => {
+                let old_total = guard.buf.capacity() as u64;
+                let min_capacity = old_total.saturating_add(alloc_len).min(u32::MAX as u64) as u32;
+                guard
+                    .buf
+                    .ensure_capacity(&self.device, queue, min_capacity)
+                    .expect("tier promotion growth cannot fail (pools have no capacity ceiling)");
+                let new_total = guard.buf.capacity() as u64;
+                guard.free.extend_total(old_total, new_total);
+                guard
+                    .free
+                    .alloc(alloc_len, align)
+                    .expect("freelist must satisfy an allocation immediately after extending past it")
+            }
+        };
+        // Upload the unit's bytes at their payload-relative positions.
+        let base_bytes = alloc_off * elem_size;
+        let buf = guard.buf.buffer();
+        for &(rel, len) in slices {
+            assert!(
+                rel % 4 == 0 && len % 4 == 0 && (rel + len) as usize <= packed.len(),
+                "rank-unit slice [{rel},+{len}) violates the 4-byte granularity contract for \
+                 pool-payload segment layouts (see tier.rs module doc) -- fix the registered layout"
+            );
+            queue.write_buffer(buf, base_bytes + rel, &packed[rel as usize..(rel + len) as usize]);
+        }
+        let range = ByteRange { offset: base_bytes, len: alloc_len * elem_size };
+        let rec = match &mut guard.tier {
+            PoolTierState::On { recs, .. } => recs.get_mut(&offset).expect("live record validated before flight"),
+            PoolTierState::Off => unreachable!("admit_rank_unit on a non-participating pool"),
+        };
+        rec.resident_units.push((rank, range));
+        rec.tier = super::tier::Tier::Vram;
+        range
+    }
+
+    fn withdraw_top_unit(&self, offset: u64) -> Option<(u32, ByteRange)> {
+        let elem_size = std::mem::size_of::<T>().max(1) as u64;
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &mut guard.tier else { return None };
+        let rec = recs.get_mut(&offset)?;
+        let idx = rec
+            .resident_units
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (r, _))| *r)
+            .map(|(i, _)| i)?;
+        let (rank, range) = rec.resident_units.remove(idx);
+        rec.generation += 1;
+        if rec.resident_units.is_empty() {
+            rec.tier = super::tier::Tier::Ram;
+        }
+        // `range.len` was reserved in padded element units — free the exact
+        // same span so the freelist never drifts from its own bookkeeping.
+        guard.free.free(range.offset / elem_size, range.len / elem_size);
+        Some((rank, range))
+    }
+
+    fn spill_staging(&self, offset: u64) {
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { engine, recs, .. } = &mut guard.tier else { return };
+        if let Some(rec) = recs.get_mut(&offset) {
+            if !rec.spilled {
+                let (disk_slot, _) = engine.spill_ram_to_disk(rec.staging);
+                rec.staging = disk_slot;
+                rec.spilled = true;
+                rec.tier = super::tier::Tier::Disk;
+                rec.generation += 1; // demotion Ram->Disk re-signs identity
+            }
+        }
+    }
+
+    fn unspill_staging(&self, offset: u64) {
+        let mut guard = self.inner.write().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { engine, recs, .. } = &mut guard.tier else { return };
+        if let Some(rec) = recs.get_mut(&offset) {
+            if rec.spilled {
+                let (ram_slot, _) = engine.unspill_disk_to_ram(rec.staging);
+                rec.staging = ram_slot;
+                rec.spilled = false;
+                rec.tier = super::tier::Tier::Ram; // promotion Disk->Ram: no gen bump
+            }
+        }
+    }
+
+    fn harvest_vram_candidates(&self) -> Vec<(u64, u64, u64)> {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &guard.tier else { return Vec::new() };
+        recs.iter()
+            .filter(|(_, r)| !r.resident_units.is_empty())
+            .map(|(&off, r)| (off, r.last_use, r.resident_units.iter().map(|(_, rng)| rng.len).sum()))
+            .collect()
+    }
+
+    fn resident_ranks(&self, offset: u64) -> Vec<(u32, ByteRange)> {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &guard.tier else { return Vec::new() };
+        let mut units = recs.get(&offset).map(|r| r.resident_units.clone()).unwrap_or_default();
+        units.sort_by_key(|(rank, _)| *rank);
+        units
+    }
+
+    fn harvest_staging_candidates(&self) -> Vec<(u64, u64)> {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &guard.tier else { return Vec::new() };
+        // VRAM-resident slots are EXCLUDED: spilling a resident slot's
+        // staging would leave its tier byte (Vram) inconsistent with its
+        // backing location, and the resident copy doesn't need its staging
+        // to stay alive — only future re-promotions do. Pressure spills
+        // target Ram-resident slots, whose residency IS their staging.
+        recs.iter()
+            .filter(|(_, r)| !r.spilled && r.staging != NO_SLOT && r.resident_units.is_empty())
+            .map(|(&off, r)| (off, r.last_use))
+            .collect()
+    }
+
+    fn audit_records(&self, key: crate::gpu::BufferKey) -> Vec<TierAuditRecord> {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let PoolTierState::On { recs, .. } = &guard.tier else { return Vec::new() };
+        let mut out: Vec<TierAuditRecord> = recs
+            .iter()
+            .map(|(&off, r)| TierAuditRecord {
+                key: TierAuditKey::PoolSlot(key, off),
+                tier: r.tier,
+                generation: r.generation,
+                last_use: r.last_use,
+                pinned: false,
+                vram_bytes: r.resident_units.iter().map(|(_, rng)| rng.len).sum(),
+                staging_bytes: if r.staging == NO_SLOT {
+                    0
+                } else {
+                    r.count as u64 * std::mem::size_of::<T>() as u64
+                },
+            })
+            .collect();
+        out.sort_by_key(|rec| match rec.key {
+            TierAuditKey::PoolSlot(_, off) => off,
+            _ => 0,
+        });
+        out
+    }
+
 }
 
 #[cfg(test)]

@@ -72,6 +72,7 @@ pub mod component;
 pub mod component_store;
 pub mod entity;
 pub mod handle;
+pub mod handle_ledger;
 pub mod lease;
 pub mod liveness;
 pub mod page;
@@ -115,7 +116,9 @@ pub use gpu::{
     DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror,
     GpuBufferDispatch, GpuBufferRegistry, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
     GpuMirrorRegistration, GpuUploadSource, GrowableGpuBufferDispatch, GrowableSceneBuffer,
-    MirrorMode, UploadMapperFn, VarLenGpuPool, VarLenHandle,
+    MaterializationSpec, MirrorMode, Segment, Tier, TierConfig, TierError, TierFetch,
+    TierPeek, TierSelector, TierSpan, TierStats, UploadMapperFn, VarLenGpuPool, VarLenHandle,
+    register_segment_layout,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`
@@ -137,6 +140,7 @@ pub use subsystem::{Subsystem, SubsystemRegistry};
 #[cfg(feature = "gpu")]
 pub use scene_db::SceneDb;
 pub use handle::Handle;
+pub use handle_ledger::{ContentAddressed, HandleId, HandleLedgerRegistration};
 pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
     condition_passes, CpuSimulateWitness, Delta, DeltaCompressor, DeltaView, decode_archetype_key,
