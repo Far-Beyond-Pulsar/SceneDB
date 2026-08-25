@@ -177,6 +177,10 @@ name = "gpu_heavy_once"
 required-features = ["gpu"]
 
 [[test]]
+name = "gpu_heavy_placement"
+required-features = ["gpu"]
+
+[[test]]
 name = "gpu_shared_buffer"
 required-features = ["gpu"]
 

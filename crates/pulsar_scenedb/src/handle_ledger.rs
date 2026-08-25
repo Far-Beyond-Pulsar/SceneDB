@@ -136,11 +136,14 @@ unsafe impl crate::page::Pod for HandleId {}
 /// drive (content-addressed dedup of GPU-resident variable-length payloads,
 /// e.g. mesh geometry).
 ///
-/// This crate never computes an id itself — no hashing, no file I/O, no
-/// domain knowledge of what the bytes mean. Implementors (asset wrapper
-/// types living downstream, e.g. Pulsar-Native's `MeshAssetPath`) own that
-/// entirely; this trait is just the narrow seam the derive macro calls
-/// through so `pulsar_scenedb_derive`'s generated code can ask "what
+/// Semantic identity is owned by downstream implementors -- asset wrapper
+/// types like Pulsar-Native's `MeshAssetPath` own the hashing and any file
+/// I/O it needs; this trait is just the narrow seam the derive macro calls
+/// through. (The ONE mechanical id helper in this crate,
+/// `gpu::placement::structural_content_id`, deliberately does NOT flow
+/// through this trait: it byte-folds a row's own reference list for
+/// Heavy-placement fields with no semantic source to name, which is
+/// structural equality, not asset identity.)
 /// identity does this value carry" without needing to know the concrete
 /// type beyond "it implements `ContentAddressed`" (enforced as a normal
 /// trait bound on the generated call, the same way `GpuUploadSource`

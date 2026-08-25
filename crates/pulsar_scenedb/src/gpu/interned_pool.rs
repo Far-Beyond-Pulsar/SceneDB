@@ -23,10 +23,16 @@
 //! # Contract
 //!
 //! - **Identity source**: a value's [`crate::handle_ledger::ContentAddressed::
-//!   content_id`] — this module (and this crate) never hashes bytes or
-//!   parses any domain format. [`HandleId::ZERO`] opts a row out of
-//!   interning entirely (falls back to a private, unshared allocation for
-//!   that write — the zero-value convention, extended to this feature).
+//!   content_id`]. Semantic identity is owned by downstream implementors
+//!   (asset wrapper types like Pulsar-Native's `MeshAssetPath`) -- this
+//!   module still never PARSES any domain format. One mechanical exception
+//!   now lives beside it (`gpu::placement::structural_content_id`): a
+//!   byte-fold over a row's own reference list, used when a Heavy-placement
+//!   field has no explicit content_id sibling to source identity from -- see
+//!   that fn's doc for why it is STRUCTURAL equality, not semantic identity.
+//!   [`HandleId::ZERO`] opts a row out of interning entirely (falls back to
+//!   a private, unshared allocation for that write -- the zero-value
+//!   convention, extended to this feature).
 //! - **First writer wins**: the FIRST `upsert_row` call for a given id
 //!   allocates and uploads; every subsequent call for the SAME id, from any
 //!   row, is a refcount bump and a byte-for-byte no-op upload. This crate

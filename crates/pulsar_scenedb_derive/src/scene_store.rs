@@ -6,6 +6,7 @@ use syn::{
 
 use crate::cell::generate_scene_column_set;
 use crate::gpu::generate_gpu_column_set;
+use crate::ty_shape::{self, TyShape};
 
 // ── #[gpu] attribute parsing ──────────────────────────────────────────────
 
@@ -257,14 +258,45 @@ pub struct FieldInfo {
     /// link-time registration (the ledger event collector) alongside every
     /// classic/var-len artifact the struct already gets.
     pub is_handle: bool,
-    /// The `T` in `Vec<T>`, present iff [`Self::is_var_len`].
+    /// The `T` in `Vec<T>`, present iff [`Self::is_var_len`]. For a
+    /// Heavy-placement field this is the LOWERED pool element (the handle
+    /// type behind `GpuHeavy`), not the field's declared element.
     pub var_len_elem_ty: Option<Type>,
+    /// Which lowering this var-len field uses — see [`VarLenShape`].
+    pub var_len_shape: VarLenShape,
+    /// The `A` behind `Vec<Result<GpuHeavy<A>, _>>`, present only for
+    /// [`VarLenShape::HeavyEither`].
+    pub either_ok_ty: Option<Type>,
+    /// The `B` behind `Vec<Result<_, GpuHeavy<B>>>`, same condition.
+    pub either_err_ty: Option<Type>,
     /// See [`GpuAttr::content_id`]'s doc -- carried through unchanged, plus
     /// the RESOLVED sibling field's own type (looked up by ident against
     /// the struct's other fields once every field has been scanned; `None`
     /// until `var_len.rs`'s validation pass fills it in, alongside checking
     /// the sibling actually exists and this field is `is_var_len`).
     pub content_id_field: Option<Ident>,
+}
+
+/// HOW a var-len field's element type lowers into its GPU pool element —
+/// the per-shape branch every registration/write/release/accessor site in
+/// `var_len.rs` switches on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VarLenShape {
+    /// `Vec<T>` with a Heavy-free element: pool element IS `T`, written by
+    /// passing the field's own slice straight through (today's path,
+    /// byte-identical output).
+    Plain,
+    /// `Vec<GpuHeavy<H>>`: pool element is `H`; the write reinterprets the
+    /// field's slice in place (`repr(transparent)` + `H: Pod` makes the
+    /// bytes identical — zero allocation).
+    HeavyHandle,
+    /// `Vec<Option<GpuHeavy<H>>>`: pool element is `H` with `H: GpuRef`;
+    /// the write maps `None -> H::NULL` into a small per-write buffer.
+    HeavyOptionHandle,
+    /// `Vec<Result<GpuHeavy<A>, GpuHeavy<B>>>`: THREE pools — `{key}::tag`
+    /// (`u32`, 0=Ok/1=Err), `{key}::ok` (A), `{key}::err` (B). Per-row
+    /// invariant: `len(ok) + len(err) == vec.len()`.
+    HeavyEither,
 }
 
 /// Returns `Some(T)` if `ty` is syntactically `Vec<T>` (any path whose last
@@ -277,7 +309,7 @@ pub struct FieldInfo {
 /// shadows the name), and the alternative (requiring the literal path
 /// `std::vec::Vec` or `alloc::vec::Vec`) would reject the overwhelmingly
 /// common bare `Vec<T>` spelling most callers actually write.
-fn as_vec_elem_type(ty: &Type) -> Option<Type> {
+pub(crate) fn as_vec_elem_type(ty: &Type) -> Option<Type> {
     let Type::Path(type_path) = ty else { return None };
     let last = type_path.path.segments.last()?;
     if last.ident != "Vec" {
@@ -291,6 +323,19 @@ fn as_vec_elem_type(ty: &Type) -> Option<Type> {
         syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
     }
+}
+
+/// The macro-expansion-time rejection for a `#[gpu] Vec<..>` element whose
+/// Heavy placement composes deeper than the var-len lowering implements.
+/// Enumerates the supported set verbatim so the error is self-documenting.
+fn unsupported_heavy_composition_error(field: &Ident) -> syn::Error {
+    syn::Error::new_spanned(
+        field,
+        "unsupported #[gpu] Heavy composition. Supported placements: \
+         GpuHeavy<H>, Vec<GpuHeavy<H>>, Vec<Option<GpuHeavy<H>>>, \
+         Vec<Result<GpuHeavy<A>, GpuHeavy<B>>> -- structural nesting beyond \
+         one container over a Heavy boundary is deliberately not implemented",
+    )
 }
 
 /// Whether `ty` is syntactically `HandleId` (a path whose last segment is
@@ -436,8 +481,54 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             )
         });
 
-        let var_len_elem_ty = is_gpu.then(|| as_vec_elem_type(&ty)).flatten();
+        let mut var_len_elem_ty = is_gpu.then(|| as_vec_elem_type(&ty)).flatten();
         let is_var_len = var_len_elem_ty.is_some();
+
+        // Heavy-placement lowering (Phase 3): classify HOW this var-len
+        // field's element reaches its GPU pool. A Heavy-free element keeps
+        // today's exact behavior — pool element IS the declared element,
+        // whatever it is (including its existing compile errors when that
+        // element was never Pod to begin with). A Heavy-containing element
+        // must match one of the four supported placements exactly;
+        // anything deeper is a compile error naming the supported set, not
+        // a quiet miscompile.
+        let mut var_len_shape = VarLenShape::Plain;
+        let mut either_ok_ty: Option<Type> = None;
+        let mut either_err_ty: Option<Type> = None;
+        if is_gpu && is_var_len {
+            let shape = ty_shape::analyze(var_len_elem_ty.as_ref().expect("is_var_len implies elem"));
+            if shape.contains_heavy() {
+                match shape {
+                    TyShape::Heavy(handle) => {
+                        var_len_shape = VarLenShape::HeavyHandle;
+                        var_len_elem_ty = Some(handle);
+                    }
+                    TyShape::Optional(inner) => match *inner {
+                        TyShape::Heavy(handle) => {
+                            var_len_shape = VarLenShape::HeavyOptionHandle;
+                            var_len_elem_ty = Some(handle);
+                        }
+                        _ => return Err(unsupported_heavy_composition_error(&ident)),
+                    },
+                    TyShape::Either(ok, err) => match (*ok, *err) {
+                        (TyShape::Heavy(a), TyShape::Heavy(b)) => {
+                            var_len_shape = VarLenShape::HeavyEither;
+                            either_ok_ty = Some(a.clone());
+                            either_err_ty = Some(b);
+                            // The tag pool's element is u32; the ok/err
+                            // pools' elements are `a`/`b` — tracked in the
+                            // pair fields above, so the shared elem slot
+                            // carries `a`.
+                            var_len_elem_ty = Some(a);
+                        }
+                        _ => return Err(unsupported_heavy_composition_error(&ident)),
+                    },
+                    TyShape::List(_) => return Err(unsupported_heavy_composition_error(&ident)),
+                    TyShape::Leaf(_) => unreachable!("contains_heavy true on a Leaf"),
+                }
+            }
+        }
+
         // Handle detection is independent of `#[gpu]` and of the var-len
         // fork: a `HandleId` field is ordinary Pod data wherever it
         // appears. It only ever ADDS the ledger registration below.
@@ -455,6 +546,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             is_handle,
             var_len_elem_ty,
             content_id_field,
+            var_len_shape,
+            either_ok_ty,
+            either_err_ty,
         });
     }
 
