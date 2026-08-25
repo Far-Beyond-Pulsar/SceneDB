@@ -523,6 +523,39 @@ pub fn write_interned_var_len_field_at_row<
     store.mark_gpu_row_dirty(handle_component_id, row, handle_bytes);
 }
 
+/// Explicit-id twin of [`write_interned_var_len_field_at_row`] -- for
+/// Heavy-placement fields whose content identity is STRUCTURAL (a byte-fold
+/// over the row's own reference list, `gpu::structural_content_id`) rather
+/// than sourced from a named `ContentAddressed` sibling field. Everything
+/// else -- pool lookup tolerance, refcount/upsert semantics, handle-table
+/// write -- is byte-for-byte that function's behavior.
+pub fn write_interned_var_len_field_with_id_at_row<
+    T: crate::page::Pod + Send + Sync + crate::token::HasTypeToken + 'static,
+>(
+    store: &SceneGpuStore,
+    queue: &wgpu::Queue,
+    pool_key: crate::gpu::BufferKey,
+    handle_component_id: ComponentId,
+    row: u32,
+    content_id: crate::handle_ledger::HandleId,
+    data: &[T],
+) {
+    let Some(pool) = store.interned_var_len_pool::<T>(pool_key) else {
+        return;
+    };
+    let handle = pool.upsert_row(queue, row, content_id, data);
+
+    // SAFETY: `VarLenHandle` is `Pod`, exactly `size_of::<VarLenHandle>()`
+    // bytes -- same argument as `write_interned_var_len_field_at_row`'s
+    // identical block.
+    let handle_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &handle as *const crate::gpu::VarLenHandle as *const u8,
+            std::mem::size_of::<crate::gpu::VarLenHandle>(),
+        )
+    };
+    store.mark_gpu_row_dirty(handle_component_id, row, handle_bytes);
+}
 /// Despawn/removal release for a PLAIN (non-interned) `Vec<T>`-typed
 /// `#[gpu]` field — fixes the pre-existing gap where neither
 /// `World::despawn_inner` nor `World::remove_inner` ever freed a var-len

@@ -25,6 +25,7 @@ mod grid;
 mod harvest;
 mod interned_pool;
 mod phase;
+mod placement;
 mod readback;
 mod region;
 mod scatter_write;
@@ -63,6 +64,7 @@ pub use harvest::{
     revalidate_run, HarvestLease, HarvestPipeline, HarvestStaging, HarvestStats, MeshClass, View,
 };
 pub use interned_pool::InternedVarLenPool;
+pub use placement::{GpuHeavy, GpuRef, structural_content_id};
 pub use phase::{BoundaryPhase, CompactedPhase, FrameDriver, HarvestPhase, RetiredPhase, SimulateA, SimulateB, SimulateWitness};
 pub use readback::{readback_bytes, readback_row};
 pub use region::{RegionPool, RegionError};
@@ -83,7 +85,7 @@ pub use var_len_pool::{VarLenBufferRef, VarLenGpuPool, VarLenHandle};
 pub use view_upload::ViewTokenBuffers;
 pub use world_mirror::{
     free_interned_var_len_field_at_row, free_var_len_field_at_row, write_gpu_columns_at_row,
-    write_interned_var_len_field_at_row, write_var_len_field_at_row, GenerationMirror,
+    write_interned_var_len_field_at_row, write_interned_var_len_field_with_id_at_row, write_var_len_field_at_row, GenerationMirror,
     GpuMirrorHandle, GpuMirrorRegistration, VarLenReleaseRegistration,
 };
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)
