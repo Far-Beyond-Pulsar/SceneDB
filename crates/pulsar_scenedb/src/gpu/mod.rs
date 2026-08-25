@@ -31,6 +31,8 @@ mod scatter_write;
 mod scene_store;
 mod slot_allocator;
 mod system_binding;
+mod tier;
+mod tier_layout;
 mod tracker;
 mod var_len_pool;
 mod view_upload;
@@ -71,6 +73,11 @@ pub use scene_store::{
 };
 pub use slot_allocator::{SlotAllocator, SlotHandle};
 pub use system_binding::{BufferBinding, BufferResolveError, GpuSystemContext};
+pub use tier::{
+    MaterializationSpec, Tier, TierAuditKey, TierAuditRecord, TierConfig, TierError, TierFetch,
+    TierPeek, TierSelector, TierSpan, TierStats,
+};
+pub use tier_layout::{register_segment_layout, register_segment_layout_for_type, LayoutError, Segment};
 pub use tracker::SubmissionTracker;
 pub use var_len_pool::{VarLenBufferRef, VarLenGpuPool, VarLenHandle};
 pub use view_upload::ViewTokenBuffers;

@@ -700,6 +700,39 @@ impl World {
         })
     }
 
+    /// Tier demand verb (`touch(id | row, range | whole, target_tier)`),
+    /// threaded to the attached mirror's store. Movement happens at the
+    /// next [`Self::flush_gpu_mirror`] — see `gpu::tier`'s module doc for
+    /// the full contract and the ordering promise. Requires a mirror to be
+    /// attached; otherwise a loud [`TierError::NotConfigured`](crate::gpu::TierError)
+    /// (a `World` with no GPU seam has no tiers to move).
+    #[cfg(feature = "gpu")]
+    pub fn touch_tier(
+        &self,
+        sel: crate::gpu::TierSelector,
+        span: crate::gpu::TierSpan,
+        target: crate::gpu::Tier,
+    ) -> Result<(), crate::gpu::TierError> {
+        match &self.gpu_mirror {
+            Some(m) => m.store().touch_tier(sel, span, target),
+            None => Err(crate::gpu::TierError::NotConfigured),
+        }
+    }
+
+    /// Withdraw-demand counterpart to [`Self::touch_tier`] — see that
+    /// method and `gpu::tier`'s module doc.
+    #[cfg(feature = "gpu")]
+    pub fn release_tier(
+        &self,
+        sel: crate::gpu::TierSelector,
+        span: crate::gpu::TierSpan,
+    ) -> Result<(), crate::gpu::TierError> {
+        match &self.gpu_mirror {
+            Some(m) => m.store().release_tier(sel, span),
+            None => Err(crate::gpu::TierError::NotConfigured),
+        }
+    }
+
     /// Reserves capacity `n` on every registered World-mirrored GPU buffer
     /// right now, ahead of a known-size batch of upcoming inserts — moves
     /// what would otherwise be an unpredictable, mid-batch reallocation

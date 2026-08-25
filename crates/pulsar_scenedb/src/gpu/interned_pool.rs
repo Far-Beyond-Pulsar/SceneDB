@@ -72,6 +72,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use super::tier::{TierAuditKey, TierAuditRecord, TierEngine, TieredInternedHooks, StaticSnapshot};
 use super::var_len_pool::VarLenGpuPool;
 use super::VarLenHandle;
 use crate::handle_ledger::HandleId;
@@ -82,10 +83,40 @@ use crate::page::Pod;
 /// what was actually uploaded (for the collision diagnostic — see the
 /// module doc's "Collision policy"; NOT a retained copy of the payload
 /// itself, matching `GeometryArena`'s "no CPU copy" precedent).
+///
+/// The `residency` field is #61 §1's per-id tier metadata — the STATIC
+/// class record. It is deliberately metadata-ONLY (`StaticResidency`): a
+/// static entry never moves at runtime, so the tier engine owns no data
+/// plane for it, and this pool's ordinary upload/free behavior is
+/// byte-for-byte what it was before tiering existed (the hard regression
+/// gate of #61 §2). See that type's doc for the exact semantics.
 struct InternEntry {
     range: VarLenHandle,
     refcount: u64,
     fingerprint: u64,
+    residency: StaticResidency,
+}
+
+/// STATIC-class residency record (#61 §2): promote-once-at-intern, pinned
+/// while referenced, demote only at drop-to-zero. Concretely:
+///
+/// - `tier` freezes at [`super::tier::Tier::Ram`] — the approved write
+///   landing zone. The ordinary mirror upload that accompanies the intern
+///   is today's pre-existing behavior, not a tier-engine placement; the
+///   record answers "what does the tier system consider authoritative",
+///   which for a never-moving asset is its write-time state.
+/// - `pinned` is implicit in EXISTENCE: an entry exists exactly while its
+///   refcount is above zero, so every live record is pinned by
+///   construction and LRU eviction can never select it (it isn't in any
+///   dynamic candidate set to begin with). Demotion requests error loudly
+///   ([`super::tier::TierError::Pinned`]).
+/// - At drop-to-zero the whole entry (record included) is removed by the
+///   same deterministic free #632 shipped — nothing extra to do, nothing
+///   to leak.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticResidency {
+    pub tier: super::tier::Tier,
+    pub last_use: u64,
 }
 
 #[derive(Default)]
@@ -142,6 +173,11 @@ impl InternState {
 pub struct InternedVarLenPool<T: Pod> {
     pool: Arc<VarLenGpuPool<T>>,
     state: RwLock<InternState>,
+    /// Tier engine hookup — `None` for standalone constructions (unit
+    /// tests, non-store callers); the store's registration path attaches
+    /// it. `None` only means tier verbs route nowhere and residency stamps
+    /// use the epoch default; intern/dedup/free behavior is IDENTICAL.
+    engine: RwLock<Option<(Arc<TierEngine>, super::BufferKey)>>,
 }
 
 /// Cheap, non-cryptographic fingerprint of a `Pod` slice's bytes — good
@@ -159,7 +195,13 @@ fn fingerprint<T: Pod>(data: &[T]) -> u64 {
 
 impl<T: Pod + Send + Sync + 'static> InternedVarLenPool<T> {
     pub fn new(pool: Arc<VarLenGpuPool<T>>) -> Self {
-        Self { pool, state: RwLock::new(InternState::default()) }
+        Self { pool, state: RwLock::new(InternState::default()), engine: RwLock::new(None) }
+    }
+
+    /// Attaches the tier engine (the store's registration path calls this;
+    /// see the field doc). Registration-time only.
+    pub(crate) fn set_tier_participation(&self, engine: Arc<TierEngine>, key: super::BufferKey) {
+        *self.engine.write().expect("InternedVarLenPool engine lock poisoned") = Some((engine, key));
     }
 
     /// The underlying plain pool — for buffer-binding call sites that only
@@ -261,7 +303,21 @@ impl<T: Pod + Send + Sync + 'static> InternedVarLenPool<T> {
                 .pool
                 .write_var_row(queue, VarLenHandle::default(), data)
                 .expect("interned var-len pool grows transparently, same no-capacity-ceiling contract as VarLenGpuPool itself");
-            state.entries.insert(new_id, InternEntry { range, refcount: 1, fingerprint: fingerprint(data) });
+            let last_use = self
+                .engine
+                .read()
+                .expect("InternedVarLenPool engine lock poisoned")
+                .as_ref()
+                .map_or(0, |(engine, _)| engine.stamp());
+            state.entries.insert(
+                new_id,
+                InternEntry {
+                    range,
+                    refcount: 1,
+                    fingerprint: fingerprint(data),
+                    residency: StaticResidency { tier: super::tier::Tier::Ram, last_use },
+                },
+            );
             range
         };
 
@@ -327,6 +383,55 @@ impl<T: Pod + Send + Sync + 'static> InternedVarLenPool<T> {
             .iter()
             .map(|(&id, e)| (id, e.refcount, e.range.count as u64 * elem_size))
             .collect()
+    }
+}
+
+/// The flush executor's read-mostly view over this pool's STATIC records —
+/// see [`TieredInternedHooks`] in `tier.rs`. Statics never transition;
+/// they get stamped on demand and audited exactly.
+impl<T: Pod + Send + Sync + 'static> TieredInternedHooks for InternedVarLenPool<T> {
+    fn static_snapshot(&self, id: HandleId) -> Option<StaticSnapshot> {
+        let state = self.state.read().expect("InternedVarLenPool lock poisoned");
+        let elem_size = std::mem::size_of::<T>() as u64;
+        state.entries.get(&id).map(|e| StaticSnapshot {
+            last_use: e.residency.last_use,
+            byte_len: e.range.count as u64 * elem_size,
+        })
+    }
+
+    fn stamp_static(&self, id: HandleId) {
+        let stamp = self
+            .engine
+            .read()
+            .expect("InternedVarLenPool engine lock poisoned")
+            .as_ref()
+            .map_or(0, |(engine, _)| engine.stamp());
+        let mut state = self.state.write().expect("InternedVarLenPool lock poisoned");
+        if let Some(entry) = state.entries.get_mut(&id) {
+            entry.residency.last_use = stamp;
+        }
+    }
+
+    fn audit_records(&self, key: super::BufferKey) -> Vec<TierAuditRecord> {
+        let state = self.state.read().expect("InternedVarLenPool lock poisoned");
+        let mut out: Vec<TierAuditRecord> = state
+            .entries
+            .iter()
+            .map(|(&id, e)| TierAuditRecord {
+                key: TierAuditKey::Interned(key, id),
+                tier: e.residency.tier,
+                generation: 0,
+                last_use: e.residency.last_use,
+                pinned: true,
+                vram_bytes: 0, // statics' VRAM footprint is the mirror's own upload, not engine accounting
+                staging_bytes: 0, // metadata-only residency (see StaticResidency's doc)
+            })
+            .collect();
+        out.sort_by_key(|rec| match rec.key {
+            TierAuditKey::Interned(_, id) => id.0,
+            _ => 0,
+        });
+        out
     }
 }
 

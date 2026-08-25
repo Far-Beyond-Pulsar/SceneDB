@@ -21,6 +21,7 @@ use crate::component::{component_id, ComponentId};
 use crate::handle::Handle;
 use crate::spatial::InstanceInfo;
 use crate::token::HasTypeToken;
+use super::tier::{Tier, TierAuditKey, TierSpan};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
@@ -439,6 +440,15 @@ pub struct SceneGpuStore {
     /// practice does. See `crate::gpu::interned_pool`'s module doc for the
     /// mechanism this backs.
     interned_var_len_pools: RwLock<HashMap<BufferKey, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Tiered-storage substrate (SceneDB#61): the shared engine (clock,
+    /// arenas, pending queue, budgets, fetch registry) plus the type-erased
+    /// per-class registries flush mediates through. Always present — until
+    /// [`Self::configure_tiers`] nothing queues or moves and every verb is
+    /// a loud [`super::tier::TierError::NotConfigured`], so an unconfigured
+    /// store behaves exactly like a pre-tier one.
+    tier_engine: Arc<super::tier::TierEngine>,
+    tier_pools: RwLock<HashMap<BufferKey, Arc<dyn super::tier::TieredPoolHooks>>>,
+    tier_interned: RwLock<HashMap<BufferKey, Arc<dyn super::tier::TieredInternedHooks>>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -526,6 +536,9 @@ impl SceneGpuStore {
             dirty_tracked_gpu_buffers: RwLock::new(HashMap::new()),
             var_len_pools: RwLock::new(HashMap::new()),
             interned_var_len_pools: RwLock::new(HashMap::new()),
+            tier_engine: Arc::new(super::tier::TierEngine::new()),
+            tier_pools: RwLock::new(HashMap::new()),
+            tier_interned: RwLock::new(HashMap::new()),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -1942,6 +1955,22 @@ impl SceneGpuStore {
         initial_capacity: u32,
         device: &Arc<wgpu::Device>,
     ) -> Arc<crate::gpu::VarLenGpuPool<T>> {
+        self.register_var_len_gpu_pool_inner::<T>(key, initial_capacity, device, true)
+    }
+
+    /// The shared implementation behind [`Self::register_var_len_gpu_pool`]
+    /// and [`Self::register_interned_var_len_gpu_pool`] — identical except
+    /// for tier participation: PLAIN pools join the tiered substrate
+    /// (#61's dynamic class); interned UNDERLAYS deliberately do not
+    /// (statics have no tier data plane, and an underlay must never stage
+    /// its payloads — that would double-handle every intern write).
+    fn register_var_len_gpu_pool_inner<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+        initial_capacity: u32,
+        device: &Arc<wgpu::Device>,
+        tier_participation: bool,
+    ) -> Arc<crate::gpu::VarLenGpuPool<T>> {
         let mut pools = self.var_len_pools.write().expect("SceneGpuStore var_len_pools lock poisoned");
         if let Some(existing) = pools.get(&key) {
             return Arc::clone(existing)
@@ -1970,6 +1999,13 @@ impl SceneGpuStore {
             initial_capacity,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         ));
+        if tier_participation {
+            pool.set_tier_participation(Arc::clone(&self.tier_engine), key);
+            self.tier_pools
+                .write()
+                .expect("SceneGpuStore tier_pools lock poisoned")
+                .insert(key, Arc::clone(&pool) as Arc<dyn super::tier::TieredPoolHooks>);
+        }
         pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
         pool
     }
@@ -2015,8 +2051,13 @@ impl SceneGpuStore {
                 )
             });
         }
-        let underlying = self.register_var_len_gpu_pool::<T>(key, initial_capacity, device);
+        let underlying = self.register_var_len_gpu_pool_inner::<T>(key, initial_capacity, device, false);
         let pool = Arc::new(crate::gpu::InternedVarLenPool::new(underlying));
+        pool.set_tier_participation(Arc::clone(&self.tier_engine), key);
+        self.tier_interned
+            .write()
+            .expect("SceneGpuStore tier_interned lock poisoned")
+            .insert(key, Arc::clone(&pool) as Arc<dyn super::tier::TieredInternedHooks>);
         pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
         pool
     }
@@ -2035,6 +2076,1001 @@ impl SceneGpuStore {
         pools.get(&key)?.clone().downcast::<crate::gpu::InternedVarLenPool<T>>().ok()
     }
 
+    // ── Tiered storage substrate (SceneDB#61 §4–§5) ──────────────────────
+    //
+    // The demand API, flush-executed transitions, budget/LRU policy, and
+    // audit surface. See `gpu::tier`'s module doc for the contract; the
+    // methods below are its orchestration over the three storage classes.
+
+    /// The ONE consumer configuration call (#61 §4): installs byte budgets
+    /// and any texture materialization bindings in a single stroke.
+    /// Consumers map their own engine settings into these two numbers;
+    /// SceneDB learns nothing about where they came from. Idempotent;
+    /// reconfiguration replaces budgets and never touches live entries.
+    pub fn configure_tiers(&self, cfg: super::tier::TierConfig, materializations: &[super::tier::MaterializationSpec]) -> Result<(), super::tier::TierError> {
+        self.tier_engine.configure(cfg, 256);
+        for spec in materializations {
+            self.tier_engine.bind_texture(&self.device, spec, None)?;
+        }
+        Ok(())
+    }
+
+    /// Demand residency (`touch(id | row, range | whole, target_tier)`).
+    /// Queues intents only — movement happens at the next flush. Touching
+    /// a target at or below the current tier is a satisfied no-op (demand
+    /// UP only; use [`Self::release_tier`] to go down). Stamps `last_use`
+    /// either way — that part is demand, not movement.
+    pub fn touch_tier(
+        &self,
+        sel: super::tier::TierSelector,
+        span: super::tier::TierSpan,
+        target: super::tier::Tier,
+    ) -> Result<(), super::tier::TierError> {
+        if self.tier_engine.configured().is_none() {
+            return Err(super::tier::TierError::NotConfigured);
+        }
+        let through_rank = match span {
+            super::tier::TierSpan::Whole => u32::MAX,
+            super::tier::TierSpan::ThroughRank(r) => r,
+        };
+        match sel {
+            super::tier::TierSelector::Interned { pool, id } => {
+                // STATIC class: pinned at its write-time residency while
+                // referenced; touch = a demand stamp, never a move.
+                let hooks = self.tier_interned.read().expect("SceneGpuStore tier_interned lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                if hooks.static_snapshot(id).is_some() {
+                    hooks.stamp_static(id);
+                    Ok(())
+                } else {
+                    Err(super::tier::TierError::UnknownResource)
+                }
+            }
+            super::tier::TierSelector::PoolSlot { pool, handle } => {
+                let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                let st = hooks.slot_state(handle.offset as u64).ok_or(super::tier::TierError::UnknownResource)?;
+                if st.count != handle.count {
+                    return Err(super::tier::TierError::StaleHandle);
+                }
+                hooks.stamp_slot(handle.offset as u64);
+                // ABSOLUTE demand: the executor clamps to max(live, target)
+                // so a touch never demotes, and last-wins folding makes
+                // racing verb pairs converge on the freshest demand.
+                let effective = target.max(st.tier);
+                let seq = self.tier_engine.tick();
+                self.tier_engine.queue_transition(super::tier::PendingTransition {
+                    target: sel,
+                    kind: super::tier::TransitionKind::SetTo { tier: effective, through_rank },
+                    seq,
+                });
+                Ok(())
+            }
+            super::tier::TierSelector::Row { column, row } => {
+                if self.row_stride_for(column).is_none() {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                let table = self.tier_engine.row_table(column);
+                let mut t = table.lock().expect("row tier table poisoned");
+                t.grow_to(row as usize);
+                let current = Tier::from_u8(t.tier[row as usize]).unwrap_or(Tier::Ram);
+                t.last_use[row as usize] = self.tier_engine.stamp();
+                t.present[row as usize] = true;
+                // ABSOLUTE demand (see the pool twin of this block): executor
+                // clamps to max(live, target); last-wins folding converges.
+                let effective = target.max(current);
+                drop(t);
+                let seq = self.tier_engine.tick();
+                self.tier_engine.queue_transition(super::tier::PendingTransition {
+                    target: sel,
+                    kind: super::tier::TransitionKind::SetTo { tier: effective, through_rank },
+                    seq,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Withdraw demand one or more rungs down the ladder
+    /// (`release_tier(...)`): `Vram` residents demote (reverse-rank order),
+    /// `Ram` residents spill to disk, `Disk` stays put. STATIC entries are
+    /// pinned while referenced ([`TierError::Pinned`](super::tier::TierError));
+    /// they demote only by dropping to zero references (#632 semantics).
+    pub fn release_tier(
+        &self,
+        sel: super::tier::TierSelector,
+        span: super::tier::TierSpan,
+    ) -> Result<(), super::tier::TierError> {
+        if self.tier_engine.configured().is_none() {
+            return Err(super::tier::TierError::NotConfigured);
+        }
+        match sel {
+            super::tier::TierSelector::Interned { .. } => Err(super::tier::TierError::Pinned),
+            super::tier::TierSelector::PoolSlot { pool, handle } => {
+                let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                let st = hooks.slot_state(handle.offset as u64).ok_or(super::tier::TierError::UnknownResource)?;
+                if st.count != handle.count {
+                    return Err(super::tier::TierError::StaleHandle);
+                }
+                let kind = match (st.tier, span) {
+                    // Rank-scoped partial demotes stay relative (they do not
+                    // commute under folding; see fold_kinds).
+                    (Tier::Vram, TierSpan::ThroughRank(r)) => {
+                        super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r))
+                    }
+                    (_, TierSpan::ThroughRank(_)) => {
+                        return Ok(()); // nothing resident above that rank
+                    }
+                    (_, _) => {
+                        let Some(lower) = st.tier.lower() else { return Ok(()) };
+                        super::tier::TransitionKind::SetTo { tier: lower, through_rank: u32::MAX }
+                    }
+                };
+                let seq = self.tier_engine.tick();
+                self.tier_engine.queue_transition(super::tier::PendingTransition {
+                    target: sel,
+                    kind,
+                    seq,
+                });
+                Ok(())
+            }
+            super::tier::TierSelector::Row { column, row } => {
+                if self.row_stride_for(column).is_none() {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                let table = self.tier_engine.row_table(column);
+                let t = table.lock().expect("row tier table poisoned");
+                if row as usize >= t.present.len() || !t.present[row as usize] {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                let current = Tier::from_u8(t.tier[row as usize]).unwrap_or(Tier::Ram);
+                drop(t);
+                let kind = match (current, span) {
+                    (Tier::Vram, TierSpan::ThroughRank(r)) => {
+                        super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r))
+                    }
+                    (_, TierSpan::ThroughRank(_)) => {
+                        return Ok(()); // nothing resident above that rank
+                    }
+                    (_, _) => {
+                        let Some(lower) = current.lower() else { return Ok(()) };
+                        super::tier::TransitionKind::SetTo { tier: lower, through_rank: u32::MAX }
+                    }
+                };
+                let seq = self.tier_engine.tick();
+                self.tier_engine.queue_transition(super::tier::PendingTransition {
+                    target: sel,
+                    kind,
+                    seq,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// The tier-transparent read-side probe: `Resident { generation }` when
+    /// bytes are CPU-readable now, `Pending(fetch)` when they sit on disk
+    /// (the un-spill is queued; complete the fetch after the next flush).
+    /// Generation guards every later read — see [`Self::tier_read`].
+    pub fn tier_peek(
+        &self,
+        sel: super::tier::TierSelector,
+    ) -> Result<super::tier::TierPeek, super::tier::TierError> {
+        if self.tier_engine.configured().is_none() {
+            return Err(super::tier::TierError::NotConfigured);
+        }
+        match sel {
+            super::tier::TierSelector::Interned { pool, id } => {
+                let hooks = self.tier_interned.read().expect("SceneGpuStore tier_interned lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                match hooks.static_snapshot(id) {
+                    // Statics are metadata-resident at their frozen tier; generation is
+                    // structurally constant (never moves ⇒ never re-signed).
+                    Some(_) => Ok(super::tier::TierPeek::Resident { generation: 0 }),
+                    None => Err(super::tier::TierError::UnknownResource),
+                }
+            }
+            super::tier::TierSelector::PoolSlot { pool, handle } => {
+                let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                let st = hooks.slot_state(handle.offset as u64).ok_or(super::tier::TierError::UnknownResource)?;
+                if st.count != handle.count {
+                    return Err(super::tier::TierError::StaleHandle);
+                }
+                match st.tier {
+                    Tier::Vram | Tier::Ram => Ok(super::tier::TierPeek::Resident { generation: st.generation }),
+                    Tier::Disk => {
+                        let fetch = self.tier_engine.open_fetch(sel);
+                        self.tier_engine.queue_transition(super::tier::PendingTransition {
+                            target: sel,
+                            kind: super::tier::TransitionKind::Unspill,                                                seq: self.tier_engine.tick(),
+                        });
+                        Ok(super::tier::TierPeek::Pending(fetch))
+                    }
+                }
+            }
+            super::tier::TierSelector::Row { column, row } => {
+                if self.row_stride_for(column).is_none() {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                let table = self.tier_engine.row_table(column);
+                let t = table.lock().expect("row tier table poisoned");
+                if row as usize >= t.present.len() || !t.present[row as usize] {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                match Tier::from_u8(t.tier[row as usize]).unwrap_or(Tier::Ram) {
+                    Tier::Vram | Tier::Ram => Ok(super::tier::TierPeek::Resident { generation: t.generation[row as usize] }),
+                    Tier::Disk => {
+                        drop(t);
+                        let fetch = self.tier_engine.open_fetch(sel);
+                        self.tier_engine.queue_transition(super::tier::PendingTransition {
+                            target: sel,
+                            kind: super::tier::TransitionKind::Unspill,                                                seq: self.tier_engine.tick(),
+                        });
+                        Ok(super::tier::TierPeek::Pending(fetch))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies the payload's CURRENT bytes into `out` (caller-provided
+    /// window — the crate's established no-alloc read seam shape), guarded
+    /// by the generation the caller validated via [`Self::tier_peek`]. A
+    /// demotion since then errors loudly
+    /// ([`StaleGeneration`](super::tier::TierError)) rather than aliasing
+    /// moved bytes. Disk-resident resources read from their spilled export
+    /// (the demotion-time snapshot); RAM/VRAM residents read live staging /
+    /// the mirror shadow.
+    pub fn tier_read(
+        &self,
+        sel: super::tier::TierSelector,
+        expected_generation: u64,
+        out: &mut [u8],
+    ) -> Result<(), super::tier::TierError> {
+        if self.tier_engine.configured().is_none() {
+            return Err(super::tier::TierError::NotConfigured);
+        }
+        match sel {
+            super::tier::TierSelector::Interned { pool, id } => {
+                // Statics' bytes are VRAM-only (no staging data plane); CPU
+                // reads ride the pre-existing row-indexed mirrors instead.
+                // Peek validates presence; reads are deliberately refused.
+                let hooks = self.tier_interned.read().expect("SceneGpuStore tier_interned lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                match hooks.static_snapshot(id) {
+                    Some(_) => Err(super::tier::TierError::ReadUnsupported),
+                    None => Err(super::tier::TierError::UnknownResource),
+                }
+            }
+            super::tier::TierSelector::PoolSlot { pool, handle } => {
+                let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
+                let st = hooks.slot_state(handle.offset as u64).ok_or(super::tier::TierError::UnknownResource)?;
+                if st.count != handle.count {
+                    return Err(super::tier::TierError::StaleHandle);
+                }
+                if st.generation != expected_generation {
+                    return Err(super::tier::TierError::StaleGeneration { expected: expected_generation, current: st.generation });
+                }
+                if out.len() as u64 != st.staged_len {
+                    return Err(super::tier::TierError::LengthMismatch { expected: st.staged_len, provided: out.len() as u64 });
+                }
+                if hooks.copy_staged_window(handle.offset as u64, 0, out) {
+                    Ok(())
+                } else {
+                    Err(super::tier::TierError::NotYetReady)
+                }
+            }
+            super::tier::TierSelector::Row { column, row } => {
+                let Some(stride) = self.row_stride_for(column) else {
+                    return Err(super::tier::TierError::UnknownResource);
+                };
+                let table = self.tier_engine.row_table(column);
+                let t = table.lock().expect("row tier table poisoned");
+                if row as usize >= t.present.len() || !t.present[row as usize] {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                let gen = t.generation[row as usize];
+                let spilled = t.spilled[row as usize];
+                let disk_slot = t.disk_slot[row as usize];
+                drop(t);
+                if gen != expected_generation {
+                    return Err(super::tier::TierError::StaleGeneration { expected: expected_generation, current: gen });
+                }
+                if out.len() != stride as usize {
+                    return Err(super::tier::TierError::LengthMismatch { expected: stride, provided: out.len() as u64 });
+                }
+                if spilled {
+                    if self.tier_engine.copy_disk_window(disk_slot, 0, out) {
+                        Ok(())
+                    } else {
+                        Err(super::tier::TierError::NotYetReady)
+                    }
+                } else {
+                    // RAM home for rows is the dirty-tracked shadow itself.
+                    let Some(bytes) = self.read_dirty_tracked_row_bytes(column, row) else {
+                        return Err(super::tier::TierError::NotYetReady);
+                    };
+                    if bytes.len() != out.len() {
+                        return Err(super::tier::TierError::LengthMismatch { expected: bytes.len() as u64, provided: out.len() as u64 });
+                    }
+                    out.copy_from_slice(&bytes);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Completes a [`Pending`](super::tier::TierPeek::Pending) fetch after
+    /// its flush executed the un-spill: copies the restored bytes into
+    /// `out` and returns the resource's fresh generation. Completion is
+    /// EXACTLY-ONCE — the ready slot is consumed by construction, so a
+    /// second call lands on [`AlreadyCompleted`](super::tier::TierError)
+    /// forever (#61 test 8).
+    pub fn complete_tier_fetch(
+        &self,
+        fetch: &super::tier::TierFetch,
+        out: &mut [u8],
+    ) -> Result<u64, super::tier::TierError> {
+        let sel = self.tier_engine.claim_fetch(fetch)?;
+        let generation = match sel {
+            super::tier::TierSelector::Interned { .. } => 0,
+            super::tier::TierSelector::PoolSlot { pool, handle } => {
+                self.tier_pools
+                    .read()
+                    .expect("SceneGpuStore tier_pools lock poisoned")
+                    .get(&pool)
+                    .and_then(|h| h.slot_state(handle.offset as u64))
+                    .map(|st| st.generation)
+                    .ok_or(super::tier::TierError::UnknownResource)?
+            }
+            super::tier::TierSelector::Row { column, row } => {
+                let table = self.tier_engine.row_table(column);
+                let t = table.lock().expect("row tier table poisoned");
+                if row as usize >= t.generation.len() {
+                    return Err(super::tier::TierError::UnknownResource);
+                }
+                t.generation[row as usize]
+            }
+        };
+        self.tier_read(sel, generation, out)?;
+        Ok(generation)
+    }
+
+    /// Executes every queued transition — promotions (per-rank budget
+    /// admission, ascending rank order, buffer→texture materialization for
+    /// bound pools), demotions (reverse rank order, ranges returned to the
+    /// freelist), spills/un-spills, liveness-guard cancellations — then
+    /// reconciles RAM-budget pressure by spilling least-recently-used
+    /// staging. Called automatically at the END of
+    /// [`Self::flush_gpu_mirror`] (after dirty-column uploads, per the
+    /// documented ordering promise); callable directly for consumers that
+    /// want the stats without a full mirror flush.
+    pub fn flush_tier_transitions(&self, queue: &wgpu::Queue) -> super::tier::TierStats {
+        let mut stats = super::tier::TierStats::default();
+        if self.tier_engine.configured().is_none() {
+            return stats;
+        }
+        // Per-shard drain-and-execute under the shard lock: preserves
+        // per-id FIFO across overlapping flushes (see
+        // TierEngine::for_each_shard_batch). Fold per target within each
+        // batch; stats accumulate across shards.
+        self.tier_engine.for_each_shard_batch(|batch| {
+            let mut order: Vec<super::tier::TierSelector> = Vec::new();
+            let mut grouped: HashMap<super::tier::TierSelector, Vec<(super::tier::TransitionKind, u64)>> = HashMap::new();
+            for t in batch {
+                let kinds = grouped.entry(t.target).or_insert_with(|| {
+                    order.push(t.target);
+                    Vec::new()
+                });
+                kinds.push((t.kind, t.seq));
+            }
+            for target in order {
+                let pairs = grouped.remove(&target).unwrap_or_default();
+                let kinds: Vec<super::tier::TransitionKind> = pairs.iter().map(|(k, _)| *k).collect();
+                let last_seq = pairs.last().map(|(_, s)| *s).unwrap_or(0);
+                for kind in super::tier::fold_kinds(&kinds) {
+                    match target {
+                        super::tier::TierSelector::Interned { .. } => {
+                            stats.cancelled += 1;
+                        }
+                        super::tier::TierSelector::PoolSlot { pool, handle } => {
+                            let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned();
+                            let Some(hooks) = hooks else { stats.cancelled += 1; continue };
+                            let Some(st) = hooks.slot_state(handle.offset as u64) else { stats.cancelled += 1; continue };
+                            if st.count != handle.count {
+                                stats.cancelled += 1;
+                                continue;
+                            }
+                            if !hooks.claim_seq(handle.offset as u64, last_seq) {
+                                stats.cancelled += 1;
+                                continue;
+                            }
+                            self.execute_pool_transition(hooks.as_ref(), pool, &target, kind, handle.offset as u64, st, queue, &mut stats);
+                        }
+                        super::tier::TierSelector::Row { column, row } => {
+                            let Some(stride) = self.row_stride_for(column) else { stats.cancelled += 1; continue };
+                            self.execute_row_transition_claimed(column, row, &target, kind, last_seq, stride, queue, &mut stats);
+                        }
+                    }
+                }
+            }
+        });        self.reconcile_ram_pressure(&mut stats);
+        stats
+    }
+
+    /// Bytes the tier engine currently accounts as placed in VRAM — the
+    /// live side of `TierConfig::vram_budget_bytes`, for budget assertions
+    /// in audits/benchmarks.
+    pub fn tier_vram_used(&self) -> u64 {
+        self.tier_engine.vram_used()
+    }
+
+    /// The SceneDB-owned texture bound as `source_pool`'s materialization
+    /// target, if one was configured. Ownership stays here (C0/§10-G4);
+    /// consumers build VIEWS, never manage lifetime.
+    pub fn tier_texture(&self, source_pool: &BufferKey) -> Option<wgpu::Texture> {
+        self.tier_engine.texture_binding(source_pool).map(|b| b.texture.clone())
+    }
+
+    /// Exact residency state of every entry the engine tracks, sorted
+    /// deterministically for exact-state assertions.
+    pub fn tier_audit(&self) -> Vec<super::tier::TierAuditRecord> {
+        let mut out: Vec<super::tier::TierAuditRecord> = Vec::new();
+        for (&key, hooks) in self.tier_interned.read().expect("SceneGpuStore tier_interned lock poisoned").iter() {
+            out.extend(hooks.audit_records(key));
+        }
+        for (&key, hooks) in self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").iter() {
+            out.extend(hooks.audit_records(key));
+        }
+        for (column, table) in self.tier_engine.row_tables() {
+            let t = table.lock().expect("row tier table poisoned");
+            for row in 0..t.present.len() {
+                if !t.present[row] {
+                    continue;
+                }
+                let vram: u64 = t.seg_ranges[row].iter().map(|(_, rng)| rng.len).sum();
+                out.push(super::tier::TierAuditRecord {
+                    key: super::tier::TierAuditKey::Row(column, row as u32),
+                    tier: Tier::from_u8(t.tier[row]).unwrap_or(Tier::Ram),
+                    generation: t.generation[row],
+                    last_use: t.last_use[row],
+                    pinned: false,
+                    vram_bytes: vram,
+                    staging_bytes: 0,
+                });
+            }
+        }
+        out.sort_by(|a, b| audit_key_order(a.key, b.key));
+        out
+    }
+    fn row_stride_for(&self, id: ComponentId) -> Option<u64> {
+        let key = self.column_keys.read().expect("SceneGpuStore column_keys lock poisoned").get(&id).cloned()?;
+        let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
+        let owner = owners.get(&key)?;
+        Some(owner.element_size as u64)
+    }
+
+    /// Column ELEMENT TYPE for flight-plan layout lookup (same metadata).
+    fn row_payload_type_for(&self, id: ComponentId) -> Option<std::any::TypeId> {
+        let key = self.column_keys.read().expect("SceneGpuStore column_keys lock poisoned").get(&id).cloned()?;
+        let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
+        let owner = owners.get(&key)?;
+        Some(owner.element_type_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_pool_transition(
+        &self,
+        hooks: &dyn super::tier::TieredPoolHooks,
+        pool_key: BufferKey,
+        target: &super::tier::TierSelector,
+        kind: super::tier::TransitionKind,
+        offset: u64,
+        st: super::tier::SlotState,
+        queue: &wgpu::Queue,
+        stats: &mut super::tier::TierStats,
+    ) {
+        match kind {
+            super::tier::TransitionKind::SetTo { tier: target_tier, through_rank } => {
+                // Stepwise absolute move: every intermediate rung uses the
+                // exact bookkeeping its single-intent arm produces.
+                let mut st = hooks.slot_state(offset).unwrap_or(st);
+                while st.tier < target_tier {
+                    if st.spilled {
+                        hooks.unspill_staging(offset);
+                        stats.unspilled += 1;
+                    }
+                    let before = st.tier;
+                    let fresh = hooks.slot_state(offset).unwrap_or(st);
+                    self.flight_pool_promote(hooks, pool_key, offset, fresh, through_rank, queue, stats);
+                    st = hooks.slot_state(offset).unwrap_or(fresh);
+                    if st.tier <= before {
+                        break; // declined/cancelled — stop climbing
+                    }
+                }
+                while st.tier > target_tier {
+                    if st.tier == Tier::Vram {
+                        match hooks.withdraw_top_unit(offset) {
+                            Some((_, range)) => {
+                                self.tier_engine.release_vram(range.len);
+                                stats.demoted += 1;
+                                st = hooks.slot_state(offset).unwrap_or(st);
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    if st.tier == Tier::Ram && target_tier == Tier::Disk {
+                        hooks.spill_staging(offset);
+                        stats.spilled += 1;
+                    }
+                    break;
+                }
+            }
+            super::tier::TransitionKind::Promote { through_rank } => {
+                self.flight_pool_promote(hooks, pool_key, offset, st, through_rank, queue, stats);
+            }
+            super::tier::TransitionKind::Demote(extent) => {
+                // Reverse-rank eviction: pop the highest resident unit until
+                // the extent is satisfied. `resident_ranks` gives the
+                // read-only view that decides when to stop.
+                loop {
+                    let ranks = hooks.resident_ranks(offset);
+                    let Some(&(top_rank, _)) = ranks.last() else { break };
+                    match extent {
+                        super::tier::DemoteExtent::AboveRank(r) if top_rank <= r => break,
+                        _ => {}
+                    }
+                    let Some((_, range)) = hooks.withdraw_top_unit(offset) else { break };
+                    self.tier_engine.release_vram(range.len);
+                    stats.demoted += 1;
+                }
+            }
+            super::tier::TransitionKind::Spill => {
+                // Stale-kind normalization: intents within one id execute in
+                // FIFO order, so a release captured when the resource READ
+                // AS Ram may run AFTER its own sibling promotion committed.
+                // A spill arriving at a Vram-resident slot therefore means
+                // "withdraw demand" — demote everything instead of moving
+                // the backing of something that still owns VRAM ranges
+                // (spilling under residency would strand those ranges).
+                if hooks.slot_state(offset).is_some_and(|st| st.tier == Tier::Vram) {
+                    while let Some((_, range)) = hooks.withdraw_top_unit(offset) {
+                        self.tier_engine.release_vram(range.len);
+                        stats.demoted += 1;
+                    }
+                } else {
+                    hooks.spill_staging(offset);
+                    stats.spilled += 1;
+                }
+            }
+            super::tier::TransitionKind::Unspill => {
+                hooks.unspill_staging(offset);
+                stats.unspilled += 1;
+                self.tier_engine.mark_fetches_ready(target);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_row_transition_claimed(
+        &self,
+        column: ComponentId,
+        row: u32,
+        target: &super::tier::TierSelector,
+        kind: super::tier::TransitionKind,
+        seq: u64,
+        stride: u64,
+        queue: &wgpu::Queue,
+        stats: &mut super::tier::TierStats,
+    ) {
+        assert!(
+            stride & 3 == 0,
+            "tiered fixed-size columns require a 4-byte-aligned row stride \
+             (wgpu write alignment); column {column:?} has stride {stride}"
+        );
+        let table_arc = self.tier_engine.row_table(column);
+        // Liveness + freshness guard BEFORE anything commits: the row must
+        // still be present, and this intent must be newer than anything
+        // already executed for it. Sub-steps below bypass this wrapper
+        // (calling `row_transition_inner` directly) — a SetTo's own steps
+        // share its seq and must not re-claim against themselves.
+        {
+            let mut t = table_arc.lock().expect("row tier table poisoned");
+            t.grow_to(row as usize);
+            let idx = row as usize;
+            if !t.present[idx] {
+                stats.cancelled += 1;
+                return;
+            }
+            if seq <= t.last_seq[idx] {
+                stats.cancelled += 1;
+                return;
+            }
+            t.last_seq[idx] = seq;
+        }
+        self.row_transition_inner(column, row, target, kind, stride, queue, stats);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row_transition_inner(
+        &self,
+        column: ComponentId,
+        row: u32,
+        target: &super::tier::TierSelector,
+        kind: super::tier::TransitionKind,
+        stride: u64,
+        queue: &wgpu::Queue,
+        stats: &mut super::tier::TierStats,
+    ) {
+        let table_arc = self.tier_engine.row_table(column);
+        match kind {
+            super::tier::TransitionKind::SetTo { tier: target_tier, .. } => {
+                // Stepwise absolute move for rows (shadow-backed RAM home).
+                loop {
+                    let live = Tier::from_u8({
+                        let t = table_arc.lock().expect("row tier table poisoned");
+                        t.tier[row as usize]
+                    })
+                    .unwrap_or(Tier::Ram);
+                    match live.cmp(&target_tier) {
+                        std::cmp::Ordering::Equal => break,
+                        std::cmp::Ordering::Less => {
+                            if live == Tier::Disk {
+                                self.row_transition_inner(column, row, target, super::tier::TransitionKind::Unspill, stride, queue, stats);
+                            }
+                            self.row_transition_inner(column, row, target, super::tier::TransitionKind::Promote { through_rank: u32::MAX }, stride, queue, stats);
+                            let now = Tier::from_u8({
+                                let t = table_arc.lock().expect("row tier table poisoned");
+                                t.tier[row as usize]
+                            })
+                            .unwrap_or(Tier::Ram);
+                            if now <= live {
+                                break; // declined/cancelled — stop climbing
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {
+                            self.row_transition_inner(column, row, target, super::tier::TransitionKind::Demote(super::tier::DemoteExtent::All), stride, queue, stats);
+                            let now = Tier::from_u8({
+                                let t = table_arc.lock().expect("row tier table poisoned");
+                                t.tier[row as usize]
+                            })
+                            .unwrap_or(Tier::Ram);
+                            if now > target_tier {
+                                self.row_transition_inner(column, row, target, super::tier::TransitionKind::Spill, stride, queue, stats);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            super::tier::TransitionKind::Promote { through_rank } => {
+                // Rows' RAM home IS the shadow — source directly from it.
+                let Some(shadow) = self.read_dirty_tracked_row_bytes(column, row) else {
+                    stats.cancelled += 1;
+                    return;
+                };
+                if shadow.len() != stride as usize {
+                    stats.cancelled += 1;
+                    return;
+                }
+                let payload_type = self.row_payload_type_for(column);
+                let plan = payload_type.map_or_else(
+                    // No owner metadata (unregistered column reaching here is
+                    // impossible — liveness checked) — the () type id yields
+                    // the atomic default plan, which is correct for rows.
+                    || super::tier::flight_plan(TypeId::of::<()>(), shadow.len() as u64),
+                    |ty| super::tier::flight_plan(ty, shadow.len() as u64),
+                );
+                let target_units = if through_rank == u32::MAX {
+                    plan.len()
+                } else {
+                    plan.iter().take_while(|u| u.rank <= through_rank).count()
+                };
+                let mut t = table_arc.lock().expect("row tier table poisoned");
+                let idx = row as usize;
+                let existing = t.seg_ranges[idx].len().min(target_units);
+                for unit in plan.iter().skip(existing).take(target_units - existing) {
+                    if self.tier_engine.try_reserve_vram(unit.bytes).is_err() {
+                        if !self.evacuate_lru_vram_excluding(unit.bytes, std::slice::from_ref(target), stats) {
+                            stats.declined_budget += 1;
+                            break;
+                        }
+                        if self.tier_engine.try_reserve_vram(unit.bytes).is_err() {
+                            stats.declined_budget += 1;
+                            break;
+                        }
+                    }
+                    let mut committed: Vec<(u32, super::tier::ByteRange)> = Vec::new();
+                    self.with_dirty_tracked_buffer_for_id(column, &mut |buf| {
+                        for &(off, len) in &unit.slices {
+                            queue.write_buffer(buf, row as u64 * stride + off, &shadow[off as usize..(off + len) as usize]);
+                        }
+                        let range = super::tier::ByteRange {
+                            offset: row as u64 * stride,
+                            len: unit.slices.iter().map(|&(_, l)| l).sum::<u64>(),
+                        };
+                        committed.push((unit.rank, range));
+                    });
+                    for (rank, range) in committed {
+                        t.seg_ranges[idx].push((rank, range));
+                        stats.promoted += 1;
+                    }
+                }
+                t.seg_ranges[idx].sort_by_key(|(rank, _)| *rank);
+                if !t.seg_ranges[idx].is_empty() {
+                    t.tier[idx] = Tier::Vram.as_u8();
+                    t.resident_through[idx] = *t.seg_ranges[idx].last().map(|(r, _)| r).unwrap_or(&0);
+                }
+            }
+            super::tier::TransitionKind::Demote(extent) => {
+                let mut t = table_arc.lock().expect("row tier table poisoned");
+                let idx = row as usize;
+                // A plain loop, not `while let`: extents may terminate without popping.
+                #[allow(clippy::while_let_loop)]
+                loop {
+                    let Some(top_i) = t.seg_ranges[idx].iter().enumerate().max_by_key(|(_, (r, _))| *r).map(|(i, _)| i) else { break };
+                    let (rank, range) = t.seg_ranges[idx][top_i];
+                    match extent {
+                        super::tier::DemoteExtent::AboveRank(r) if rank <= r => break,
+                        _ => {}
+                    }
+                    t.seg_ranges[idx].remove(top_i);
+                    self.tier_engine.release_vram(range.len);
+                    t.generation[idx] += 1;
+                    stats.demoted += 1;
+                }
+                if t.seg_ranges[idx].is_empty() {
+                    t.tier[idx] = Tier::Ram.as_u8();
+                    t.resident_through[idx] = 0;
+                } else {
+                    t.resident_through[idx] = *t.seg_ranges[idx].last().map(|(r, _)| r).unwrap_or(&0);
+                }
+            }
+            super::tier::TransitionKind::Spill => {
+                // Stale-kind normalization (see the pool twin of this arm):
+                // a release captured pre-promotion but executing post-
+                // promotion withdraws the VRAM residency instead of
+                // spilling under it.
+                let resident = {
+                    let t = table_arc.lock().expect("row tier table poisoned");
+                    !t.seg_ranges[row as usize].is_empty()
+                };
+                if resident {
+                    let mut t = table_arc.lock().expect("row tier table poisoned");
+                    let idx = row as usize;
+                    for (_, range) in std::mem::take(&mut t.seg_ranges[idx]) {
+                        self.tier_engine.release_vram(range.len);
+                        t.generation[idx] += 1;
+                        stats.demoted += 1;
+                    }
+                    t.tier[idx] = Tier::Ram.as_u8();
+                    t.resident_through[idx] = 0;
+                } else {
+                    // Export the shadow's CURRENT bytes as the demotion-time
+                    // snapshot (module doc: mutations after spill diverge;
+                    // reads of a spilled row serve the snapshot).
+                    let Some(bytes) = self.read_dirty_tracked_row_bytes(column, row) else {
+                        stats.cancelled += 1;
+                        return;
+                    };
+                    let (slot, _) = self.tier_engine.export_row_snapshot(bytes);
+                    let mut t = table_arc.lock().expect("row tier table poisoned");
+                    let idx = row as usize;
+                    t.spilled[idx] = true;
+                    t.disk_slot[idx] = slot;
+                    t.tier[idx] = Tier::Disk.as_u8();
+                    t.generation[idx] += 1;
+                    stats.spilled += 1;
+                }
+            }
+            super::tier::TransitionKind::Unspill => {
+                let mut t = table_arc.lock().expect("row tier table poisoned");
+                let idx = row as usize;
+                if t.spilled[idx] {
+                    self.tier_engine.drop_row_export(t.disk_slot[idx]);
+                    t.spilled[idx] = false;
+                    t.disk_slot[idx] = super::tier::NO_SLOT;
+                    t.tier[idx] = Tier::Ram.as_u8(); // promotion Disk->Ram: no gen bump
+                    stats.unspilled += 1;
+                }
+                drop(t);
+                self.tier_engine.mark_fetches_ready(target);
+            }
+        }
+    }
+
+    /// VRAM bytes currently placed for one pool slot (single-lock probe).
+    fn pool_vram_bytes_of(&self, hooks: &dyn super::tier::TieredPoolHooks, offset: u64) -> u64 {
+        hooks.slot_state(offset).map(|st| st.vram_bytes).unwrap_or(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// One whole-payload promotion flight (used by both the Promote arm and
+    /// `SettleBy` upward legs): inline un-spill sourcing, per-rank budget
+    /// admission with LRU evacuation, staged-byte upload, and whole-payload
+    /// texture materialization when the full prefix lands.
+    fn flight_pool_promote(
+        &self,
+        hooks: &dyn super::tier::TieredPoolHooks,
+        pool_key: BufferKey,
+        offset: u64,
+        st: super::tier::SlotState,
+        through_rank: u32,
+        queue: &wgpu::Queue,
+        stats: &mut super::tier::TierStats,
+    ) {
+        if st.spilled {
+            hooks.unspill_staging(offset);
+        }
+        let payload_bytes = st.staged_len;
+        let plan = super::tier::flight_plan(hooks.payload_type(), payload_bytes);
+        let target_units = if through_rank == u32::MAX {
+            plan.len()
+        } else {
+            plan.iter().take_while(|u| u.rank <= through_rank).count()
+        };
+        let already = hooks.resident_ranks(offset).len().min(target_units);
+        for unit in plan.iter().skip(already).take(target_units - already) {
+            let exclude = [super::tier::TierSelector::PoolSlot {
+                pool: pool_key,
+                handle: crate::gpu::VarLenHandle { offset: offset as u32, count: 0 },
+            }];
+            if self.tier_engine.try_reserve_vram(unit.bytes).is_err() {
+                if !self.evacuate_lru_vram_excluding(unit.bytes, &exclude, stats) {
+                    stats.declined_budget += 1;
+                    break;
+                }
+                if self.tier_engine.try_reserve_vram(unit.bytes).is_err() {
+                    stats.declined_budget += 1;
+                    break;
+                }
+            }
+            let base = unit.slices.first().map(|&(off, _)| off).unwrap_or(0);
+            let mut packed = vec![0u8; unit.bytes as usize];
+            let mut filled = 0usize;
+            let mut rel_slices = Vec::with_capacity(unit.slices.len());
+            for &(off, len) in &unit.slices {
+                let dst = &mut packed[filled..filled + len as usize];
+                if !hooks.copy_staged_window(offset, off, dst) {
+                    self.tier_engine.release_vram(unit.bytes);
+                    stats.cancelled += 1;
+                    return;
+                }
+                rel_slices.push((off - base, len));
+                filled += len as usize;
+            }
+            hooks.admit_rank_unit(queue, offset, unit.rank, &packed, &rel_slices);
+            stats.promoted += 1;
+        }
+        // Whole-payload materialization into a SceneDB-owned texture once
+        // the FULL prefix is resident (#61 §4 buffer-to-texture).
+        if let Some(binding) = self.tier_engine.texture_binding(&pool_key) {
+            let fully_resident = {
+                let total: u64 = plan.iter().map(|u| u.bytes).sum();
+                total > 0 && self.pool_vram_bytes_of(hooks, offset) >= total
+            };
+            if fully_resident {
+                let mut bytes = vec![0u8; payload_bytes as usize];
+                if hooks.copy_staged_window(offset, 0, &mut bytes) {
+                    queue.write_texture(
+                        binding.texture.as_image_copy(),
+                        &bytes,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: if binding.height > 1 { Some(binding.bytes_per_texel_row as u32) } else { None },
+                            rows_per_image: Some(binding.height),
+                        },
+                        wgpu::Extent3d { width: binding.width, height: binding.height, depth_or_array_layers: 1 },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Global LRU evacuation for one admission retry: harvests VRAM-resident
+    /// dynamic candidates across pools AND row tables (statics are not in
+    /// any candidate set — pinned floors by construction), evicts oldest-
+    /// touched until `needed` bytes are free or candidates run out.
+    fn evacuate_lru_vram_excluding(
+        &self,
+        needed: u64,
+        exclude: &[super::tier::TierSelector],
+        stats: &mut super::tier::TierStats,
+    ) -> bool {
+        use super::tier::{VictimCandidate, VictimClass};
+        let mut cands: Vec<VictimCandidate> = Vec::new();
+        for (&key, hooks) in self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").iter() {
+            for (offset, last_use, bytes) in hooks.harvest_vram_candidates() {
+                cands.push(VictimCandidate {
+                    last_use,
+                    vram_bytes: bytes,
+                    class: VictimClass::PoolSlot { pool: key, offset },
+                });
+            }
+        }
+        for (column, table) in self.tier_engine.row_tables() {
+            let t = table.lock().expect("row tier table poisoned");
+            for row in 0..t.present.len() {
+                if !t.present[row] || t.seg_ranges[row].is_empty() {
+                    continue;
+                }
+                let bytes: u64 = t.seg_ranges[row].iter().map(|(_, rng)| rng.len).sum();
+                cands.push(VictimCandidate {
+                    last_use: t.last_use[row],
+                    vram_bytes: bytes,
+                    class: VictimClass::Row { column, row: row as u32 },
+                });
+            }
+        }
+        cands.retain(|c| {
+            let sel = match c.class {
+                VictimClass::PoolSlot { pool, offset } => {
+                    super::tier::TierSelector::PoolSlot { pool, handle: crate::gpu::VarLenHandle { offset: offset as u32, count: 0 } }
+                }
+                VictimClass::Row { column, row } => super::tier::TierSelector::Row { column, row },
+            };
+            !exclude.contains(&sel)
+        });
+        cands.sort_by_key(|c| c.last_use);
+        let mut freed = 0u64;
+        for cand in cands {
+            if freed >= needed {
+                break;
+            }
+            freed += match cand.class {
+                VictimClass::PoolSlot { pool, offset } => {
+                    let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned();
+                    let Some(hooks) = hooks else { continue };
+                    let mut evicted = 0u64;
+                    while let Some((_, range)) = hooks.withdraw_top_unit(offset) {
+                        self.tier_engine.release_vram(range.len);
+                        evicted += range.len;
+                        stats.demoted += 1;
+                    }
+                    evicted
+                }
+                VictimClass::Row { column, row } => {
+                    let table = self.tier_engine.row_table(column);
+                    let mut t = table.lock().expect("row tier table poisoned");
+                    let idx = row as usize;
+                    let mut evicted = 0u64;
+                    for (_, range) in std::mem::take(&mut t.seg_ranges[idx]) {
+                        self.tier_engine.release_vram(range.len);
+                        evicted += range.len;
+                        t.generation[idx] += 1;
+                    }
+                    if evicted > 0 {
+                        t.tier[idx] = Tier::Ram.as_u8();
+                        t.resident_through[idx] = 0;
+                    }
+                    evicted
+                }
+            };
+        }
+        freed >= needed
+    }
+
+    /// Post-flush RAM-budget reconciliation: spill least-recently-used
+    /// staging until the arena account fits the configured budget.
+    fn reconcile_ram_pressure(&self, stats: &mut super::tier::TierStats) {
+        let Some(cfg) = self.tier_engine.configured() else { return };
+        while self.tier_engine.ram_used() > cfg.ram_budget_bytes {
+            // Oldest-stamped staging across participating pools.
+            let mut best: Option<(BufferKey, u64, u64)> = None; // (pool, offset, last_use)
+            for (&key, hooks) in self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").iter() {
+                for (offset, last_use) in hooks.harvest_staging_candidates() {
+                    // is_none_or stabilized after this crate MSRV; same documented allow as is_registered above.
+                    #[allow(clippy::unnecessary_map_or)]
+                    if best.map_or(true, |(_, _, lu)| last_use < lu) {
+                        best = Some((key, offset, last_use));
+                    }
+                }
+            }
+            let Some((pool, offset, _)) = best else { break };
+            let Some(hooks) = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned() else { break };
+            hooks.spill_staging(offset);
+            stats.spilled += 1;
+            stats.pressure_spilled += 1;
+        }
+    }
+
     /// Uploads every row marked dirty (via [`Self::mark_gpu_row_dirty`])
     /// across every dirty-tracked World-mirrored column, coalesced. Call
     /// once per frame — the World-mirror analogue of the cell-mirrored
@@ -2045,6 +3081,15 @@ impl SceneGpuStore {
     /// fields are ALSO registered here (see the `dirty_tracked_gpu_buffers`
     /// field doc for why), so this same loop covers both modes — nothing
     /// extra needed here to make `Once` deferred/batched too.
+    ///
+    /// As of SceneDB#61 this ALSO executes queued tier transitions AFTER the
+    /// dirty uploads — the flush-ordering promise downstream consumers rely
+    /// on (`gpu::tier`'s module doc): anything touched before this call has
+    /// its final residency committed before it returns, with every GPU-side
+    /// effect ordered behind it in the same in-order queue. The tier stats
+    /// are folded into nothing here; consumers that want them call
+    /// [`Self::flush_tier_transitions`] directly (a second drain is a
+    /// harmless no-op).
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
         let mut total = SyncStats { ranges: 0, bytes: 0 };
         for buf in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").values() {
@@ -2052,6 +3097,7 @@ impl SceneGpuStore {
             total.ranges += stats.ranges;
             total.bytes += stats.bytes;
         }
+        let _tier = self.flush_tier_transitions(queue);
         total
     }
 
@@ -2197,5 +3243,28 @@ impl SceneGpuStore {
     /// Per-cell GPU state for telemetry snapshot.
     pub(crate) fn telemetry_cells(&self) -> &[Option<CellGpuState>] {
         &self.cells
+    }
+}
+
+/// Deterministic audit ordering: class discriminant (Interned < PoolSlot <
+/// Row), then each class's natural key. Pure presentation for
+/// `tier_audit`'s exact-state assertions.
+fn audit_key_order(a: TierAuditKey, b: TierAuditKey) -> std::cmp::Ordering {
+    use TierAuditKey::*;
+    fn class_rank(k: &TierAuditKey) -> u8 {
+        match k {
+            Interned(..) => 0,
+            PoolSlot(..) => 1,
+            Row(..) => 2,
+        }
+    }
+    match (class_rank(&a), class_rank(&b)) {
+        (ra, rb) if ra != rb => ra.cmp(&rb),
+        _ => match (a, b) {
+            (Interned(ka, ia), Interned(kb, ib)) => ka.as_str().cmp(kb.as_str()).then(ia.0.cmp(&ib.0)),
+            (PoolSlot(ka, oa), PoolSlot(kb, ob)) => ka.as_str().cmp(kb.as_str()).then(oa.cmp(&ob)),
+            (Row(ca, ra_), Row(cb, rb_)) => ca.0.cmp(&cb.0).then(ra_.cmp(&rb_)),
+            _ => std::cmp::Ordering::Equal,
+        },
     }
 }

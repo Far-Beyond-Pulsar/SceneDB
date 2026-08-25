@@ -195,3 +195,11 @@ required-features = ["gpu"]
 [[test]]
 name = "world_gpu_mirror_get_mut"
 required-features = ["gpu"]
+
+[[test]]
+name = "tier_storage"
+required-features = ["gpu"]
+
+[[test]]
+name = "tier_storage_benchmarks"
+required-features = ["gpu"]
