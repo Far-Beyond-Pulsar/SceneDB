@@ -430,6 +430,15 @@ pub struct SceneGpuStore {
     /// field's own declared type), so this is a plain, infallible-in-
     /// practice downcast, not a real type-erasure boundary.
     var_len_pools: RwLock<HashMap<BufferKey, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Content-addressed counterpart to `var_len_pools` above — a SEPARATE
+    /// registry, not the same map, because an interned pool and a plain one
+    /// are different types (`InternedVarLenPool<T>` vs `VarLenGpuPool<T>`)
+    /// even for the same element `T`; a `#[gpu(content_id = "...")]` field
+    /// and a plain `#[gpu]` `Vec<T>` field could theoretically declare the
+    /// same buffer key without this being ambiguous, though nothing in
+    /// practice does. See `crate::gpu::interned_pool`'s module doc for the
+    /// mechanism this backs.
+    interned_var_len_pools: RwLock<HashMap<BufferKey, Arc<dyn std::any::Any + Send + Sync>>>,
     slot_mirror: SceneBuffer<u32>,
     generations: GenerationBuffer,
     // `material` (32-byte placeholder buffer + `material_buffer()` accessor)
@@ -516,6 +525,7 @@ impl SceneGpuStore {
             growable_gpu_buffers: RwLock::new(HashMap::new()),
             dirty_tracked_gpu_buffers: RwLock::new(HashMap::new()),
             var_len_pools: RwLock::new(HashMap::new()),
+            interned_var_len_pools: RwLock::new(HashMap::new()),
             slot_mirror: SceneBuffer::new(ctx.device(), "scenedb-slot-mirror", row_offset),
             generations: GenerationBuffer::new(ctx.device(), slot_offset),
             // Per-cell metadata stride is 8 bytes (design §4.1: f32 alpha +
@@ -1975,6 +1985,54 @@ impl SceneGpuStore {
     ) -> Option<Arc<crate::gpu::VarLenGpuPool<T>>> {
         let pools = self.var_len_pools.read().expect("SceneGpuStore var_len_pools lock poisoned");
         pools.get(&key)?.clone().downcast::<crate::gpu::VarLenGpuPool<T>>().ok()
+    }
+
+    /// Content-addressed counterpart to [`Self::register_var_len_gpu_pool`]
+    /// — registers (or adopts) a shared
+    /// [`crate::gpu::InternedVarLenPool<T>`] under `key`, wrapping a plain
+    /// `VarLenGpuPool<T>` registered the identical way (same buffer usage
+    /// flags, same growable backing buffer) so buffer-binding call sites
+    /// that only need the underlying `wgpu::Buffer`
+    /// ([`crate::gpu::InternedVarLenPool::underlying`]) are unaffected by
+    /// interning existing at all. Same "already registered with a
+    /// different element type" panic contract as
+    /// [`Self::register_var_len_gpu_pool`].
+    pub fn register_interned_var_len_gpu_pool<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+        initial_capacity: u32,
+        device: &Arc<wgpu::Device>,
+    ) -> Arc<crate::gpu::InternedVarLenPool<T>> {
+        let mut pools = self
+            .interned_var_len_pools
+            .write()
+            .expect("SceneGpuStore interned_var_len_pools lock poisoned");
+        if let Some(existing) = pools.get(&key) {
+            return Arc::clone(existing).downcast::<crate::gpu::InternedVarLenPool<T>>().unwrap_or_else(|_| {
+                panic!(
+                    "interned var-len GPU pool key {key:?} already registered with a different element \
+                     type -- every #[gpu(content_id = \"...\")] field sharing this key must declare the same T"
+                )
+            });
+        }
+        let underlying = self.register_var_len_gpu_pool::<T>(key, initial_capacity, device);
+        let pool = Arc::new(crate::gpu::InternedVarLenPool::new(underlying));
+        pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
+        pool
+    }
+
+    /// Looks up an already-registered [`crate::gpu::InternedVarLenPool<T>`]
+    /// by key. `None` if nothing registered this key yet (same
+    /// auto-registration-on-first-use contract as [`Self::var_len_pool`]).
+    pub fn interned_var_len_pool<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+    ) -> Option<Arc<crate::gpu::InternedVarLenPool<T>>> {
+        let pools = self
+            .interned_var_len_pools
+            .read()
+            .expect("SceneGpuStore interned_var_len_pools lock poisoned");
+        pools.get(&key)?.clone().downcast::<crate::gpu::InternedVarLenPool<T>>().ok()
     }
 
     /// Uploads every row marked dirty (via [`Self::mark_gpu_row_dirty`])

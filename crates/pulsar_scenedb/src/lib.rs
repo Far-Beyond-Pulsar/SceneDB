@@ -72,6 +72,7 @@ pub mod component;
 pub mod component_store;
 pub mod entity;
 pub mod handle;
+pub mod handle_ledger;
 pub mod lease;
 pub mod liveness;
 pub mod page;
@@ -137,6 +138,7 @@ pub use subsystem::{Subsystem, SubsystemRegistry};
 #[cfg(feature = "gpu")]
 pub use scene_db::SceneDb;
 pub use handle::Handle;
+pub use handle_ledger::{ContentAddressed, HandleId, HandleLedgerRegistration};
 pub use replication::{
     AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
     condition_passes, CpuSimulateWitness, Delta, DeltaCompressor, DeltaView, decode_archetype_key,
