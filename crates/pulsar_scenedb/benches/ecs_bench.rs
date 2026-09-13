@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use pulsar_scenedb::*;
 
-// â”€â”€ Component types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Component types
 struct Pos(f32, f32, f32);
 struct Vel(f32, f32, f32);
 struct Health(u32);
@@ -24,29 +24,37 @@ fn spawn_n(c: &mut Criterion) {
                 }
             });
         });
-        group.bench_with_input(criterion::BenchmarkId::new("with_component", n), &n, |b, _| {
-            b.iter(|| {
-                let mut world = World::new();
-                world.reserve_entities(n);
-                for _ in 0..n {
-                    let e = world.spawn();
-                    world.insert(e, Pos(1.0, 2.0, 3.0));
-                }
-            });
-        });
-        group.bench_with_input(criterion::BenchmarkId::new("with_4_components", n), &n, |b, _| {
-            b.iter(|| {
-                let mut world = World::new();
-                world.reserve_entities(n);
-                for _ in 0..n {
-                    let e = world.spawn();
-                    world.insert(e, Pos(1.0, 2.0, 3.0));
-                    world.insert(e, Vel(0.0, 0.0, 0.0));
-                    world.insert(e, Health(100));
-                    world.insert(e, Tag);
-                }
-            });
-        });
+        group.bench_with_input(
+            criterion::BenchmarkId::new("with_component", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let mut world = World::new();
+                    world.reserve_entities(n);
+                    for _ in 0..n {
+                        let e = world.spawn();
+                        world.insert(e, Pos(1.0, 2.0, 3.0));
+                    }
+                });
+            },
+        );
+        group.bench_with_input(
+            criterion::BenchmarkId::new("with_4_components", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let mut world = World::new();
+                    world.reserve_entities(n);
+                    for _ in 0..n {
+                        let e = world.spawn();
+                        world.insert(e, Pos(1.0, 2.0, 3.0));
+                        world.insert(e, Vel(0.0, 0.0, 0.0));
+                        world.insert(e, Health(100));
+                        world.insert(e, Tag);
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -136,5 +144,11 @@ fn archetype_migration(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, spawn_n, query_single, query_tuple_8, archetype_migration);
+criterion_group!(
+    benches,
+    spawn_n,
+    query_single,
+    query_tuple_8,
+    archetype_migration
+);
 criterion_main!(benches);
