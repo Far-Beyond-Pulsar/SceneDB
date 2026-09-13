@@ -23,7 +23,7 @@
 use pulsar_scenedb::*;
 use std::time::{Duration, Instant};
 
-// â”€â”€ Component types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Component types
 
 #[derive(Clone, Copy)]
 struct Pos(f32, f32, f32);
@@ -42,7 +42,7 @@ struct Color([f32; 4]);
 #[derive(Clone, Copy)]
 struct Lifetime(f32);
 
-// â”€â”€ Stats collector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Stats collector
 
 struct PhaseStats {
     name: &'static str,
@@ -137,7 +137,9 @@ impl Profiler {
         println!(
             "\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—"
         );
-        println!("â•‘                        HOTPATH PROFILING SUMMARY                            â•‘");
+        println!(
+            "â•‘                        HOTPATH PROFILING SUMMARY                            â•‘"
+        );
         println!(
             "â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£"
         );
@@ -158,7 +160,7 @@ impl Profiler {
     }
 }
 
-// â”€â”€ Helper: run a closure with timing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Helper: run a closure with timing
 // The `#[inline(never)]` prevents the compiler from inlining this function,
 // which is critical: without it, the compiler can see through the closure and
 // optimize away work that has no observable side effects.
@@ -171,10 +173,10 @@ fn timed<F: FnOnce() -> R, R>(f: F) -> (R, Duration) {
     (result, elapsed)
 }
 
-// â”€â”€ Benchmark: spawn hotpath â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: spawn hotpath â”€
 
 fn bench_spawn(p: &mut Profiler, n: usize) {
-    println!("\nâ”€â”€â”€ Benchmark: spawn ({} entities) â”€â”€â”€", n);
+    println!("\nâ”€ Benchmark: spawn ({} entities) â”€", n);
 
     let (world, elapsed) = timed(|| {
         let mut world = World::new();
@@ -194,11 +196,11 @@ fn bench_spawn(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: insert hotpath (per-phase timing) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: insert hotpath (per-phase timing) â”€
 
 fn bench_insert_phases(p: &mut Profiler, n: usize) {
     println!(
-        "\nâ”€â”€â”€ Benchmark: insert phases ({} entities Ã— 4 components) â”€â”€â”€",
+        "\nâ”€ Benchmark: insert phases ({} entities Ã— 4 components) â”€",
         n
     );
 
@@ -285,10 +287,10 @@ fn bench_insert_phases(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: remove hotpath (per-phase timing) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: remove hotpath (per-phase timing) â”€
 
 fn bench_remove_phases(p: &mut Profiler, n: usize) {
-    println!("\nâ”€â”€â”€ Benchmark: remove phases ({} entities) â”€â”€â”€", n);
+    println!("\nâ”€ Benchmark: remove phases ({} entities) â”€", n);
 
     let mut world = World::new();
     let entities: Vec<_> = (0..n)
@@ -327,10 +329,10 @@ fn bench_remove_phases(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: query hotpath (per-archetype breakdown) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: query hotpath (per-archetype breakdown) â”€
 
 fn bench_query_phases(p: &mut Profiler, n: usize) {
-    println!("\nâ”€â”€â”€ Benchmark: query phases ({} entities) â”€â”€â”€", n);
+    println!("\nâ”€ Benchmark: query phases ({} entities) â”€", n);
 
     let mut world = World::new();
 
@@ -459,10 +461,10 @@ fn bench_query_phases(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: despawn hotpath â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: despawn hotpath â”€
 
 fn bench_despawn_phases(p: &mut Profiler, n: usize) {
-    println!("\nâ”€â”€â”€ Benchmark: despawn phases ({} entities) â”€â”€â”€", n);
+    println!("\nâ”€ Benchmark: despawn phases ({} entities) â”€", n);
 
     let mut world = World::new();
     let entities: Vec<_> = (0..n)
@@ -515,11 +517,11 @@ fn bench_despawn_phases(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: component_id hotpath (cache hit vs miss) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: component_id hotpath (cache hit vs miss)
 
 fn bench_component_id(p: &mut Profiler, n: usize) {
     println!(
-        "\nâ”€â”€â”€ Benchmark: component_id lookup ({} iterations) â”€â”€â”€",
+        "\nâ”€ Benchmark: component_id lookup ({} iterations) â”€",
         n
     );
 
@@ -558,10 +560,10 @@ fn bench_component_id(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: archetype migration cost â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: archetype migration cost
 
 fn bench_migration_phases(p: &mut Profiler, n: usize) {
-    println!("\nâ”€â”€â”€ Benchmark: archetype migration ({} entities) â”€â”€â”€", n);
+    println!("\nâ”€ Benchmark: archetype migration ({} entities) â”€", n);
 
     // Phase 1: spawn â†’ insert 1 component (empty â†’ {Pos})
     let start = Instant::now();
@@ -612,11 +614,11 @@ fn bench_migration_phases(p: &mut Profiler, n: usize) {
     );
 }
 
-// â”€â”€ Benchmark: churn (spawn â†’ insert â†’ remove â†’ despawn cycle) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: churn (spawn â†’ insert â†’ remove â†’ despawn cycle) â”€
 
 fn bench_churn(p: &mut Profiler, waves: usize, per_wave: usize) {
     println!(
-        "\nâ”€â”€â”€ Benchmark: entity churn ({} waves Ã— {} entities) â”€â”€â”€",
+        "\nâ”€ Benchmark: entity churn ({} waves Ã— {} entities) â”€",
         waves, per_wave
     );
 
@@ -655,10 +657,10 @@ fn bench_churn(p: &mut Profiler, waves: usize, per_wave: usize) {
     );
 }
 
-// â”€â”€ Benchmark: large-world query scalability â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: large-world query scalability â”€
 
 fn bench_query_scalability(p: &mut Profiler, sizes: &[usize]) {
-    println!("\nâ”€â”€â”€ Benchmark: query scalability across entity counts â”€â”€â”€");
+    println!("\nâ”€ Benchmark: query scalability across entity counts â”€");
 
     for &n in sizes {
         let mut world = World::new();
@@ -693,11 +695,11 @@ fn bench_query_scalability(p: &mut Profiler, sizes: &[usize]) {
     }
 }
 
-// â”€â”€ Benchmark: archetype count pressure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Benchmark: archetype count pressure
 
 fn bench_archetype_pressure(p: &mut Profiler, n: usize, components_per_entity: usize) {
     println!(
-        "\nâ”€â”€â”€ Benchmark: archetype pressure ({} entities, {} comp types each) â”€â”€â”€",
+        "\nâ”€ Benchmark: archetype pressure ({} entities, {} comp types each) â”€",
         n, components_per_entity
     );
 
@@ -756,7 +758,7 @@ fn bench_archetype_pressure(p: &mut Profiler, n: usize, components_per_entity: u
     );
 }
 
-// â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Main â”€
 
 fn black_box<T>(t: T) -> T {
     std::hint::black_box(t)
@@ -764,14 +766,20 @@ fn black_box<T>(t: T) -> T {
 
 fn main() {
     println!("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-    println!("â•‘                    pulsar_scenedb HOTPATH PROFILER                               â•‘");
-    println!("â•‘  Measures individual phases of every hot path operation.                     â•‘");
-    println!("â•‘  Run with: cargo bench --bench hotpath_profiler                              â•‘");
+    println!(
+        "â•‘                    pulsar_scenedb HOTPATH PROFILER                               â•‘"
+    );
+    println!(
+        "â•‘  Measures individual phases of every hot path operation.                     â•‘"
+    );
+    println!(
+        "â•‘  Run with: cargo bench --bench hotpath_profiler                              â•‘"
+    );
     println!("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
     let mut profiler = Profiler::new();
 
-    // â”€â”€ Small-scale detailed benchmarks â”€â”€
+    //  Small-scale detailed benchmarks
     bench_spawn(&mut profiler, 10_000);
     bench_insert_phases(&mut profiler, 10_000);
     bench_remove_phases(&mut profiler, 10_000);
@@ -780,28 +788,50 @@ fn main() {
     bench_component_id(&mut profiler, 10_000);
     bench_migration_phases(&mut profiler, 10_000);
 
-    // â”€â”€ Medium-scale benchmarks â”€â”€
+    //  Medium-scale benchmarks
     bench_churn(&mut profiler, 50, 1_000);
     bench_query_scalability(&mut profiler, &[1_000, 5_000, 10_000, 50_000]);
     bench_archetype_pressure(&mut profiler, 10_000, 8);
 
-    // â”€â”€ Summary â”€â”€
+    //  Summary
     println!("\n");
     profiler.print_summary();
     profiler.print_top_slowest(20);
 
     println!("\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-    println!("â•‘  HOW TO VIEW OUTPUT                                                          â•‘");
+    println!(
+        "â•‘  HOW TO VIEW OUTPUT                                                          â•‘"
+    );
     println!("â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£");
-    println!("â•‘  1. Terminal: the summary table above shows avg/min/max per phase.           â•‘");
-    println!("â•‘  2. Top-20 slowest: identifies outlier operations.                           â•‘");
-    println!("â•‘  3. Flame graph: run `cargo bench --bench hotpath_profiler` and pipe to      â•‘");
-    println!("â•‘     speedscope:                                                              â•‘");
-    println!("â•‘       cargo bench --bench hotpath_profiler 2>&1 | speedscope -               â•‘");
-    println!("â•‘  4. Compare runs: save output to files and diff:                             â•‘");
-    println!("â•‘       cargo bench --bench hotpath_profiler > before.txt                      â•‘");
-    println!("â•‘       # make changes...                                                      â•‘");
-    println!("â•‘       cargo bench --bench hotpath_profiler > after.txt                       â•‘");
-    println!("â•‘       diff -u before.txt after.txt                                           â•‘");
+    println!(
+        "â•‘  1. Terminal: the summary table above shows avg/min/max per phase.           â•‘"
+    );
+    println!(
+        "â•‘  2. Top-20 slowest: identifies outlier operations.                           â•‘"
+    );
+    println!(
+        "â•‘  3. Flame graph: run `cargo bench --bench hotpath_profiler` and pipe to      â•‘"
+    );
+    println!(
+        "â•‘     speedscope:                                                              â•‘"
+    );
+    println!(
+        "â•‘       cargo bench --bench hotpath_profiler 2>&1 | speedscope -               â•‘"
+    );
+    println!(
+        "â•‘  4. Compare runs: save output to files and diff:                             â•‘"
+    );
+    println!(
+        "â•‘       cargo bench --bench hotpath_profiler > before.txt                      â•‘"
+    );
+    println!(
+        "â•‘       # make changes...                                                      â•‘"
+    );
+    println!(
+        "â•‘       cargo bench --bench hotpath_profiler > after.txt                       â•‘"
+    );
+    println!(
+        "â•‘       diff -u before.txt after.txt                                           â•‘"
+    );
     println!("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 }

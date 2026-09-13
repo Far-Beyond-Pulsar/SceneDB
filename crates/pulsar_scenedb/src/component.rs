@@ -49,7 +49,11 @@ pub fn component_id<T: 'static>() -> ComponentId {
     let tid = TypeId::of::<T>();
     // Fast path â€” thread-local, no synchronization.
     if let Some(cid) = CID_CACHE.with(|cache| {
-        cache.borrow().iter().find(|&&(t, _)| t == tid).map(|&(_, c)| c)
+        cache
+            .borrow()
+            .iter()
+            .find(|&&(t, _)| t == tid)
+            .map(|&(_, c)| c)
     }) {
         return cid;
     }
@@ -105,7 +109,7 @@ pub fn type_of(id: ComponentId) -> TypeId {
     reg[id.0 as usize - 1]
 }
 
-// â”€â”€ Component trait â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Component trait
 
 /// Marker trait for types that can be stored as ECS components.
 ///
@@ -115,7 +119,7 @@ pub fn type_of(id: ComponentId) -> TypeId {
 pub trait Component: Any + Send + Sync + 'static {}
 impl<T: Any + Send + Sync + 'static> Component for T {}
 
-// â”€â”€ Column storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Column storage
 
 pub(crate) trait ErasedColumn: Any + Send + Sync {
     fn type_id(&self) -> TypeId;

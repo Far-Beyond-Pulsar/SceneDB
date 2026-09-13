@@ -14,7 +14,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-// â”€â”€ Shared component shapes, one definition per side (same fields/sizes) â”€â”€
+//  Shared component shapes, one definition per side (same fields/sizes)
 
 mod psdb_components {
     #[derive(Clone, Copy)]
@@ -39,7 +39,7 @@ mod bevy_components {
     pub struct Tag(pub u32);
 }
 
-// â”€â”€ spawn: N entities, each with 4 components â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  spawn: N entities, each with 4 components
 
 fn spawn_4_components(c: &mut Criterion) {
     let mut group = c.benchmark_group("vs_bevy/spawn_4_components");
@@ -54,7 +54,12 @@ fn spawn_4_components(c: &mut Criterion) {
                 world.reserve_entities(n as u32);
                 world.reserve_bundle::<(Pos, Vel, Health, Tag)>(n as u32);
                 for _ in 0..n {
-                    world.spawn_bundle((Pos(1.0, 2.0, 3.0), Vel(0.0, 0.0, 0.0), Health(100), Tag(0)));
+                    world.spawn_bundle((
+                        Pos(1.0, 2.0, 3.0),
+                        Vel(0.0, 0.0, 0.0),
+                        Health(100),
+                        Tag(0),
+                    ));
                 }
             });
         });
@@ -73,8 +78,8 @@ fn spawn_4_components(c: &mut Criterion) {
     group.finish();
 }
 
-// â”€â”€ archetype_migration: N entities, each migrated empty -> {Pos} ->
-// {Pos,Health} -> then Health removed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  archetype_migration: N entities, each migrated empty -> {Pos} ->
+// {Pos,Health} -> then Health removed
 
 fn archetype_migration(c: &mut Criterion) {
     let n: u64 = 10_000;
@@ -121,8 +126,8 @@ fn archetype_migration(c: &mut Criterion) {
     group.finish();
 }
 
-// â”€â”€ query: iterate N entities matching a 2-component and an 8-field-total
-// pattern â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  query: iterate N entities matching a 2-component and an 8-field-total
+// pattern â”€
 
 fn query_two_components(c: &mut Criterion) {
     let mut group = c.benchmark_group("vs_bevy/query_2_components");

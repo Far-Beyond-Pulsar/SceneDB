@@ -37,7 +37,9 @@ impl MoveScratch {
         // bytes before they've been written (which `move_column_row` never
         // does; it always writes via `swap_remove_into` before reading via
         // `push_from`) would be.
-        Self { bytes: [MaybeUninit::uninit(); Self::CAP] }
+        Self {
+            bytes: [MaybeUninit::uninit(); Self::CAP],
+        }
     }
 
     #[inline]
@@ -236,7 +238,10 @@ struct HandleMutHook {
 
 impl HandleMutHook {
     fn fire(&self, current_value: *const ()) {
-        let mut counts = self.counts.lock().expect("World handle_counts: mutex poisoned");
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("World handle_counts: mutex poisoned");
         crate::handle_ledger::report_captured_swap(
             &mut counts,
             self.collect,
@@ -301,7 +306,12 @@ impl<'a, T> Mut<'a, T> {
     pub fn into_inner(mut self) -> &'a mut T {
         #[cfg(feature = "gpu")]
         if let Some(hook) = self.gpu_hook.take() {
-            (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+            (hook.dispatch)(
+                &hook.mirror,
+                hook.row,
+                self.value as *const T as *const (),
+                true,
+            );
         }
         // Same "run me immediately" boundary the GPU hook above treats
         // `into_inner` as: handing the unique `&mut T` out ends all further
@@ -312,7 +322,8 @@ impl<'a, T> Mut<'a, T> {
             hook.fire(self.value as *const T as *const ());
         }
         if let Some(hook) = self.change_hook.take() {
-            hook.tracker.record_component_change(hook.entity, hook.component_id, 0, Vec::new());
+            hook.tracker
+                .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
         // Deliberately NOT gated on `mutated_via_deref_mut`: handing the
         // unique `&mut T` out of the guard is itself the handoff point after
@@ -360,7 +371,12 @@ impl<'a, T> Drop for Mut<'a, T> {
             // here exactly like `DirtyTracked` ones do (see the module doc
             // on `MirrorMode::Once` / `GpuUploadSource` for the full
             // contract this is the write-side half of).
-            (hook.dispatch)(&hook.mirror, hook.row, self.value as *const T as *const (), true);
+            (hook.dispatch)(
+                &hook.mirror,
+                hook.row,
+                self.value as *const T as *const (),
+                true,
+            );
         }
         if let Some(hook) = &self.change_hook {
             // Same "0, empty bytes" shape `insert_inner`'s tracked path
@@ -486,7 +502,10 @@ impl World {
     /// only thing any mutating path pays for subscriptions is one
     /// `Option::is_none()` check; after it, only keys with at least one
     /// watcher pay a hash probe + queue append.
-    pub fn subscribe<T: Component>(&mut self, entity: Entity) -> Option<crate::subscriptions::SubscriptionId> {
+    pub fn subscribe<T: Component>(
+        &mut self,
+        entity: Entity,
+    ) -> Option<crate::subscriptions::SubscriptionId> {
         self.subscribe_id(entity, crate::component::component_id::<T>())
     }
 
@@ -540,7 +559,9 @@ impl World {
     /// Delivery is at-least-once per real mutation, in mutation order, NOT
     /// coalesced -- treat the result as a dirty set keyed by
     /// `(entity, component)` unless you genuinely need per-write fidelity.
-    pub fn take_component_change_events(&mut self) -> Vec<crate::subscriptions::ComponentChangeEvent> {
+    pub fn take_component_change_events(
+        &mut self,
+    ) -> Vec<crate::subscriptions::ComponentChangeEvent> {
         let Some(registry) = &self.subscriptions else {
             return Vec::new();
         };
@@ -569,9 +590,7 @@ impl World {
     pub fn dropped_component_change_events(&self) -> u64 {
         match &self.subscriptions {
             None => 0,
-            Some(registry) => {
-                registry.try_lock().map(|r| r.dropped_count()).unwrap_or(0)
-            }
+            Some(registry) => registry.try_lock().map(|r| r.dropped_count()).unwrap_or(0),
         }
     }
 
@@ -611,7 +630,8 @@ impl World {
         for arch in &self.archetypes {
             for (i, col) in arch.columns.iter().enumerate() {
                 let Some(col) = col else { continue };
-                let Some(collect) = crate::handle_ledger::collect_fn_for(ComponentId(i as u32)) else {
+                let Some(collect) = crate::handle_ledger::collect_fn_for(ComponentId(i as u32))
+                else {
                     continue;
                 };
                 for row in 0..col.len() {
@@ -750,8 +770,14 @@ impl World {
     /// starts with, `reserve` is for growing an *already-running* `World`
     /// ahead of a specific future batch.
     #[cfg(feature = "gpu")]
-    pub fn reserve_gpu_mirror_capacity(&self, queue: &wgpu::Queue, n: u32) -> Option<Result<(), crate::gpu::CapacityError>> {
-        self.gpu_mirror.as_ref().map(|m| m.store().reserve_world_mirror_capacity(queue, n))
+    pub fn reserve_gpu_mirror_capacity(
+        &self,
+        queue: &wgpu::Queue,
+        n: u32,
+    ) -> Option<Result<(), crate::gpu::CapacityError>> {
+        self.gpu_mirror
+            .as_ref()
+            .map(|m| m.store().reserve_world_mirror_capacity(queue, n))
     }
 
     /// Shrinks every registered World-mirrored GPU buffer to the smallest
@@ -766,9 +792,16 @@ impl World {
     /// GPU-to-GPU copy per buffer that actually shrinks. No-op if no mirror
     /// is attached.
     #[cfg(feature = "gpu")]
-    pub fn shrink_gpu_mirror_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) {
+    pub fn shrink_gpu_mirror_to_fit(
+        &self,
+        queue: &wgpu::Queue,
+        highest_live_row: u32,
+        slack_factor: f32,
+    ) {
         if let Some(mirror) = &self.gpu_mirror {
-            mirror.store().shrink_world_mirror_to_fit(queue, highest_live_row, slack_factor);
+            mirror
+                .store()
+                .shrink_world_mirror_to_fit(queue, highest_live_row, slack_factor);
         }
     }
 
@@ -797,7 +830,7 @@ impl World {
         }
     }
 
-    // â”€â”€ Entity lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Entity lifecycle â”€
 
     /// Pre-allocate storage for `count` entities.  Call before a batch spawn
     /// loop to avoid repeated capacity-doubling reallocations of the slot vec
@@ -943,7 +976,9 @@ impl World {
             let arch = &self.archetypes[arch_id.0 as usize];
             for (i, col) in arch.columns.iter().enumerate() {
                 if col.is_some() {
-                    if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(ComponentId(i as u32)) {
+                    if let Some(release) =
+                        crate::gpu::world_mirror::release_dispatch_for(ComponentId(i as u32))
+                    {
                         release(mirror, entity.index());
                     }
                 }
@@ -989,8 +1024,10 @@ impl World {
                     // no-alloc steady-state guarantee.
                     dying.retain(|id| !id.is_zero());
                     if !dying.is_empty() {
-                        let mut counts =
-                            self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                        let mut counts = self
+                            .handle_counts
+                            .lock()
+                            .expect("World handle_counts: mutex poisoned");
                         crate::handle_ledger::release_row(&mut counts, dying);
                     }
                 }
@@ -1021,7 +1058,9 @@ impl World {
         // on).
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            mirror.generations().note_despawn(entity.index(), new_generation);
+            mirror
+                .generations()
+                .note_despawn(entity.index(), new_generation);
         }
 
         if let Some(t) = tracker {
@@ -1050,7 +1089,11 @@ impl World {
         if let Some(registry) = &self.subscriptions {
             let mut guard = crate::subscriptions::lock(registry);
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
-                guard.record(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
+                guard.record(
+                    entity,
+                    cid,
+                    crate::subscriptions::ComponentChangeKind::Removed,
+                );
             }
             guard.unsubscribe_entity(entity);
         }
@@ -1071,7 +1114,7 @@ impl World {
             .unwrap_or(false)
     }
 
-    // â”€â”€ Component helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Component helpers
 
     /// Fast path: check whether archetype `arch_id` has a column at `cid`.
     #[inline]
@@ -1082,8 +1125,13 @@ impl World {
 
     /// Get a mutable reference to the `ErasedColumn` at `cid` in `arch`.
     #[inline]
-    fn get_erased_mut(arch: &mut Archetype, cid: ComponentId) -> Option<&mut Box<dyn ErasedColumn>> {
-        arch.columns.get_mut(cid.0 as usize).and_then(|c| c.as_mut())
+    fn get_erased_mut(
+        arch: &mut Archetype,
+        cid: ComponentId,
+    ) -> Option<&mut Box<dyn ErasedColumn>> {
+        arch.columns
+            .get_mut(cid.0 as usize)
+            .and_then(|c| c.as_mut())
     }
 
     /// Get a shared reference to the `ErasedColumn` at `cid` in `arch`.
@@ -1122,7 +1170,7 @@ impl World {
             .collect()
     }
 
-    // â”€â”€ Component operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Component operations â”€
 
     /// Add a component to an entity, migrating it to a new archetype if needed.
     ///
@@ -1148,7 +1196,12 @@ impl World {
     /// Like [`insert`](Self::insert) but also records the change in
     /// `tracker`. Redundant with plain [`Self::insert`] once a change
     /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
-    pub fn insert_tracked<T: Component>(&mut self, entity: Entity, value: T, tracker: &mut ChangeTracker) {
+    pub fn insert_tracked<T: Component>(
+        &mut self,
+        entity: Entity,
+        value: T,
+        tracker: &mut ChangeTracker,
+    ) {
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.insert_inner(entity, value, Some(&mut guard));
@@ -1157,7 +1210,12 @@ impl World {
         }
     }
 
-    fn insert_inner<T: Component>(&mut self, entity: Entity, value: T, mut tracker: Option<&mut ChangeTracker>) {
+    fn insert_inner<T: Component>(
+        &mut self,
+        entity: Entity,
+        value: T,
+        mut tracker: Option<&mut ChangeTracker>,
+    ) {
         let cid = crate::component::component_id::<T>();
         assert!(self.is_alive(entity), "insert on dead entity {entity}");
 
@@ -1203,9 +1261,16 @@ impl World {
                 // nothing" fix (the first half is that `spawn_inner` no
                 // longer touches the liveness mirror at all).
                 if is_new_insert {
-                    mirror.generations().note_gpu_bearing_insert(entity.index(), entity.generation());
+                    mirror
+                        .generations()
+                        .note_gpu_bearing_insert(entity.index(), entity.generation());
                 }
-                dispatch(mirror, entity.index(), &value as *const T as *const (), is_new_insert);
+                dispatch(
+                    mirror,
+                    entity.index(),
+                    &value as *const T as *const (),
+                    is_new_insert,
+                );
             }
         }
 
@@ -1225,14 +1290,18 @@ impl World {
             if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
                 let old_ptr = &col.data[old_row] as *const T as *const ();
                 let new_ptr = &value as *const T as *const ();
-                let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                let mut counts = self
+                    .handle_counts
+                    .lock()
+                    .expect("World handle_counts: mutex poisoned");
                 crate::handle_ledger::report_value_swap(&mut counts, collect, old_ptr, new_ptr);
             }
 
             if let Some(t) = tracker.as_deref_mut() {
                 // Capture bytes before the value is moved into the column.
                 let len = std::mem::size_of::<T>();
-                let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
                 t.record_component_change(entity, cid, 0, bytes.to_vec());
             }
             col.data[old_row] = value;
@@ -1312,7 +1381,10 @@ impl World {
             // which is gone) so the event reflects committed state.
             if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
                 let new_ptr = col_data.last().expect("just pushed above") as *const T as *const ();
-                let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+                let mut counts = self
+                    .handle_counts
+                    .lock()
+                    .expect("World handle_counts: mutex poisoned");
                 crate::handle_ledger::report_value_acquire(&mut counts, collect, new_ptr);
             }
         }
@@ -1356,7 +1428,11 @@ impl World {
     /// Like [`remove`](Self::remove) but also records the change in
     /// `tracker`. Redundant with plain [`Self::remove`] once a change
     /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
-    pub fn remove_tracked<T: Component>(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> Option<T> {
+    pub fn remove_tracked<T: Component>(
+        &mut self,
+        entity: Entity,
+        tracker: &mut ChangeTracker,
+    ) -> Option<T> {
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             return self.remove_inner(entity, Some(&mut guard));
@@ -1364,7 +1440,11 @@ impl World {
         self.remove_inner(entity, Some(tracker))
     }
 
-    fn remove_inner<T: Component>(&mut self, entity: Entity, tracker: Option<&mut ChangeTracker>) -> Option<T> {
+    fn remove_inner<T: Component>(
+        &mut self,
+        entity: Entity,
+        tracker: Option<&mut ChangeTracker>,
+    ) -> Option<T> {
         if !self.is_alive(entity) {
             return None;
         }
@@ -1412,7 +1492,10 @@ impl World {
         // value itself.
         if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
             let value_ptr = &removed_val as *const T as *const ();
-            let mut counts = self.handle_counts.lock().expect("World handle_counts: mutex poisoned");
+            let mut counts = self
+                .handle_counts
+                .lock()
+                .expect("World handle_counts: mutex poisoned");
             crate::handle_ledger::report_value_release(&mut counts, collect, value_ptr);
         }
 
@@ -1495,11 +1578,12 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
-        let value = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
-            c.as_any_mut()
-                .downcast_mut::<Column<T>>()
-                .map(|col| &mut col.data[row])
-        })?;
+        let value =
+            Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
+                c.as_any_mut()
+                    .downcast_mut::<Column<T>>()
+                    .map(|col| &mut col.data[row])
+            })?;
 
         #[cfg(feature = "gpu")]
         let gpu_hook = self.gpu_mirror.as_ref().and_then(|mirror| {
@@ -1554,7 +1638,7 @@ impl World {
         })
     }
 
-    // â”€â”€ Archetype graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Archetype graph â”€
 
     /// Spawn `entity` at its EXACT wire index+generation, directly into the
     /// archetype identified by `key`, using `row_ops` to construct any
@@ -1718,7 +1802,7 @@ impl World {
         id
     }
 
-    // â”€â”€ Bundle support â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Bundle support
 
     /// Edge-cached "insert `T`" archetype-graph step -- the exact same
     /// cache-or-rebuild-key logic `insert_inner` uses for a single
@@ -1767,8 +1851,15 @@ impl World {
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
             if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
-                mirror.generations().note_gpu_bearing_insert(entity.index(), entity.generation());
-                dispatch(mirror, entity.index(), &value as *const T as *const (), true);
+                mirror
+                    .generations()
+                    .note_gpu_bearing_insert(entity.index(), entity.generation());
+                dispatch(
+                    mirror,
+                    entity.index(),
+                    &value as *const T as *const (),
+                    true,
+                );
             }
         }
 
@@ -1810,7 +1901,11 @@ impl World {
     /// on every column the bundle touches -- the same reason
     /// [`World::reserve_entities`] exists for the empty archetype's own
     /// entity list.
-    pub(crate) fn reserve_component_column<T: Component>(&mut self, arch_id: ArchetypeId, additional: u32) {
+    pub(crate) fn reserve_component_column<T: Component>(
+        &mut self,
+        arch_id: ArchetypeId,
+        additional: u32,
+    ) {
         let cid = crate::component::component_id::<T>();
         let arch = &mut self.archetypes[arch_id.0 as usize];
         let idx = cid.0 as usize;
@@ -1827,7 +1922,7 @@ impl World {
             .reserve(additional as usize);
     }
 
-    // â”€â”€ Archetype migration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //  Archetype migration
 
     /// Moves one column's element at `old_row` in `old_arch_id` into a
     /// (possibly newly-created) column of the same `cid` in `new_arch_id`.
@@ -1849,7 +1944,13 @@ impl World {
     /// the inline scratch capacity (rare) still pays that cost, via the
     /// original path kept as a correctness fallback.
     #[inline]
-    fn move_column_row(&mut self, old_arch_id: ArchetypeId, old_row: usize, new_arch_id: ArchetypeId, cid: ComponentId) {
+    fn move_column_row(
+        &mut self,
+        old_arch_id: ArchetypeId,
+        old_row: usize,
+        new_arch_id: ArchetypeId,
+        cid: ComponentId,
+    ) {
         if !Self::has_column_id(&self.archetypes[new_arch_id.0 as usize], cid) {
             let proto = Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
                 .unwrap()
@@ -1904,7 +2005,6 @@ impl World {
         }
     }
 
-
     /// Move the entity and all component data from `old_arch_id`/`old_row`
     /// into `new_arch_id`.
     ///
@@ -1927,9 +2027,7 @@ impl World {
         new_arch_id: ArchetypeId,
     ) {
         // Phase 1: push entity to destination first.
-        let new_row = self.archetypes[new_arch_id.0 as usize]
-            .entities
-            .len() as u32;
+        let new_row = self.archetypes[new_arch_id.0 as usize].entities.len() as u32;
         self.archetypes[new_arch_id.0 as usize]
             .entities
             .push(entity);
@@ -1983,9 +2081,7 @@ impl World {
         skip_cid: ComponentId,
     ) {
         // Phase 1: push entity to destination first.
-        let new_row = self.archetypes[new_arch_id.0 as usize]
-            .entities
-            .len() as u32;
+        let new_row = self.archetypes[new_arch_id.0 as usize].entities.len() as u32;
         self.archetypes[new_arch_id.0 as usize]
             .entities
             .push(entity);
