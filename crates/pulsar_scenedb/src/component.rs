@@ -178,6 +178,23 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
     /// # Safety
     /// - `row` must be < `self.len()`.
     unsafe fn get_raw(&self, row: usize) -> *const ();
+
+    /// Return a properly-typed `&dyn Any` for the element at `row` -- unlike
+    /// [`as_any`](Self::as_any) (which erases to the *column*, `Column<T>`,
+    /// whose `TypeId` is useless for element-level lookups), this erases to
+    /// `T` itself, so `value.type_id() == TypeId::of::<T>()` and callers can
+    /// hand it to anything keyed by a component's own `TypeId` -- in
+    /// particular `pulsar_reflection::RUNTIME_TYPE_REGISTRY`, for
+    /// structured (nested-struct/enum/wrapper-aware) inspection of a live
+    /// row without the caller knowing `T` at compile time. Safe: unlike
+    /// `get_raw`, no pointer arithmetic or unsafe deref is exposed to the
+    /// caller, `row` is bounds-checked here.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()` (same bound `get_raw`'s safety
+    /// contract requires the caller to already uphold; enforced here
+    /// instead of left unchecked, since this method is otherwise safe).
+    fn get_any(&self, row: usize) -> &dyn Any;
     /// Return a mutable raw pointer to the element at `row`.
     ///
     /// # Safety
@@ -282,6 +299,10 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     unsafe fn get_raw(&self, row: usize) -> *const () {
         self.data.as_ptr().add(row) as *const ()
+    }
+
+    fn get_any(&self, row: usize) -> &dyn Any {
+        &self.data[row]
     }
 
     unsafe fn get_raw_mut(&mut self, row: usize) -> *mut () {
