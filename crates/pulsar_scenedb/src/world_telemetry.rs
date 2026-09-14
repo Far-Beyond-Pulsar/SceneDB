@@ -72,8 +72,14 @@ pub struct ArchetypeColumnSnapshot {
     /// the only available view of this column's contents.
     pub rows_reflected: Option<Vec<serde_json::Value>>,
     /// Hex-encoded raw bytes, row-major: `[row0_bytes, row1_bytes, ...]`,
-    /// same order as the owning [`ArchetypeSnapshot::entities`]. Always
-    /// present, regardless of `rows_reflected`.
+    /// same order as the owning [`ArchetypeSnapshot::entities`]. Only
+    /// populated when `rows_reflected` is `None` -- computing both for
+    /// every row of every reflectable component (the common case for real
+    /// engine components) would silently double the cost of every
+    /// snapshot for no reader-visible benefit; nothing consumes raw hex
+    /// once a structured decode is available. Empty (not omitted) when
+    /// `rows_reflected` is `Some`, so the field always round-trips through
+    /// JSON as an array rather than becoming type-dependent on the wire.
     pub rows_hex: Vec<String>,
 }
 
@@ -99,39 +105,48 @@ impl World {
                         let element_size = col.element_size();
                         let len = col.len();
 
-                        let mut rows_hex = Vec::with_capacity(len);
-                        for row in 0..len {
-                            // SAFETY: `row < len == col.len()`.
-                            let ptr = unsafe { col.get_raw(row) } as *const u8;
-                            // SAFETY: `ptr` points at a live element of this
-                            // column, valid for `element_size` bytes.
-                            let bytes =
-                                unsafe { std::slice::from_raw_parts(ptr, element_size) };
-                            rows_hex.push(hex_encode(bytes));
-                        }
-
                         // Reflection is opt-in per type (only types that
                         // registered via `#[derive(Reflectable)]`/
                         // `#[pulsar_type]` show up here), so check once
                         // rather than per row -- every row in a column
-                        // shares the same element type.
-                        let rows_reflected = RUNTIME_TYPE_REGISTRY
+                        // shares the same element type -- and branch on it
+                        // rather than always doing both encodings (see
+                        // `rows_hex`'s doc comment for why that matters).
+                        let is_reflectable = RUNTIME_TYPE_REGISTRY
                             .get_by_id(ErasedColumn::type_id(&**col))
-                            .is_some()
-                            .then(|| {
-                                (0..len)
-                                    .map(|row| {
-                                        match RUNTIME_TYPE_REGISTRY
-                                            .serialize_json_for_any(col.get_any(row))
-                                        {
-                                            Ok(v) => v,
-                                            Err(e) => serde_json::json!({
-                                                "__reflection_error__": e.to_string(),
-                                            }),
-                                        }
-                                    })
-                                    .collect()
-                            });
+                            .is_some();
+
+                        let mut rows_hex = Vec::new();
+                        let mut rows_reflected_vec = Vec::new();
+
+                        if is_reflectable {
+                            rows_reflected_vec.reserve(len);
+                            for row in 0..len {
+                                let value = match RUNTIME_TYPE_REGISTRY
+                                    .serialize_json_for_any(col.get_any(row))
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => serde_json::json!({
+                                        "__reflection_error__": e.to_string(),
+                                    }),
+                                };
+                                rows_reflected_vec.push(value);
+                            }
+                        } else {
+                            rows_hex.reserve(len);
+                            for row in 0..len {
+                                // SAFETY: `row < len == col.len()`.
+                                let ptr = unsafe { col.get_raw(row) } as *const u8;
+                                // SAFETY: `ptr` points at a live element of
+                                // this column, valid for `element_size`
+                                // bytes.
+                                let bytes =
+                                    unsafe { std::slice::from_raw_parts(ptr, element_size) };
+                                rows_hex.push(hex_encode(bytes));
+                            }
+                        }
+
+                        let rows_reflected = is_reflectable.then_some(rows_reflected_vec);
 
                         Some(ArchetypeColumnSnapshot {
                             component_id,
