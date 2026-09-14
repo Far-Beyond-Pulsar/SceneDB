@@ -1,0 +1,13 @@
+[package]
+name = "scenedb_inspector"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone egui client that launches a target process and renders its live pulsar_scenedb::World state, published by scenedb-inspector-agent (in the Helio repo) over shared memory."
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+shared_memory = "0.12"
+serde_json = { workspace = true }
+env_logger = "0.11"
+log = "0.4"

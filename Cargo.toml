@@ -3,6 +3,7 @@ members = [
     "crates/pulsar_scenedb",
     "crates/pulsar_scenedb_derive",
     "crates/scenedb_dashboard",
+    "crates/scenedb_inspector",
 ]
 resolver = "2"
 
