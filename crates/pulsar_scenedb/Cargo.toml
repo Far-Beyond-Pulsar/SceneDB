@@ -10,12 +10,15 @@ gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
-# Repinned onto the `dyn-method-registry` branch (Pulsar-Reflection#3) for
-# DynMethodRegistry/DYN_METHOD_REGISTRY, which `subsystem.rs`'s dynamic
-# dispatch path needs. Additive-only on the Pulsar-Reflection side (see
-# that PR), so this is safe ahead of merge; repin to whatever commit
-# Pulsar-Reflection#3 merges as once that lands.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "b9dd888d84fd5e0724f8c6cc8abcbb10c351e5ff" }
+# Pulsar-Reflection#3 (dyn-method-registry, for subsystem.rs's
+# DynMethodRegistry/DYN_METHOD_REGISTRY dispatch path) and #6 (fixes
+# #[derive(Reflectable)] emitting a `static RuntimeTypeInfo = RuntimeTypeInfo
+# { .. }` initializer that called non-`const` `Reflectable::type_info()` on
+# nested field types -- broke on ANY derived struct with a field whose own
+# type is `#[pulsar_type]`/`#[derive(Reflectable)]`-registered, e.g. a plain
+# `f32` field, which is effectively every real one) are both merged to main
+# as of this rev.
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "27eaaf7233522ff7d8c79cd2c76e7eeacb17d59d" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
