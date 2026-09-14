@@ -18,7 +18,7 @@ telemetry = ["dep:socket2", "dep:serde", "gpu"]
 # type is `#[pulsar_type]`/`#[derive(Reflectable)]`-registered, e.g. a plain
 # `f32` field, which is effectively every real one) are both merged to main
 # as of this rev.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "745ee787cc63288463c170aafb778672db8e85ac" }
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "27eaaf7233522ff7d8c79cd2c76e7eeacb17d59d" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
