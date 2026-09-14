@@ -25,8 +25,13 @@ pub struct ComponentId(pub u32);
 // ID 0 is reserved â€” columns are stored with id â‰¥ 1.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-fn registry() -> &'static Mutex<Vec<TypeId>> {
-    static REG: OnceLock<Mutex<Vec<TypeId>>> = OnceLock::new();
+// Each entry is (TypeId, `std::any::type_name::<T>()`) captured the one time
+// `T` is registered -- the name rides along for free so telemetry/tooling
+// can label a ComponentId without compile-time knowledge of `T`. Display
+// only: `type_name` is not guaranteed stable across Rust versions or crate
+// rebuilds, so never parse it.
+fn registry() -> &'static Mutex<Vec<(TypeId, &'static str)>> {
+    static REG: OnceLock<Mutex<Vec<(TypeId, &'static str)>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -59,7 +64,7 @@ pub fn component_id<T: 'static>() -> ComponentId {
     }
     // Slow path â€” register globally, then cache locally.
     let mut reg = registry().lock().expect("ComponentId registry lock");
-    for (i, &rtid) in reg.iter().enumerate() {
+    for (i, &(rtid, _)) in reg.iter().enumerate() {
         if rtid == tid {
             let cid = ComponentId(i as u32 + 1);
             CID_CACHE.with(|cache| cache.borrow_mut().push((tid, cid)));
@@ -67,7 +72,7 @@ pub fn component_id<T: 'static>() -> ComponentId {
         }
     }
     let cid = ComponentId(reg.len() as u32 + 1);
-    reg.push(tid);
+    reg.push((tid, std::any::type_name::<T>()));
     NEXT_ID.store(cid.0 + 1, Ordering::Relaxed);
     CID_CACHE.with(|cache| cache.borrow_mut().push((tid, cid)));
     cid
@@ -80,7 +85,7 @@ pub fn component_id<T: 'static>() -> ComponentId {
 /// Panics if `type_id` has not been registered via [`component_id::<T>()`].
 pub fn resolve_id(type_id: TypeId) -> ComponentId {
     let reg = registry().lock().expect("ComponentId registry lock");
-    for (i, &tid) in reg.iter().enumerate() {
+    for (i, &(tid, _)) in reg.iter().enumerate() {
         if tid == type_id {
             return ComponentId(i as u32 + 1);
         }
@@ -106,7 +111,21 @@ pub fn component_count() -> u32 {
 /// Panics if `id` has not been registered.
 pub fn type_of(id: ComponentId) -> TypeId {
     let reg = registry().lock().expect("ComponentId registry lock");
-    reg[id.0 as usize - 1]
+    reg[id.0 as usize - 1].0
+}
+
+/// Returns the `std::any::type_name::<T>()` recorded for `id` when its type
+/// was first registered via [`component_id::<T>()`]. Display only -- not
+/// guaranteed stable across Rust versions or crate rebuilds; used by
+/// telemetry/tooling to label a `ComponentId` without compile-time knowledge
+/// of the concrete component type.
+///
+/// # Panics
+///
+/// Panics if `id` has not been registered.
+pub fn type_name(id: ComponentId) -> &'static str {
+    let reg = registry().lock().expect("ComponentId registry lock");
+    reg[id.0 as usize - 1].1
 }
 
 //  Component trait

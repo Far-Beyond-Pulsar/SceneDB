@@ -102,6 +102,9 @@ pub mod scene_db;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 
+#[cfg(feature = "telemetry")]
+pub mod world_telemetry;
+
 pub use actor::{Actor, ActorRegistry};
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use bundle::Bundle;
@@ -171,3 +174,5 @@ pub use world::{Mut, World};
 
 #[cfg(feature = "telemetry")]
 pub use telemetry::{TelemetryServer, TelemetrySnapshot};
+#[cfg(feature = "telemetry")]
+pub use world_telemetry::{ArchetypeColumnSnapshot, ArchetypeSnapshot, WorldSnapshot};
