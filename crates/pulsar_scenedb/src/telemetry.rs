@@ -68,6 +68,7 @@ pub struct GpuSnapshot {
     pub sync_bytes: u64,
     pub write_ops: u64,
     pub buffers: Vec<GpuBufferSnapshot>,
+    pub registry_buffers: Vec<GpuRegistryBufferSnapshot>,
     /// Per-cell GPU state (dirty column counts, pending retires).
     pub cell_gpu_states: Vec<CellGpuSnapshot>,
 }
@@ -79,6 +80,33 @@ pub struct GpuBufferSnapshot {
     pub capacity: u32,
 }
 
+#[derive(Serialize)]
+pub struct GpuRegistryBufferSnapshot {
+    pub name: String,
+    pub kind: String,
+    pub element_size: usize,
+    pub capacity_bytes: Option<u64>,
+    pub epoch: Option<u64>,
+    pub access: String,
+    pub mirror_mode: Option<String>,
+    pub element_type_name: Option<String>,
+    pub cells: Vec<GpuCellSnapshot>,
+    pub cells_truncated: bool,
+    pub raw_chunks: Vec<GpuRawChunkSnapshot>,
+}
+
+#[derive(Serialize)]
+pub struct GpuRawChunkSnapshot {
+    pub offset: u64,
+    pub bytes_hex: String,
+}
+
+#[derive(Serialize)]
+pub struct GpuCellSnapshot {
+    pub index: u32,
+    pub bytes_hex: String,
+    pub reflected: serde_json::Value,
+}
 #[derive(Serialize)]
 pub struct CellGpuSnapshot {
     pub id: u32,
@@ -237,6 +265,45 @@ pub fn collect_gpu_snapshot(store: &SceneGpuStore) -> GpuSnapshot {
                 component_id: id.0,
                 element_size: buf.element_size(),
                 capacity: buf.capacity(),
+            })
+            .collect(),
+        registry_buffers: store
+            .buffer_registry()
+            .telemetry_entries()
+            .into_iter()
+            .map(|(key, kind, element_size, access, mirror_mode, capacity_bytes, epoch)| {
+                let device = store.device_arc();
+                let inspected = store.buffer_registry().inspect_rows(
+                    &device,
+                    store.queue(),
+                    key,
+                    4 * 1024 * 1024,
+                );
+                let raw_chunks = store.buffer_registry().inspect_bytes(&device, store.queue(), key, 4 * 1024 * 1024);
+                let (element_type_name, cells, cells_truncated) = inspected
+                    .map(|(type_name, cells, truncated)| (
+                        type_name.map(str::to_owned),
+                        cells.into_iter().map(|(index, bytes_hex, reflected)| GpuCellSnapshot {
+                            index,
+                            bytes_hex,
+                            reflected,
+                        }).collect(),
+                        truncated,
+                    ))
+                    .unwrap_or((None, Vec::new(), false));
+                GpuRegistryBufferSnapshot {
+                    name: key.as_str().to_owned(),
+                    kind: kind.to_owned(),
+                    element_size,
+                    capacity_bytes,
+                    epoch,
+                    access: format!("{access:?}"),
+                    mirror_mode: mirror_mode.map(|mode| format!("{mode:?}")),
+                    element_type_name,
+                    cells,
+                    cells_truncated,
+                    raw_chunks: raw_chunks.into_iter().map(|(offset, bytes_hex)| GpuRawChunkSnapshot { offset, bytes_hex }).collect(),
+                }
             })
             .collect(),
         cell_gpu_states: store
@@ -403,6 +470,7 @@ impl TelemetrySnapshot {
                 sync_bytes: 0,
                 write_ops: 0,
                 buffers: Vec::new(),
+                registry_buffers: Vec::new(),
                 cell_gpu_states: Vec::new(),
             },
             schema: Vec::new(),

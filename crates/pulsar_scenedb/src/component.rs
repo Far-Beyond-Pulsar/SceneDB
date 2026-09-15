@@ -178,6 +178,10 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
     /// # Safety
     /// - `row` must be < `self.len()`.
     unsafe fn get_raw(&self, row: usize) -> *const ();
+    /// Return the properly typed element at `row` as `&dyn Any`.
+    /// Unlike `as_any`, this erases to `T` itself rather than `Column<T>`,
+    /// allowing TypeId-keyed reflection serializers to decode the row.
+    fn get_any(&self, row: usize) -> &dyn Any;
     /// Return a mutable raw pointer to the element at `row`.
     ///
     /// # Safety
@@ -282,6 +286,10 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     unsafe fn get_raw(&self, row: usize) -> *const () {
         self.data.as_ptr().add(row) as *const ()
+    }
+
+    fn get_any(&self, row: usize) -> &dyn Any {
+        &self.data[row]
     }
 
     unsafe fn get_raw_mut(&mut self, row: usize) -> *mut () {

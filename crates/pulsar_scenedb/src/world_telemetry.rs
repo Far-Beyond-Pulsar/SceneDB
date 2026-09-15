@@ -22,9 +22,11 @@
 //! documents for the cell-based snapshot.
 
 use serde::Serialize;
+use serde_json::Value;
 
-use crate::component::{self, ComponentId};
+use crate::component::{self, ComponentId, ErasedColumn};
 use crate::world::World;
+use pulsar_reflection::RUNTIME_TYPE_REGISTRY;
 
 /// Full snapshot of a [`World`]'s live entities and components, in
 /// archetype-major order.
@@ -33,6 +35,19 @@ pub struct WorldSnapshot {
     /// Total live entity count across all archetypes.
     pub entity_count: usize,
     pub archetypes: Vec<ArchetypeSnapshot>,
+    /// SceneDB-owned GPU storage snapshot, when this world has a mirror.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<crate::telemetry::GpuSnapshot>,
+    /// Optional SceneDB-owned projections, including the GPU mirror and upload state.
+    #[serde(flatten)]
+    pub extensions: std::collections::BTreeMap<String, Value>,
+}
+
+impl WorldSnapshot {
+    /// Attach a serializable projection owned by SceneDB, such as GPU mirror or upload diagnostics.
+    pub fn insert_snapshot_extension(&mut self, key: impl Into<String>, value: Value) {
+        self.extensions.insert(key.into(), value);
+    }
 }
 
 #[derive(Serialize)]
@@ -52,6 +67,8 @@ pub struct ArchetypeColumnSnapshot {
     /// first registered. Display only -- see [`component::type_name`].
     pub type_name: &'static str,
     pub element_size: usize,
+    /// Structured reflection-decoded value per row when the type is registered.
+    pub rows_reflected: Option<Vec<serde_json::Value>>,
     /// Hex-encoded raw bytes, row-major: `[row0_bytes, row1_bytes, ...]`,
     /// same order as the owning [`ArchetypeSnapshot::entities`].
     pub rows_hex: Vec<String>,
@@ -79,21 +96,42 @@ impl World {
                         let element_size = col.element_size();
                         let len = col.len();
 
-                        let mut rows_hex = Vec::with_capacity(len);
-                        for row in 0..len {
-                            // SAFETY: `row < len == col.len()`.
-                            let ptr = unsafe { col.get_raw(row) } as *const u8;
-                            // SAFETY: `ptr` points at a live element of this
-                            // column, valid for `element_size` bytes.
-                            let bytes =
-                                unsafe { std::slice::from_raw_parts(ptr, element_size) };
-                            rows_hex.push(hex_encode(bytes));
+                        let is_reflectable = RUNTIME_TYPE_REGISTRY
+                            .get_by_id(ErasedColumn::type_id(&**col))
+                            .is_some();
+                        let mut rows_hex = Vec::new();
+                        let mut rows_reflected_vec = Vec::new();
+
+                        if is_reflectable {
+                            rows_reflected_vec.reserve(len);
+                            for row in 0..len {
+                                let value = match RUNTIME_TYPE_REGISTRY
+                                    .serialize_json_for_any(col.get_any(row))
+                                {
+                                    Ok(value) => value,
+                                    Err(error) => serde_json::json!({
+                                        "__reflection_error__": error.to_string(),
+                                    }),
+                                };
+                                rows_reflected_vec.push(value);
+                            }
+                        } else {
+                            rows_hex.reserve(len);
+                            for row in 0..len {
+                                // SAFETY: `row < len == col.len()`.
+                                let ptr = unsafe { col.get_raw(row) } as *const u8;
+                                // SAFETY: `ptr` is valid for `element_size` bytes.
+                                let bytes =
+                                    unsafe { std::slice::from_raw_parts(ptr, element_size) };
+                                rows_hex.push(hex_encode(bytes));
+                            }
                         }
 
                         Some(ArchetypeColumnSnapshot {
                             component_id,
                             type_name: component::type_name(ComponentId(component_id)),
                             element_size,
+                            rows_reflected: is_reflectable.then_some(rows_reflected_vec),
                             rows_hex,
                         })
                     })
@@ -110,6 +148,8 @@ impl World {
 
         WorldSnapshot {
             entity_count: archetypes.iter().map(|a| a.entity_count).sum(),
+            gpu: self.gpu_mirror().map(|mirror| crate::telemetry::collect_gpu_snapshot(mirror.store())),
+            extensions: std::collections::BTreeMap::new(),
             archetypes,
         }
     }

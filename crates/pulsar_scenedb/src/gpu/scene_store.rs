@@ -83,7 +83,7 @@ pub const CELL_METADATA_BUFFER_KEY: BufferKey = BufferKey::of("builtin_cell_meta
 /// calls it always did: this type documents that layout for the registry,
 /// it does not change it.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct CellMetadataRow {
     pub alpha: f32,
     pub domain: u32,
@@ -662,7 +662,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -910,7 +910,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -1767,7 +1767,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -1851,7 +1851,7 @@ impl SceneGpuStore {
         key: BufferKey,
     ) where
         Wrapper: Pod + Send + Sync + HasTypeToken + 'static,
-        Element: Pod + Send + Sync + HasTypeToken + 'static,
+        Element: Pod + Send + Sync + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         let mode = MirrorMode::Once;
         let id = <Wrapper as HasTypeToken>::type_token().id();

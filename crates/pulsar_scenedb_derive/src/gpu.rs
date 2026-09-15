@@ -352,7 +352,7 @@ pub fn generate_gpu_column_set(
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
         #[repr(C)]
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, pulsar_scenedb::pulsar_reflection::Reflectable)]
         pub struct #packed_view_ident {
             #(#packed_field_defs),*
         }

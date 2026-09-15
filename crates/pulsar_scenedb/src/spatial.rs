@@ -30,7 +30,7 @@ pub const TRANSFORM_COLUMN: usize = SPATIAL_COLUMNS;
 /// GPU mirror itself lives in `gpu::scene_store` — this type is plain Pod
 /// data and stays graphics-free, CONTRACTS C0).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, pulsar_reflection::Reflectable)]
 pub struct InstanceInfo {
     pub mesh_index: u32, // @0 — MeshRegistry index (LOD 0 entry per R9)
     pub flags: u32,      // @4 — bit 0 reserved: near-clip CPU twin (M3-β); rest 0
