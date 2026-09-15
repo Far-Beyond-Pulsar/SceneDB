@@ -626,13 +626,12 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let pod_impl = generate_pod_impl(name, &impl_generics, &ty_generics, where_clause, &field_types);
 
-    // Two `SceneColumnSet` impls, `cfg`-split on the `gpu` feature: with it
-    // on, `#[gpu]` fields' CellType column tokens must match the wrapper
-    // types `write_gpu`/`GpuColumnDesc` use (see `gpu_wrapper`'s doc) or
-    // `cell.column_for_mut::<Wrapper>()` would find no column; with it off
-    // there is no GPU column concept at all, so every field (including ones
-    // marked `#[gpu]`, which is a no-op without the feature) keeps its own
-    // natural type -- unchanged from before this fix.
+    // A `SceneStore` derive expands in its *consumer* crate, so it cannot
+    // inspect SceneDB's dependency features with `cfg(feature = "gpu")`:
+    // that predicate checks the consumer's feature set. A type with `#[gpu]`
+    // fields must always generate its wrappers, packed view, and mirror
+    // registration together. Types without GPU fields retain the lean
+    // CPU-only column-set implementation.
     let scene_column_set_gpu = generate_scene_column_set(
         name,
         &impl_generics,
@@ -685,19 +684,29 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     // `pulsar_scenedb::token` covers `T: Pod + 'static`, which our Pod impl
     // satisfies.  An explicit impl would conflict.
 
+    let scene_column_set = if gpu_fields.is_empty() {
+        scene_column_set_no_gpu
+    } else {
+        scene_column_set_gpu
+    };
+
+    let gpu_expansion = if gpu_fields.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #(#gpu_wrapper_defs)*
+            #gpu_column_set
+        }
+    };
+
     Ok(quote! {
         #pod_impl
 
         #handle_registration
 
-        #[cfg(feature = "gpu")]
-        const _: () = {
-            #(#gpu_wrapper_defs)*
-            #scene_column_set_gpu
-            #gpu_column_set
-        };
-        #[cfg(not(feature = "gpu"))]
-        #scene_column_set_no_gpu
+        #scene_column_set
+
+        #gpu_expansion
     })
 }
 

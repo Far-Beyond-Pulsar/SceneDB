@@ -609,6 +609,32 @@ impl GpuBufferRegistry {
             (i as u64 * 16, chunk.iter().map(|byte| format!("{byte:02x}")).collect())
         }).collect()
     }
+
+    /// Resolve an inspector-supplied name without manufacturing a
+    /// non-static BufferKey.
+    pub fn key_named(&self, name: &str) -> Option<BufferKey> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        entries.keys().copied().find(|key| key.as_str() == name)
+    }
+
+    /// Read exactly one bounded byte range from a registered GPU buffer.
+    /// This is intentionally a diagnostic operation; callers should run it
+    /// away from the render thread because the readback waits for the GPU.
+    pub fn inspect_bytes_range(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: BufferKey,
+        offset: u64,
+        len: u64,
+    ) -> Option<Vec<u8>> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let entry = entries.get(&key)?;
+        let inner = entry.inner.as_ref()?.read().expect("GpuBufferRegistry lock poisoned");
+        let end = offset.checked_add(len)?;
+        if len == 0 || end > inner.buffer.size() { return None; }
+        Some(super::readback_bytes(device, queue, &inner.buffer, offset..end))
+    }
     /// Read back a bounded set of row cells for diagnostic inspection.
     /// Returns the reflected value when the registered element type has a
     /// reflection serializer, plus the raw bytes for every returned cell.

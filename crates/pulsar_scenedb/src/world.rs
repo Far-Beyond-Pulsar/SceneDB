@@ -93,6 +93,18 @@ pub struct World {
     /// automatically -- no `_tracked`-suffixed call needed anywhere. Not
     /// `gpu`-feature-gated: replication is always available (CONTRACTS C0).
     change_tracker: Option<crate::replication::SharedChangeTracker>,
+    /// Optional external inspector sink. The callback receives a complete snapshot
+    /// after authoritative SceneDB mutations and GPU mirror flushes.
+    #[cfg(feature = "telemetry")]
+    inspector_callback: Option<Box<dyn Fn(&crate::WorldSnapshot)>>,
+    #[cfg(feature = "telemetry")]
+    inspector_metadata_callback: Option<Box<dyn Fn(&crate::WorldSnapshot)>>,
+    #[cfg(feature = "telemetry")]
+    inspector_last_publish: std::cell::Cell<Option<std::time::Instant>>,
+    #[cfg(feature = "telemetry")]
+    inspector_request_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>>,
+    #[cfg(feature = "telemetry")]
+    inspector_response_callback: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     /// Per-`(Entity, ComponentId)` subscription wiring (see
     /// [`crate::subscriptions`] -- SceneDB#47), attached the same way as
     /// `change_tracker` above. `None` (the default) means every mutating
@@ -409,10 +421,127 @@ impl World {
             #[cfg(feature = "gpu")]
             gpu_mirror: None,
             change_tracker: None,
+            #[cfg(feature = "telemetry")]
+            inspector_callback: None,
+            #[cfg(feature = "telemetry")]
+            inspector_metadata_callback: None,
+            #[cfg(feature = "telemetry")]
+            inspector_last_publish: std::cell::Cell::new(None),
+            #[cfg(feature = "telemetry")]
+            inspector_request_queue: None,
+            #[cfg(feature = "telemetry")]
+            inspector_response_callback: None,
             subscriptions: None,
             handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::handle_ledger::HandleCounts::default(),
             )),
+        }
+    }
+
+    /// Install an optional callback used by external SceneDB inspector bridges.
+    /// The callback is invoked after public world mutations and GPU flushes.
+    #[cfg(feature = "telemetry")]
+    pub fn set_inspector_callback(
+        &mut self,
+        callback: Box<dyn Fn(&crate::WorldSnapshot)>,
+    ) {
+        self.inspector_callback = Some(callback);
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn notify_inspector(&self) {
+        if let Some(callback) = &self.inspector_callback {
+            let snapshot = self.telemetry_snapshot();
+            callback(&snapshot);
+        }
+        if let Some(callback) = &self.inspector_metadata_callback {
+            let snapshot = self.telemetry_snapshot_metadata();
+            callback(&snapshot);
+        }
+    }
+
+    /// Install the metadata-only callback used by live tooling. Unlike
+    /// [Self::set_inspector_callback], this never traverses ECS rows.
+    #[cfg(feature = "telemetry")]
+    pub fn set_inspector_metadata_callback(
+        &mut self,
+        callback: Box<dyn Fn(&crate::WorldSnapshot)>,
+    ) {
+        self.inspector_metadata_callback = Some(callback);
+    }
+
+    /// Install the request half of the live inspector bridge. The queue is
+    /// fed by the agent's shared-memory reader thread and drained only at an
+    /// explicit frame boundary by [Self::publish_inspector_snapshot].
+    #[cfg(feature = "telemetry")]
+    pub fn set_inspector_request_queue(
+        &mut self,
+        queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>,
+    ) {
+        self.inspector_request_queue = Some(queue);
+    }
+
+    /// Install the response sink used by the agent to publish selective
+    /// detail responses. GPU responses are delivered later from a worker.
+    #[cfg(feature = "telemetry")]
+    pub fn set_inspector_response_callback(
+        &mut self,
+        callback: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    ) {
+        self.inspector_response_callback = Some(callback);
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn service_inspector_requests(&self) {
+        let Some(queue) = &self.inspector_request_queue else { return };
+        let requests = {
+            let mut queue = queue.lock().expect("SceneDB inspector request queue poisoned");
+            queue.drain(..).take(8).collect::<Vec<_>>()
+        };
+        for bytes in requests {
+            let request = match serde_json::from_slice::<crate::InspectorRequest>(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("SceneDB inspector request decode failed: {error}");
+                    continue;
+                }
+            };
+            let cpu = request.cpu.as_ref().and_then(|request| self.inspector_cpu_range(request));
+            let callback = self.inspector_response_callback.clone();
+            let request_id = request.request_id;
+            let gpu_requested = request.gpu.is_some();
+            if let Some(gpu_request) = request.gpu.clone() {
+                #[cfg(feature = "gpu")]
+                if let (Some(mirror), Some(callback)) = (self.gpu_mirror.clone(), callback.clone()) {
+                    std::thread::Builder::new().name("scenedb-inspector-gpu-readback".into()).spawn(move || {
+                        let result = mirror.store().buffer_registry().key_named(&gpu_request.buffer)
+                            .and_then(|key| {
+                                let device = mirror.store().device_arc();
+                                let bytes = mirror.store().buffer_registry().inspect_bytes_range(
+                                    &device, mirror.queue(), key, gpu_request.byte_offset, gpu_request.byte_len,
+                                )?;
+                                Some(crate::InspectorGpuResponse {
+                                    buffer: gpu_request.buffer,
+                                    byte_offset: gpu_request.byte_offset,
+                                    bytes_hex: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+                                    cell: gpu_request.cell,
+                                })
+                            });
+                        let response = crate::InspectorResponse {
+                            kind: "detail", request_id, cpu, gpu: result, error: None,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&response) { callback(bytes); }
+                    }).ok();
+                    continue;
+                }
+            }
+            if let Some(callback) = callback {
+                let response = crate::InspectorResponse {
+                    kind: "detail", request_id, cpu, gpu: None,
+                    error: gpu_requested.then(|| "GPU mirror unavailable".to_owned()),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&response) { callback(bytes); }
+            }
         }
     }
 
@@ -714,10 +843,27 @@ impl World {
     /// attached but nothing was pending.
     #[cfg(feature = "gpu")]
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> Option<crate::gpu::SyncStats> {
-        self.gpu_mirror.as_ref().map(|m| {
+        let stats = self.gpu_mirror.as_ref().map(|m| {
             m.generations().flush(queue);
             m.store().flush_gpu_mirror(queue)
-        })
+        });
+        stats
+    }
+
+    /// Publish the current CPU and GPU state to an installed inspector bridge.
+    /// Call this after the GPU flush has returned, never from inside a
+    /// storage-locking operation.
+    pub fn publish_inspector_snapshot(&self) {
+        #[cfg(feature = "telemetry")]
+        {
+        let now = std::time::Instant::now();
+        if self.inspector_last_publish.get().is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(100)) {
+            return;
+        }
+        self.inspector_last_publish.set(Some(now));
+        self.service_inspector_requests();
+        self.notify_inspector();
+        }
     }
 
     /// Tier demand verb (`touch(id | row, range | whole, target_tier)`),
@@ -854,12 +1000,13 @@ impl World {
     /// only if you additionally need to record into a *different*,
     /// explicitly-held tracker.
     pub fn spawn(&mut self) -> Entity {
-        if let Some(shared) = self.change_tracker.clone() {
+        let entity = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.spawn_inner(Some(&mut guard))
         } else {
             self.spawn_inner(None)
-        }
+        };
+        entity
     }
 
     /// Like [`spawn`](Self::spawn) but also records the spawn in `tracker`.
@@ -929,12 +1076,13 @@ impl World {
     /// Records into the attached change tracker automatically, same as
     /// [`Self::spawn`] — see that method's doc.
     pub fn despawn(&mut self, entity: Entity) -> bool {
-        if let Some(shared) = self.change_tracker.clone() {
+        let removed = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.despawn_inner(entity, Some(&mut guard))
         } else {
             self.despawn_inner(entity, None)
-        }
+        };
+        removed
     }
 
     /// Like [`despawn`](Self::despawn) but also records the despawn in
@@ -1417,12 +1565,13 @@ impl World {
     /// Records into the attached change tracker automatically, same as
     /// [`Self::spawn`] — see that method's doc.
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
-        if let Some(shared) = self.change_tracker.clone() {
+        let removed = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.remove_inner(entity, Some(&mut guard))
         } else {
             self.remove_inner(entity, None)
-        }
+        };
+        removed
     }
 
     /// Like [`remove`](Self::remove) but also records the change in
