@@ -39,7 +39,7 @@ fn main() -> eframe::Result<()> {
     let target_args: Vec<String> = args.collect();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1450.0, 800.0]),
         ..Default::default()
     };
 
@@ -536,26 +536,89 @@ fn show_gpu_tab(
     }
     ui.label(format!("{} registered SceneDB GPU entries", entries.len()));
     ui.separator();
-    ui.columns(2, |columns| {
-        columns[0].heading("Buffers");
-        egui::ScrollArea::vertical().id_salt("scenedb_gpu_buffer_list").show(&mut columns[0], |ui| {
-            for buffer in &entries {
-                let Some(name) = buffer.get("name").and_then(|v| v.as_str()) else { continue };
-                let kind = buffer.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                if ui.selectable_label(selected.as_deref() == Some(name), format!("{name}  [{kind}]")).clicked() {
-                    *selected = Some(name.to_owned());
-                    *selected_cell = None;
-                }
-            }
+
+    let selected_buffer = selected.as_deref().and_then(|name| entries.iter().find(|b| b.get("name").and_then(|v| v.as_str()) == Some(name)));
+
+    egui::SidePanel::left("scenedb_gpu_buffers")
+        .resizable(true)
+        .default_width(220.0)
+        .min_width(160.0)
+        .show_inside(ui, |ui| {
+            ui.heading("Buffers");
+            egui::ScrollArea::vertical()
+                .id_salt("scenedb_gpu_buffer_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for buffer in &entries {
+                        let Some(name) = buffer.get("name").and_then(|v| v.as_str()) else { continue };
+                        let kind = buffer.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                        let label_width = ui.available_width();
+                        if ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(label_width, 24.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |row_ui| {
+                                    row_ui.add(egui::SelectableLabel::new(
+                                        selected.as_deref() == Some(name),
+                                        format!("{name}  [{kind}]"),
+                                    ))
+                                },
+                            )
+                            .inner
+                            .clicked()
+                        {
+                            *selected = Some(name.to_owned());
+                            *selected_cell = None;
+                        }
+                    }
+                });
         });
 
-        let selected_buffer = selected.as_deref().and_then(|name| entries.iter().find(|b| b.get("name").and_then(|v| v.as_str()) == Some(name)));
-        columns[1].heading(selected.as_deref().unwrap_or("Buffer"));
+    egui::SidePanel::right("scenedb_gpu_details")
+        .resizable(true)
+        .default_width(460.0)
+        .min_width(300.0)
+        .max_width(700.0)
+        .show_inside(ui, |ui| {
+            ui.heading("Details panel");
+            let Some(buffer) = selected_buffer else {
+                ui.label("Select a SceneDB GPU entry.");
+                return;
+            };
+            if is_pixel_buffer(buffer) {
+                show_pixel_canvas(ui, buffer, zoom, pan);
+                return;
+            }
+
+            let cells = buffer.get("cells").and_then(|value| value.as_array()).map(Vec::as_slice).unwrap_or(&[]);
+            let Some(index) = *selected_cell else {
+                ui.label("Select a cell to inspect its reflected contents.");
+                return;
+            };
+            let Some(cell) = cells.iter().find(|cell| cell.get("index").and_then(|v| v.as_u64()) == Some(index as u64)) else {
+                ui.label("Selected cell is not in this snapshot.");
+                return;
+            };
+            ui.label(format!("cell {index}"));
+            ui.label("reflected value");
+            egui::ScrollArea::vertical().id_salt("scenedb_gpu_cell_detail").auto_shrink([false, false]).show(ui, |ui| {
+                match cell.get("reflected").filter(|v| !v.is_null()) {
+                    Some(value) => { ui.push_id(index, |ui| show_json_tree(ui, value)); },
+                    None => { ui.label("No reflection value was published for this row."); }
+                }
+                ui.separator();
+                ui.label("raw bytes");
+                ui.monospace(cell.get("bytes_hex").and_then(|v| v.as_str()).unwrap_or(""));
+            });
+        });
+
+    egui::CentralPanel::default().show_inside(ui, |ui| {
         let Some(buffer) = selected_buffer else {
-            columns[1].label("Select a SceneDB GPU entry.");
+            ui.label("Select a SceneDB GPU entry.");
             return;
         };
-        egui::Grid::new("scenedb_gpu_buffer_metadata").striped(true).show(&mut columns[1], |ui| {
+        ui.heading(selected.as_deref().unwrap_or("Buffer"));
+        egui::Grid::new("scenedb_gpu_buffer_metadata").striped(true).show(ui, |ui| {
             for key in ["kind", "element_size", "capacity_bytes", "epoch", "access", "mirror_mode", "element_type_name", "cells_truncated"] {
                 if let Some(value) = buffer.get(key) {
                     ui.label(key);
@@ -564,39 +627,30 @@ fn show_gpu_tab(
                 }
             }
         });
-
-        if is_pixel_buffer(buffer) {
-            show_pixel_canvas(&mut columns[1], buffer, zoom, pan);
-            return;
-        }
-
+        ui.separator();
+        let element_size = buffer
+            .get("element_size")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
         let cells = buffer.get("cells").and_then(|value| value.as_array()).map(Vec::as_slice).unwrap_or(&[]);
-        columns[1].heading("Cells");
+        ui.heading(format!("Cells ({})", cells.len()));
         if cells.is_empty() {
             let raw_chunks = buffer.get("raw_chunks").and_then(|value| value.as_array()).map(Vec::as_slice).unwrap_or(&[]);
             if raw_chunks.is_empty() {
-                columns[1].label("This SceneDB entry is empty: SceneDB reports zero capacity bytes.");
+                ui.label("This SceneDB entry has no readable rows.");
             } else {
-                columns[1].label("Raw SceneDB bytes (no typed reflection schema is registered for this entry):");
-                egui::ScrollArea::vertical().show(&mut columns[1], |ui| {
-                    for chunk in raw_chunks {
-                        ui.horizontal(|ui| {
-                            ui.monospace(format!("{:08x}", chunk.get("offset").and_then(|v| v.as_u64()).unwrap_or(0)));
-                            ui.monospace(chunk.get("bytes_hex").and_then(|v| v.as_str()).unwrap_or(""));
-                        });
-                    }
-                });
+                ui.label("No row cells; raw bytes are available in Details panel.");
             }
             return;
         }
         if selected_cell.map(|row| row >= cells.len()).unwrap_or(true) {
             *selected_cell = Some(0);
         }
-        columns[1].label(format!("{} cells read back; values use the registered reflection type", cells.len()));
+        ui.label(format!("{} cells read back; click a row for details", cells.len()));
         egui::ScrollArea::vertical()
             .id_salt("scenedb_gpu_cells")
-            .max_height(columns[1].available_height() * 0.55)
-            .show_rows(&mut columns[1], 20.0, cells.len(), |ui, range| {
+            .auto_shrink([false, false])
+            .show_rows(ui, 24.0, cells.len(), |ui, range| {
                 for position in range {
                     let cell = &cells[position];
                     let index = cell.get("index").and_then(|v| v.as_u64()).unwrap_or(position as u64) as usize;
@@ -605,31 +659,48 @@ fn show_gpu_tab(
                         .and_then(extract_overview)
                         .or_else(|| reflected.map(format_json_inline))
                         .unwrap_or_else(|| "no reflection value".to_owned());
-                    let label = format!("cell {index}  —  {summary}");
-                    if ui.selectable_label(*selected_cell == Some(index), label).clicked() {
+
+                    let max_summary_chars = ((ui.available_width() - 150.0) / 7.0).max(8.0) as usize;
+                    let summary = if summary.chars().count() > max_summary_chars {
+                        let mut short = summary.chars().take(max_summary_chars.saturating_sub(1)).collect::<String>();
+                        short.push('…');
+                        short
+                    } else {
+                        summary
+                    };
+                    let mut row_text = egui::text::LayoutJob::default();
+                    row_text.append(
+                        &format!("cell {index}  ·  {element_size}B  ·  "),
+                        0.0,
+                        egui::TextFormat::default(),
+                    );
+                    row_text.append(
+                        &summary,
+                        0.0,
+                        egui::TextFormat {
+                            color: ui.visuals().weak_text_color(),
+                            ..Default::default()
+                        },
+                    );
+                    let row_width = ui.available_width();
+                    if ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(row_width, 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |row_ui| {
+                                row_ui.add(egui::SelectableLabel::new(
+                                    *selected_cell == Some(index),
+                                    row_text,
+                                ))
+                            },
+                        )
+                        .inner
+                        .clicked()
+                    {
                         *selected_cell = Some(index);
                     }
                 }
             });
-        columns[1].separator();
-        egui::ScrollArea::vertical().id_salt("scenedb_gpu_cell_detail").show(&mut columns[1], |ui| {
-            let Some(index) = *selected_cell else {
-                ui.label("Select a cell to inspect its reflected contents.");
-                return;
-            };
-            let Some(cell) = cells.iter().find(|cell| cell.get("index").and_then(|v| v.as_u64()) == Some(index as u64)) else {
-                return;
-            };
-            ui.label(format!("cell {index}"));
-            ui.label("reflected value");
-            match cell.get("reflected").filter(|v| !v.is_null()) {
-                Some(value) => show_json_tree(ui, value),
-                None => { ui.label("No reflection serializer is registered for this element type."); }
-            }
-            ui.separator();
-            ui.label("raw bytes");
-            ui.monospace(cell.get("bytes_hex").and_then(|v| v.as_str()).unwrap_or(""));
-        });
     });
 }
 fn synthetic_pixel_buffer() -> serde_json::Value {
