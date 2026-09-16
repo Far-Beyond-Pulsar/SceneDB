@@ -15,7 +15,7 @@ telemetry = ["dep:socket2", "dep:serde", "gpu"]
 # dispatch path needs. Additive-only on the Pulsar-Reflection side (see
 # that PR), so this is safe ahead of merge; repin to whatever commit
 # Pulsar-Reflection#3 merges as once that lands.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "745ee787cc63288463c170aafb778672db8e85ac" }
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "1c64758" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
