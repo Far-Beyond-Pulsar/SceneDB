@@ -1,8 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{
-    parse::Parse, Data, DeriveInput, Fields, Ident, Type,
-};
+use syn::{parse::Parse, Data, DeriveInput, Fields, Ident, Type};
 
 use crate::cell::generate_scene_column_set;
 use crate::gpu::generate_gpu_column_set;
@@ -94,7 +92,12 @@ impl Parse for GpuAttr {
                 break;
             }
         }
-        Ok(GpuAttr { mirror_mode, buffer_key, heavy, content_id })
+        Ok(GpuAttr {
+            mirror_mode,
+            buffer_key,
+            heavy,
+            content_id,
+        })
     }
 }
 
@@ -125,7 +128,10 @@ impl Parse for StructGpuAttr {
                 "layout" => {
                     let value: Ident = input.parse()?;
                     if value != "packed" {
-                        return Err(syn::Error::new(value.span(), "expected `packed` -- the only supported layout today"));
+                        return Err(syn::Error::new(
+                            value.span(),
+                            "expected `packed` -- the only supported layout today",
+                        ));
                     }
                     layout_packed = true;
                 }
@@ -146,7 +152,10 @@ impl Parse for StructGpuAttr {
                 break;
             }
         }
-        Ok(StructGpuAttr { layout_packed, buffer_key })
+        Ok(StructGpuAttr {
+            layout_packed,
+            buffer_key,
+        })
     }
 }
 
@@ -183,7 +192,14 @@ impl Parse for StructGpuAttr {
 /// behavior for the same attribute name used at two different syntactic
 /// positions in this macro.
 pub fn struct_gpu_attr(attrs: &[syn::Attribute]) -> StructGpuAttr {
-    attrs.iter().find(|attr| attr.path().is_ident("gpu")).and_then(|attr| attr.parse_args::<StructGpuAttr>().ok()).unwrap_or(StructGpuAttr { layout_packed: false, buffer_key: None })
+    attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("gpu"))
+        .and_then(|attr| attr.parse_args::<StructGpuAttr>().ok())
+        .unwrap_or(StructGpuAttr {
+            layout_packed: false,
+            buffer_key: None,
+        })
 }
 
 // ── Per-field metadata ────────────────────────────────────────────────────
@@ -310,12 +326,16 @@ pub enum VarLenShape {
 /// `std::vec::Vec` or `alloc::vec::Vec`) would reject the overwhelmingly
 /// common bare `Vec<T>` spelling most callers actually write.
 pub(crate) fn as_vec_elem_type(ty: &Type) -> Option<Type> {
-    let Type::Path(type_path) = ty else { return None };
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
     let last = type_path.path.segments.last()?;
     if last.ident != "Vec" {
         return None;
     }
-    let syn::PathArguments::AngleBracketed(args) = &last.arguments else { return None };
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
     if args.args.len() != 1 {
         return None;
     }
@@ -347,8 +367,12 @@ fn unsupported_heavy_composition_error(field: &Ident) -> syn::Error {
 /// `pulsar_scenedb::handle_ledger::HandleId` spelling would reject the bare
 /// import every real caller writes.
 fn as_handle_id_field(ty: &Type) -> bool {
-    let Type::Path(type_path) = ty else { return false };
-    let Some(last) = type_path.path.segments.last() else { return false };
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return false;
+    };
     if last.ident != "HandleId" {
         return false;
     }
@@ -416,6 +440,181 @@ fn generate_handle_registration(
     }
 }
 
+/// Generates the `Reflectable` impl + `inventory` registration that puts a
+/// `#[derive(SceneStore)]` type into `pulsar_reflection`'s
+/// `RUNTIME_TYPE_REGISTRY`, reflecting its non-Heavy `#[gpu]` fields.
+///
+/// This is what lets `world_telemetry`'s inspector decode a component row into
+/// structured JSON instead of raw hex: the registry lookup is keyed by the
+/// component's own `TypeId`, so the type itself -- not just its generated
+/// packed view -- has to be registered.
+///
+/// Only `#[gpu]` fields are reflected. They are already the fields whose types
+/// the packed view's own `#[derive(Reflectable)]` proves reflectable, and they
+/// are the fields the GPU-facing record is made of. Non-`#[gpu]` fields are
+/// ordinary `Pod` fields that may be arbitrary handle newtypes (`HandleId`,
+/// `AssetId`, ...) with no `Reflectable` impl at all -- reflecting them would
+/// fail to compile for those types. `#[gpu(heavy)]` fields are skipped for the
+/// same reason: their declared type is a lightweight upload handle, not the
+/// element data.
+///
+/// `all_fields_reflected` is `true` only when every field on the struct is a
+/// reflected `#[gpu]` field. In that case the generated `deserialize` can
+/// rebuild `Self` field-for-field; otherwise it returns an error, because the
+/// skipped fields have no value to reconstruct from. `serialize` still works
+/// either way.
+fn generate_reflection_impl(
+    name: &Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+    reflect_fields: &[&FieldInfo],
+    all_fields_reflected: bool,
+) -> TokenStream {
+    let field_infos = reflect_fields.iter().map(|f| {
+        let ident = &f.ident;
+        let name_str = ident.to_string();
+        let ty = &f.ty;
+        quote! {
+            ::pulsar_scenedb::pulsar_reflection::FieldInfo {
+                name: #name_str,
+                type_info: <#ty as ::pulsar_scenedb::pulsar_reflection::Reflectable>::type_info(),
+                offset: ::std::mem::offset_of!(#name #ty_generics, #ident),
+            }
+        }
+    });
+
+    let serialize_fields = reflect_fields.iter().map(|f| {
+        let ident = &f.ident;
+        let name_str = ident.to_string();
+        quote! { (#name_str, &self.#ident as &dyn ::std::any::Any) }
+    });
+
+    let deserialize_fields = reflect_fields.iter().map(|f| {
+        let ident = &f.ident;
+        let name_str = ident.to_string();
+        let ty = &f.ty;
+        quote! {
+            #ident: {
+                let value = fields.get(#name_str).ok_or_else(|| {
+                    ::pulsar_scenedb::pulsar_reflection::ReflectError::MissingField {
+                        struct_name: stringify!(#name),
+                        field_name: #name_str,
+                    }
+                })?;
+                value.downcast_ref::<#ty>().cloned().ok_or_else(|| {
+                    ::pulsar_scenedb::pulsar_reflection::ReflectError::TypeMismatch {
+                        expected: stringify!(#ty),
+                        found: ::std::format!("{:?}", value.type_id()),
+                    }
+                })?
+            }
+        }
+    });
+
+    let deserialize_body = if all_fields_reflected {
+        quote! {
+            let type_info = <Self as ::pulsar_scenedb::pulsar_reflection::Reflectable>::type_info();
+            let fields_info = type_info.fields().ok_or_else(|| {
+                ::pulsar_scenedb::pulsar_reflection::ReflectError::DeserializationFailed(
+                    ::std::format!("{} is not a struct", stringify!(#name))
+                )
+            })?;
+            let fields = deserializer.deserialize_struct(fields_info)?;
+            ::core::result::Result::Ok(Self {
+                #(#deserialize_fields),*
+            })
+        }
+    } else {
+        quote! {
+            let _ = deserializer;
+            ::core::result::Result::Err(
+                ::pulsar_scenedb::pulsar_reflection::ReflectError::DeserializationFailed(
+                    ::std::format!(
+                        "{} cannot be deserialized via reflection: it has non-#[gpu] fields",
+                        stringify!(#name)
+                    )
+                )
+            )
+        }
+    };
+
+    quote! {
+        const _: () = {
+            impl #impl_generics ::pulsar_scenedb::pulsar_reflection::Reflectable
+                for #name #ty_generics #where_clause
+            {
+                fn type_info() -> &'static ::pulsar_scenedb::pulsar_reflection::RuntimeTypeInfo {
+                    static CELL: ::std::sync::OnceLock<
+                        ::pulsar_scenedb::pulsar_reflection::RuntimeTypeInfo,
+                    > = ::std::sync::OnceLock::new();
+                    CELL.get_or_init(|| {
+                        let fields: &'static [::pulsar_scenedb::pulsar_reflection::FieldInfo] =
+                            ::std::boxed::Box::leak(::std::boxed::Box::new([#(#field_infos),*]));
+                        ::pulsar_scenedb::pulsar_reflection::RuntimeTypeInfo {
+                            type_id: ::std::any::TypeId::of::<#name #ty_generics>(),
+                            type_name: stringify!(#name),
+                            size: ::std::mem::size_of::<#name #ty_generics>(),
+                            align: ::std::mem::align_of::<#name #ty_generics>(),
+                            structure: ::pulsar_scenedb::pulsar_reflection::TypeStructure::Struct {
+                                fields,
+                            },
+                            color: ::core::option::Option::None,
+                        }
+                    })
+                }
+
+                fn serialize(
+                    &self,
+                    serializer: &mut dyn ::pulsar_scenedb::pulsar_reflection::TypeSerializer,
+                ) -> ::pulsar_scenedb::pulsar_reflection::ReflectResult<()> {
+                    serializer.serialize_struct(&[#(#serialize_fields),*])
+                }
+
+                fn deserialize(
+                    deserializer: &mut dyn ::pulsar_scenedb::pulsar_reflection::TypeDeserializer,
+                ) -> ::pulsar_scenedb::pulsar_reflection::ReflectResult<Self> {
+                    #deserialize_body
+                }
+
+                fn clone_any(&self) -> ::std::boxed::Box<dyn ::std::any::Any> {
+                    ::std::boxed::Box::new(::std::clone::Clone::clone(self))
+                }
+            }
+
+            ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+                ::pulsar_scenedb::pulsar_reflection::RuntimeTypeRegistration {
+                    type_info: <#name #ty_generics as ::pulsar_scenedb::pulsar_reflection::Reflectable>::type_info,
+                    serialize_json: |value: &dyn ::std::any::Any| {
+                        let typed = value
+                            .downcast_ref::<#name #ty_generics>()
+                            .ok_or_else(|| ::pulsar_scenedb::pulsar_reflection::ReflectError::TypeMismatch {
+                                expected: stringify!(#name),
+                                found: ::std::format!("{:?}", value.type_id()),
+                            })?;
+                        let mut serializer = ::pulsar_scenedb::pulsar_reflection::JsonSerializer::new();
+                        <#name #ty_generics as ::pulsar_scenedb::pulsar_reflection::Reflectable>::serialize(
+                            typed,
+                            &mut serializer,
+                        )?;
+                        ::core::result::Result::Ok(serializer.into_json())
+                    },
+                    deserialize_json: |value: ::pulsar_scenedb::pulsar_reflection::serde_json::Value| {
+                        let mut deserializer =
+                            ::pulsar_scenedb::pulsar_reflection::JsonDeserializer::new(value);
+                        let typed = <#name #ty_generics as ::pulsar_scenedb::pulsar_reflection::Reflectable>::deserialize(
+                            &mut deserializer,
+                        )?;
+                        ::core::result::Result::Ok(
+                            ::std::boxed::Box::new(typed) as ::std::boxed::Box<dyn ::std::any::Any>
+                        )
+                    },
+                }
+            }
+        };
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -474,12 +673,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         // built-ins included), not generic over their `#[gpu]` fields'
         // types, so this covers the real cases; a future fix for the
         // generic case would fold `ty_generics` into the wrapper name.
-        let gpu_wrapper = is_gpu.then(|| {
-            Ident::new(
-                &format!("__ScenedbGpuCol_{}_{}", name, ident),
-                ident.span(),
-            )
-        });
+        let gpu_wrapper = is_gpu
+            .then(|| Ident::new(&format!("__ScenedbGpuCol_{}_{}", name, ident), ident.span()));
 
         let mut var_len_elem_ty = is_gpu.then(|| as_vec_elem_type(&ty)).flatten();
         let is_var_len = var_len_elem_ty.is_some();
@@ -496,7 +691,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let mut either_ok_ty: Option<Type> = None;
         let mut either_err_ty: Option<Type> = None;
         if is_gpu && is_var_len {
-            let shape = ty_shape::analyze(var_len_elem_ty.as_ref().expect("is_var_len implies elem"));
+            let shape =
+                ty_shape::analyze(var_len_elem_ty.as_ref().expect("is_var_len implies elem"));
             if shape.contains_heavy() {
                 match shape {
                     TyShape::Heavy(handle) => {
@@ -624,7 +820,34 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let field_types: Vec<&Type> = field_infos.iter().map(|f| &f.ty).collect();
     let gpu_fields: Vec<&FieldInfo> = field_infos.iter().filter(|f| f.is_gpu).collect();
 
-    let pod_impl = generate_pod_impl(name, &impl_generics, &ty_generics, where_clause, &field_types);
+    // Register the type itself with `pulsar_reflection` so the inspector's
+    // `world_telemetry` decode (keyed by the component's own `TypeId`) finds
+    // it. Reflect only the plain `#[gpu]` data fields: `heavy` fields hold
+    // upload handles and non-`#[gpu]` fields hold arbitrary `Pod` handle
+    // types, neither of which is guaranteed `Reflectable`. See
+    // `generate_reflection_impl`'s doc.
+    let reflect_fields: Vec<&FieldInfo> = gpu_fields.iter().copied().filter(|f| !f.heavy).collect();
+    let all_fields_reflected = field_infos.iter().all(|f| f.is_gpu && !f.heavy);
+    let reflection = if reflect_fields.is_empty() {
+        quote! {}
+    } else {
+        generate_reflection_impl(
+            name,
+            &impl_generics,
+            &ty_generics,
+            where_clause,
+            &reflect_fields,
+            all_fields_reflected,
+        )
+    };
+
+    let pod_impl = generate_pod_impl(
+        name,
+        &impl_generics,
+        &ty_generics,
+        where_clause,
+        &field_types,
+    );
 
     // A `SceneStore` derive expands in its *consumer* crate, so it cannot
     // inspect SceneDB's dependency features with `cfg(feature = "gpu")`:
@@ -652,7 +875,10 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let gpu_wrapper_defs: Vec<TokenStream> = gpu_fields
         .iter()
         .map(|f| {
-            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
             let ty = &f.ty;
             quote! {
                 // Byte-identical to #ty (repr(transparent), single field) --
@@ -707,6 +933,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         #scene_column_set
 
         #gpu_expansion
+
+        #reflection
     })
 }
 
@@ -726,12 +954,10 @@ fn generate_pod_impl(
         })
         .collect();
 
-    let mut wc: syn::WhereClause = where_clause
-        .cloned()
-        .unwrap_or_else(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: syn::punctuated::Punctuated::new(),
-        });
+    let mut wc: syn::WhereClause = where_clause.cloned().unwrap_or_else(|| syn::WhereClause {
+        where_token: Default::default(),
+        predicates: syn::punctuated::Punctuated::new(),
+    });
 
     for bound in &pod_bounds {
         let pred: syn::WherePredicate = syn::parse_quote! { #bound };
