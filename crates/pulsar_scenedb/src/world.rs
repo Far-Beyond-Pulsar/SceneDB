@@ -96,11 +96,11 @@ pub struct World {
     /// Optional external inspector sink. The callback receives a complete snapshot
     /// after authoritative SceneDB mutations and GPU mirror flushes.
     #[cfg(feature = "telemetry")]
-    inspector_callback: Option<Box<dyn Fn(&crate::WorldSnapshot)>>,
+    inspector_callback: Option<Box<dyn Fn(&crate::WorldSnapshot) + Send + Sync>>,
     #[cfg(feature = "telemetry")]
-    inspector_metadata_callback: Option<Box<dyn Fn(&crate::WorldSnapshot)>>,
+    inspector_metadata_callback: Option<Box<dyn Fn(&crate::WorldSnapshot) + Send + Sync>>,
     #[cfg(feature = "telemetry")]
-    inspector_last_publish: std::cell::Cell<Option<std::time::Instant>>,
+    inspector_last_publish: std::sync::Mutex<Option<std::time::Instant>>,
     #[cfg(feature = "telemetry")]
     inspector_request_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>>,
     #[cfg(feature = "telemetry")]
@@ -426,7 +426,7 @@ impl World {
             #[cfg(feature = "telemetry")]
             inspector_metadata_callback: None,
             #[cfg(feature = "telemetry")]
-            inspector_last_publish: std::cell::Cell::new(None),
+            inspector_last_publish: std::sync::Mutex::new(None),
             #[cfg(feature = "telemetry")]
             inspector_request_queue: None,
             #[cfg(feature = "telemetry")]
@@ -443,7 +443,7 @@ impl World {
     #[cfg(feature = "telemetry")]
     pub fn set_inspector_callback(
         &mut self,
-        callback: Box<dyn Fn(&crate::WorldSnapshot)>,
+        callback: Box<dyn Fn(&crate::WorldSnapshot) + Send + Sync>,
     ) {
         self.inspector_callback = Some(callback);
     }
@@ -465,7 +465,7 @@ impl World {
     #[cfg(feature = "telemetry")]
     pub fn set_inspector_metadata_callback(
         &mut self,
-        callback: Box<dyn Fn(&crate::WorldSnapshot)>,
+        callback: Box<dyn Fn(&crate::WorldSnapshot) + Send + Sync>,
     ) {
         self.inspector_metadata_callback = Some(callback);
     }
@@ -603,6 +603,13 @@ impl World {
     /// original handle all the way there separately).
     pub fn change_tracker(&self) -> Option<&crate::replication::SharedChangeTracker> {
         self.change_tracker.as_ref()
+    }
+
+    /// Monotonic count of every mutation this world has recorded, or `0` when no
+    /// change tracker is attached. Two equal readings mean nothing changed between
+    /// them -- the cheap "is the world dirty?" check for idle frames and panels.
+    pub fn revision(&self) -> u64 {
+        self.change_tracker.as_ref().map_or(0, |tracker| tracker.revision())
     }
 
     // ── Component subscriptions (SceneDB#47) ────────────────────────────────
@@ -863,10 +870,13 @@ impl World {
         #[cfg(feature = "telemetry")]
         {
         let now = std::time::Instant::now();
-        if self.inspector_last_publish.get().is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(100)) {
-            return;
+        {
+            let mut last_publish = self.inspector_last_publish.lock().expect("inspector publish clock poisoned");
+            if last_publish.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(100)) {
+                return;
+            }
+            *last_publish = Some(now);
         }
-        self.inspector_last_publish.set(Some(now));
         self.service_inspector_requests();
         self.notify_inspector();
         }
