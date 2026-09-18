@@ -599,6 +599,13 @@ impl World {
         self.change_tracker.as_ref()
     }
 
+    /// Monotonic count of every mutation this world has recorded, or `0` when no
+    /// change tracker is attached. Two equal readings mean nothing changed between
+    /// them -- the cheap "is the world dirty?" check for idle frames and panels.
+    pub fn revision(&self) -> u64 {
+        self.change_tracker.as_ref().map_or(0, |tracker| tracker.revision())
+    }
+
     // ── Component subscriptions (SceneDB#47) ────────────────────────────────
 
     /// Subscribe to changes of component `T` on `entity`: every subsequent

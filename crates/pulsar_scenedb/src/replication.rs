@@ -1497,6 +1497,11 @@ pub struct ChangeTracker {
     component_removals: Vec<(Entity, ComponentId)>,
     events: Vec<ReplicatedEvent>,
     frame: u64,
+    /// Monotonic count of every mutation ever recorded (spawn, despawn, component
+    /// write/insert/remove, event). Never reset by a drain, so a consumer that
+    /// only wants "has the world changed since I last looked?" -- an idle-frame
+    /// check, a panel refresh -- compares two values instead of draining.
+    revision: u64,
 }
 
 impl ChangeTracker {
@@ -1508,14 +1513,22 @@ impl ChangeTracker {
             component_removals: Vec::new(),
             events: Vec::new(),
             frame: 0,
+            revision: 0,
         }
     }
 
+    /// Monotonic mutation counter; see the `revision` field.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn record_spawn(&mut self, entity: Entity) {
+        self.revision = self.revision.wrapping_add(1);
         self.spawned.push(entity);
     }
 
     pub fn record_despawn(&mut self, entity: Entity) {
+        self.revision = self.revision.wrapping_add(1);
         self.despawned.push(entity);
     }
 
@@ -1523,6 +1536,7 @@ impl ChangeTracker {
     /// see [`Self::component_removals`]'s doc for why this is a separate,
     /// unambiguous list rather than folded into [`Self::record_component_change`].
     pub fn record_component_removal(&mut self, entity: Entity, component_type: ComponentId) {
+        self.revision = self.revision.wrapping_add(1);
         self.component_removals.push((entity, component_type));
     }
 
@@ -1543,6 +1557,7 @@ impl ChangeTracker {
         field_index: u32,
         field_bytes: Vec<u8>,
     ) {
+        self.revision = self.revision.wrapping_add(1);
         // Find existing ComponentDelta for this entity+component, or create one.
         if let Some(existing) = self
             .component_changes
@@ -1571,6 +1586,7 @@ impl ChangeTracker {
     }
 
     pub fn record_event(&mut self, event: ReplicatedEvent) {
+        self.revision = self.revision.wrapping_add(1);
         self.events.push(event);
     }
 
@@ -1682,6 +1698,11 @@ impl SharedChangeTracker {
         authority: &AuthorityTable,
     ) -> (Delta, Vec<ReplicatedEvent>) {
         self.lock().drain(schema, client, authority)
+    }
+
+    /// Monotonic mutation counter; see [`ChangeTracker::revision`].
+    pub fn revision(&self) -> u64 {
+        self.lock().revision()
     }
 
     /// Same contract as [`ChangeTracker::end_frame`].
