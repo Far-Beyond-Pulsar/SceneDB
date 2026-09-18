@@ -507,6 +507,12 @@ impl World {
                 }
             };
             let cpu = request.cpu.as_ref().and_then(|request| self.inspector_cpu_range(request));
+            let cpu_ranges = request.cpu_ranges.as_ref().map(|ranges| {
+                ranges
+                    .iter()
+                    .filter_map(|range| self.inspector_cpu_range(range))
+                    .collect::<Vec<_>>()
+            });
             let callback = self.inspector_response_callback.clone();
             let request_id = request.request_id;
             let gpu_requested = request.gpu.is_some();
@@ -528,7 +534,7 @@ impl World {
                                 })
                             });
                         let response = crate::InspectorResponse {
-                            kind: "detail", request_id, cpu, gpu: result, error: None,
+                            kind: "detail", request_id, cpu, cpu_ranges, gpu: result, error: None,
                         };
                         if let Ok(bytes) = serde_json::to_vec(&response) { callback(bytes); }
                     }).ok();
@@ -537,7 +543,7 @@ impl World {
             }
             if let Some(callback) = callback {
                 let response = crate::InspectorResponse {
-                    kind: "detail", request_id, cpu, gpu: None,
+                    kind: "detail", request_id, cpu, cpu_ranges, gpu: None,
                     error: gpu_requested.then(|| "GPU mirror unavailable".to_owned()),
                 };
                 if let Ok(bytes) = serde_json::to_vec(&response) { callback(bytes); }

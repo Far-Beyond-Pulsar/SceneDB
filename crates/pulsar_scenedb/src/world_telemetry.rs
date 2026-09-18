@@ -62,6 +62,15 @@ pub struct WorldSnapshot {
 pub struct InspectorRequest {
     pub request_id: u64,
     pub cpu: Option<InspectorCpuRequest>,
+    /// Multiple CPU column windows, serviced in a single round-trip. The
+    /// shared-memory bridge only ever delivers the *latest* request (an
+    /// older one is overwritten in place), so a client that needs several
+    /// ranges at once -- e.g. the 4-pane inspector fetching the entity
+    /// viewport plus the selected entity's row across every column --
+    /// batches them here rather than sending N requests that would clobber
+    /// one another before the host drains its queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ranges: Option<Vec<InspectorCpuRequest>>,
     pub gpu: Option<InspectorGpuRequest>,
 }
 
@@ -86,6 +95,10 @@ pub struct InspectorResponse {
     pub kind: &'static str,
     pub request_id: u64,
     pub cpu: Option<InspectorCpuResponse>,
+    /// One [`InspectorCpuResponse`] per range in
+    /// [`InspectorRequest::cpu_ranges`], in the same order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_ranges: Option<Vec<InspectorCpuResponse>>,
     pub gpu: Option<InspectorGpuResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -322,5 +335,106 @@ fn hex_char(v: u8) -> char {
         (b'0' + v) as char
     } else {
         (b'a' + v - 10) as char
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    struct Pos(i32, i32);
+    #[derive(Clone, Copy)]
+    struct Vel(i32, i32);
+
+    /// A request's `cpu_ranges` must be serviced together and returned in
+    /// order in a single response -- this is the property the 4-pane
+    /// inspector relies on, since the shared-memory bridge only delivers the
+    /// latest request and cannot carry two separate requests in flight.
+    #[test]
+    fn multi_range_request_returns_every_window_in_one_ordered_response() {
+        let mut world = World::new();
+        world.spawn_bundle((Pos(10, 11), Vel(20, 21)));
+        world.spawn_bundle((Pos(30, 31), Vel(40, 41)));
+
+        let meta = world.telemetry_snapshot_metadata();
+        let arch = meta
+            .archetypes
+            .iter()
+            .find(|a| !a.columns.is_empty())
+            .expect("spawned archetype");
+        let pos = arch
+            .columns
+            .iter()
+            .find(|c| c.type_name.ends_with("Pos"))
+            .expect("Pos column");
+        let vel = arch
+            .columns
+            .iter()
+            .find(|c| c.type_name.ends_with("Vel"))
+            .expect("Vel column");
+
+        let queue = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let responses = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        world.set_inspector_request_queue(queue.clone());
+        {
+            let responses = responses.clone();
+            world.set_inspector_response_callback(Arc::new(move |bytes| {
+                responses.lock().unwrap().push(bytes);
+            }));
+        }
+
+        let request = serde_json::json!({
+            "request_id": 7,
+            "cpu": null,
+            "cpu_ranges": [
+                {
+                    "archetype_id": arch.id,
+                    "component_id": pos.component_id,
+                    "row_start": 0,
+                    "row_count": 2,
+                },
+                {
+                    "archetype_id": arch.id,
+                    "component_id": vel.component_id,
+                    "row_start": 1,
+                    "row_count": 1,
+                },
+            ],
+            "gpu": null,
+        });
+        queue
+            .lock()
+            .unwrap()
+            .push_back(serde_json::to_vec(&request).unwrap());
+
+        world.publish_inspector_snapshot();
+
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 1, "one request must yield one response");
+        let value: serde_json::Value = serde_json::from_slice(&responses[0]).unwrap();
+        assert_eq!(value["request_id"].as_u64(), Some(7));
+
+        let ranges = value["cpu_ranges"].as_array().expect("cpu_ranges present");
+        assert_eq!(ranges.len(), 2, "one entry per requested range, in order");
+
+        assert_eq!(ranges[0]["component_id"].as_u64(), Some(pos.component_id as u64));
+        assert_eq!(ranges[0]["row_start"].as_u64(), Some(0));
+        assert_eq!(ranges[0]["entities"].as_array().unwrap().len(), 2);
+        // A plain (non-`Reflectable`) component dumps raw hex, not JSON.
+        assert_eq!(ranges[0]["rows_hex"].as_array().unwrap().len(), 2);
+        assert!(ranges[0]["rows_reflected"].is_null());
+
+        assert_eq!(ranges[1]["component_id"].as_u64(), Some(vel.component_id as u64));
+        assert_eq!(ranges[1]["row_start"].as_u64(), Some(1));
+        assert_eq!(ranges[1]["entities"].as_array().unwrap().len(), 1);
+
+        // Same archetype row => same entity bits across every column.
+        assert_eq!(
+            ranges[0]["entities"][1], ranges[1]["entities"][0],
+            "row 1 must address the same entity in both columns"
+        );
     }
 }
