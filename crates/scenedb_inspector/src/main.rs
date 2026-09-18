@@ -4,8 +4,16 @@
 //! the generic viewer). Launches a target executable with
 //! `SCENEDB_INSPECTOR_SHM` set, attaches to the shared-memory segment the
 //! agent publishes into once the target starts, and renders the live
-//! `pulsar_scenedb::World` snapshot (archetypes -> columns -> per-row raw
-//! hex bytes / reflected JSON) as a tree.
+//! `pulsar_scenedb::World` state as standard ECS-inspector panes:
+//! archetypes | entities | components | details.
+//!
+//! The agent only publishes *metadata* (`telemetry_snapshot_metadata`), so
+//! entity bits and row values are fetched on demand through
+//! `InspectorCpuRequest` windows. Because the shared-memory bridge delivers
+//! only the latest request, the client batches every window it needs for
+//! the current selection into one request's `cpu_ranges` (entity viewport
+//! plus the selected entity's row across all columns) and splices each
+//! returned range back into the snapshot.
 //!
 //! Deliberately has zero *compile-time* dependency on `pulsar_scenedb`
 //! (even though it now lives in this repo): the wire format is plain JSON
@@ -84,11 +92,14 @@ struct InspectorApp {
     detail_cache: Vec<(String, serde_json::Value)>,
     last_poll: Instant,
     selected_archetype: usize,
-    selected_column: usize,
-    row_filter: String,
-    /// Row index within the selected column, shown in the detail pane
-    /// below the (virtualized) row list. `None` selects nothing.
-    selected_row: Option<usize>,
+    /// Archetype row index identifying the selected entity. Every column in
+    /// an archetype stores the same rows in the same order, so a single
+    /// index addresses that entity across all of its components.
+    selected_entity: Option<usize>,
+    /// Index into the selected archetype's `columns` for the component
+    /// whose value is shown in the details pane.
+    selected_component: Option<usize>,
+    entity_filter: String,
     gpu_tab: bool,
     selected_gpu_buffer: Option<String>,
     gpu_textures_tab: bool,
@@ -100,26 +111,39 @@ struct InspectorApp {
     request_slot: u32,
     next_request_id: u64,
     last_request_key: Option<String>,
-    cpu_visible_start: usize,
-    cpu_visible_count: usize,
+    entity_visible_start: usize,
+    entity_visible_count: usize,
+}
+
+fn cpu_range_key(cpu: &serde_json::Value) -> String {
+    format!(
+        "cpu:{}:{}:{}",
+        cpu.get("archetype_id").and_then(|value| value.as_u64()).unwrap_or(0),
+        cpu.get("component_id").and_then(|value| value.as_u64()).unwrap_or(0),
+        cpu.get("row_start").and_then(|value| value.as_u64()).unwrap_or(0),
+    )
 }
 
 fn detail_cache_key(response: &serde_json::Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
     if let Some(cpu) = response.get("cpu").filter(|value| value.is_object()) {
-        return Some(format!(
-            "cpu:{}:{}:{}",
-            cpu.get("archetype_id").and_then(|value| value.as_u64()).unwrap_or(0),
-            cpu.get("component_id").and_then(|value| value.as_u64()).unwrap_or(0),
-            cpu.get("row_start").and_then(|value| value.as_u64()).unwrap_or(0),
+        parts.push(cpu_range_key(cpu));
+    }
+    if let Some(ranges) = response.get("cpu_ranges").and_then(|value| value.as_array()) {
+        for cpu in ranges {
+            parts.push(cpu_range_key(cpu));
+        }
+    }
+    if let Some(gpu) = response.get("gpu").filter(|value| value.is_object()) {
+        parts.push(format!(
+            "gpu:{}:{}:{}:{}",
+            gpu.get("buffer").and_then(|value| value.as_str()).unwrap_or(""),
+            gpu.get("byte_offset").and_then(|value| value.as_u64()).unwrap_or(0),
+            gpu.get("byte_len").and_then(|value| value.as_u64()).unwrap_or(0),
+            gpu.get("cell").and_then(|value| value.as_u64()).unwrap_or(usize::MAX as u64),
         ));
     }
-    response.get("gpu").filter(|value| value.is_object()).map(|gpu| format!(
-        "gpu:{}:{}:{}:{}",
-        gpu.get("buffer").and_then(|value| value.as_str()).unwrap_or(""),
-        gpu.get("byte_offset").and_then(|value| value.as_u64()).unwrap_or(0),
-        gpu.get("byte_len").and_then(|value| value.as_u64()).unwrap_or(0),
-        gpu.get("cell").and_then(|value| value.as_u64()).unwrap_or(usize::MAX as u64),
-    ))
+    (!parts.is_empty()).then(|| parts.join("|"))
 }
 
 fn decode_hex(text: &str) -> Vec<u8> {
@@ -150,9 +174,9 @@ impl InspectorApp {
             detail_cache: Vec::new(),
             last_poll: Instant::now() - Duration::from_secs(1),
             selected_archetype: 0,
-            selected_column: 0,
-            row_filter: String::new(),
-            selected_row: None,
+            selected_entity: None,
+            selected_component: None,
+            entity_filter: String::new(),
             gpu_tab: false,
             selected_gpu_buffer: None,
             gpu_textures_tab: false,
@@ -164,8 +188,8 @@ impl InspectorApp {
             request_slot: 0,
             next_request_id: 1,
             last_request_key: None,
-            cpu_visible_start: 0,
-            cpu_visible_count: 32,
+            entity_visible_start: 0,
+            entity_visible_count: 32,
         };
         // Auto-launch when a target was given on the command line, so
         // `scenedb_inspector target.exe` works without an extra click.
@@ -403,7 +427,7 @@ impl eframe::App for InspectorApp {
         }
         egui::SidePanel::left("archetypes")
             .resizable(true)
-            .default_width(260.0)
+            .default_width(240.0)
             .show(ctx, |ui| {
                 ui.heading(format!("{entity_count} entities"));
                 ui.label(format!("{} archetypes", archetypes.len()));
@@ -420,17 +444,147 @@ impl eframe::App for InspectorApp {
                             .and_then(|c| c.as_array())
                             .map(|c| c.len())
                             .unwrap_or(0);
-                        let label = format!("archetype {id}  ({count} entities, {columns} columns)");
+                        let label = format!("archetype {id}  ({count} entities, {columns} components)");
                         if ui
                             .selectable_label(self.selected_archetype == i, label)
                             .clicked()
                         {
                             self.selected_archetype = i;
-                            self.selected_column = 0;
-                            self.selected_row = None;
+                            self.selected_entity = None;
+                            self.selected_component = None;
                         }
                     }
                 });
+            });
+
+        egui::SidePanel::left("entities")
+            .resizable(true)
+            .default_width(300.0)
+            .min_width(180.0)
+            .show(ctx, |ui| {
+                let Some(arch) = archetypes.get(self.selected_archetype) else {
+                    ui.label("select an archetype");
+                    return;
+                };
+                let empty_entities = Vec::new();
+                let entity_count = arch.get("entity_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                // Entity bits are archetype-wide: every column stores the
+                // same rows in the same order, so any one column's injected
+                // `entities` array is the archetype's entity list. Use the
+                // first. (The agent publishes metadata only, so this array
+                // arrives via the viewport request below and is spliced in
+                // by `merge_cpu_response`.)
+                let entity_bits = arch
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.get("entities"))
+                    .and_then(|e| e.as_array())
+                    .unwrap_or(&empty_entities);
+                ui.heading(format!("{entity_count} entities"));
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut self.entity_filter);
+                });
+                ui.separator();
+                let filter = self.entity_filter.trim().to_string();
+                let visible_rows: Vec<usize> = (0..entity_count)
+                    .filter(|&row| {
+                        filter.is_empty()
+                            || entity_bits
+                                .get(row)
+                                .and_then(|v| v.as_u64())
+                                .is_some_and(|bits| bits.to_string().contains(&filter))
+                    })
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, 18.0, visible_rows.len(), |ui, range| {
+                        if let Some(&first) = visible_rows.get(range.start) {
+                            self.entity_visible_start = first;
+                            self.entity_visible_count = visible_rows
+                                .get(range.end.saturating_sub(1))
+                                .map(|last| last.saturating_sub(first) + 1)
+                                .unwrap_or(range.len());
+                        }
+                        for i in range {
+                            let row = visible_rows[i];
+                            let bits = entity_bits.get(row).and_then(|v| v.as_u64());
+                            let label = match bits {
+                                Some(bits) => format!("#{row}  entity {bits}"),
+                                None => format!("#{row}  entity \u{2026}"),
+                            };
+                            if ui
+                                .selectable_label(self.selected_entity == Some(row), label)
+                                .clicked()
+                            {
+                                self.selected_entity = Some(row);
+                            }
+                        }
+                    });
+            });
+
+        egui::SidePanel::right("details")
+            .resizable(true)
+            .default_width(460.0)
+            .min_width(260.0)
+            .max_width(820.0)
+            .show(ctx, |ui| {
+                let Some(arch) = archetypes.get(self.selected_archetype) else {
+                    ui.label("select an archetype");
+                    return;
+                };
+                let empty_columns = Vec::new();
+                let columns = arch.get("columns").and_then(|c| c.as_array()).unwrap_or(&empty_columns);
+                let Some(component_index) = self.selected_component else {
+                    ui.heading("Details");
+                    ui.label("Select a component to inspect its value.");
+                    return;
+                };
+                let Some(col) = columns.get(component_index) else {
+                    ui.label("component out of range");
+                    return;
+                };
+                let type_name = col.get("type_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let short = type_name.rsplit("::").next().unwrap_or(type_name);
+                let element_size = col.get("element_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let component_id = col.get("component_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                ui.heading(short);
+                ui.label(format!(
+                    "{type_name}  (component_id {component_id}, {element_size} bytes/row)"
+                ));
+                ui.separator();
+                let Some(row) = self.selected_entity else {
+                    ui.label("Select an entity to see this component's value.");
+                    return;
+                };
+                ui.label(format!("row #{row}"));
+                let reflected = col.get("rows_reflected").and_then(|r| r.get(row));
+                let hex = col
+                    .get("rows_hex")
+                    .and_then(|r| r.get(row))
+                    .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty());
+                egui::ScrollArea::vertical()
+                    .id_salt("entity_component_detail")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Scoped by (component, row) so switching the
+                        // selection doesn't carry over another value's
+                        // per-field expand/collapse state just because two
+                        // values share a field name.
+                        ui.push_id((component_index, row), |ui| match reflected {
+                            Some(value) if !value.is_null() => show_json_tree(ui, value),
+                            _ => match hex {
+                                Some(hex) => {
+                                    ui.monospace(hex);
+                                }
+                                None => {
+                                    ui.label("value not fetched yet \u{2026}");
+                                }
+                            },
+                        });
+                    });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -438,141 +592,45 @@ impl eframe::App for InspectorApp {
                 ui.label("select an archetype");
                 return;
             };
-            let empty_vec2 = Vec::new();
-            let columns = arch
-                .get("columns")
-                .and_then(|c| c.as_array())
-                .unwrap_or(&empty_vec2);
-            ui.horizontal(|ui| {
+            let empty_columns = Vec::new();
+            let columns = arch.get("columns").and_then(|c| c.as_array()).unwrap_or(&empty_columns);
+            ui.heading("Components");
+            let Some(row) = self.selected_entity else {
+                ui.label("Select an entity to list its components.");
+                ui.label(
+                    "Every entity in an archetype has the same component set; \
+                     the values shown are for the selected row.",
+                );
+                return;
+            };
+            ui.label(format!("row #{row}"));
+            ui.separator();
+            if columns.is_empty() {
+                ui.label("this archetype has no components");
+                return;
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (i, col) in columns.iter().enumerate() {
-                    let type_name = col
-                        .get("type_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
+                    let type_name = col.get("type_name").and_then(|v| v.as_str()).unwrap_or("?");
                     let short = type_name.rsplit("::").next().unwrap_or(type_name);
+                    let overview = col
+                        .get("rows_reflected")
+                        .and_then(|r| r.get(row))
+                        .filter(|v| !v.is_null())
+                        .and_then(extract_overview);
+                    let label = match overview {
+                        Some(overview) => format!("{short}  \u{2014}  {overview}"),
+                        None => short.to_string(),
+                    };
                     if ui
-                        .selectable_label(self.selected_column == i, short)
+                        .selectable_label(self.selected_component == Some(i), label)
                         .on_hover_text(type_name)
                         .clicked()
                     {
-                        self.selected_column = i;
-                        self.selected_row = None;
+                        self.selected_component = Some(i);
                     }
                 }
             });
-            ui.separator();
-
-            let Some(col) = columns.get(self.selected_column) else {
-                ui.label("this archetype has no components");
-                return;
-            };
-            let entities = col.get("entities").and_then(|e| e.as_array()).cloned().unwrap_or_default();
-            let type_name = col.get("type_name").and_then(|v| v.as_str()).unwrap_or("?");
-            let element_size = col.get("element_size").and_then(|v| v.as_u64()).unwrap_or(0);
-            let component_id = col.get("component_id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let empty_vec3 = Vec::new();
-            let rows_hex = col
-                .get("rows_hex")
-                .and_then(|r| r.as_array())
-                .unwrap_or(&empty_vec3);
-            // Structured, nested-aware view when this component's type is
-            // registered with pulsar_reflection; None means only rows_hex
-            // is available (see ArchetypeColumnSnapshot's doc comment).
-            let rows_reflected = col.get("rows_reflected").and_then(|r| r.as_array());
-            let row_count = col.get("row_count").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or_else(|| rows_reflected.map(|r| r.len()).unwrap_or(rows_hex.len()));
-
-            ui.label(format!(
-                "{type_name}  (component_id {component_id}, {element_size} bytes/row, {row_count} rows{})",
-                if rows_reflected.is_some() { ", reflected" } else { ", raw hex only \u{2014} not #[derive(Reflectable)]" }
-            ));
-            ui.horizontal(|ui| {
-                ui.label("Filter (entity bits, decimal):");
-                ui.text_edit_singleline(&mut self.row_filter);
-            });
-            ui.separator();
-
-            // Filtered index list, built once per frame: `show_rows` below
-            // virtualizes over row *position* in a dense 0..N range (it
-            // needs uniform row height to do the scrollbar math), so
-            // filtering has to happen before that, not inside it -- letting
-            // `show_rows` iterate every unfiltered row just to `continue`
-            // past the ones that don't match would defeat the point.
-            let filter = self.row_filter.trim();
-            let visible_rows: Vec<usize> = (0..row_count)
-                .filter(|&row| {
-                    filter.is_empty()
-                        || entities
-                            .get(row)
-                            .and_then(|v| v.as_u64())
-                            .is_some_and(|bits| bits.to_string().contains(filter))
-                })
-                .collect();
-
-            // Top: a plain, fixed-height-per-row (virtualized) list -- only
-            // the ~20-30 rows actually scrolled into view ever get an
-            // overview string built each frame, regardless of whether the
-            // column has 10 rows or 10,000. This is what actually fixes the
-            // lag a full CollapsingHeader-per-row list had: that scaled
-            // with total row count every frame (laying out every row's
-            // header, even collapsed), this scales with viewport height.
-            let list_height = ui.available_height() * 0.55;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height(list_height)
-                .show_rows(ui, 18.0, visible_rows.len(), |ui, range| {
-                    if let Some(&first) = visible_rows.get(range.start) {
-                        self.cpu_visible_start = first;
-                        self.cpu_visible_count = visible_rows.get(range.end.saturating_sub(1)).map(|last| last.saturating_sub(first) + 1).unwrap_or(range.len());
-                    }
-                    for i in range {
-                        let row = visible_rows[i];
-                        let entity_bits = entities
-                            .get(row)
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "?".into());
-                        let reflected_value = rows_reflected.and_then(|r| r.get(row));
-                        let overview = reflected_value
-                            .and_then(extract_overview)
-                            .unwrap_or_default();
-
-                        let selected = self.selected_row == Some(row);
-                        let label = format!(
-                            "#{row}  entity {entity_bits}  \u{2014}  {element_size}B{}{overview}",
-                            if overview.is_empty() { "" } else { "  \u{2014}  " }
-                        );
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.selected_row = Some(row);
-                        }
-                    }
-                });
-
-            ui.separator();
-
-            // Bottom: full nested tree for the one selected row only --
-            // cheap regardless of how many total rows there are, since it's
-            // never built for anything but the single selection.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .id_salt("detail_scroll")
-                .show(ui, |ui| match self.selected_row {
-                    Some(row) => {
-                        ui.label(format!("row #{row}"));
-                        // Scoped by row so switching the selection doesn't
-                        // carry over another row's per-field expand/collapse
-                        // state just because two rows share a field name.
-                        ui.push_id(row, |ui| match rows_reflected.and_then(|r| r.get(row)) {
-                            Some(value) => show_json_tree(ui, value),
-                            None => {
-                                let hex = rows_hex.get(row).and_then(|v| v.as_str()).unwrap_or("");
-                                ui.monospace(hex);
-                            }
-                        });
-                    }
-                    None => {
-                        ui.label("select a row above to see its full contents");
-                    }
-                });
         });
     }
 }
@@ -908,27 +966,11 @@ impl InspectorApp {
     fn merge_detail(&mut self, response: serde_json::Value) {
         let Some(snapshot) = self.last_snapshot.as_mut() else { return; };
         if let Some(cpu) = response.get("cpu") {
-            let aid = cpu.get("archetype_id").and_then(|v| v.as_u64());
-            let cid = cpu.get("component_id").and_then(|v| v.as_u64());
-            if let (Some(aid), Some(cid)) = (aid, cid) {
-                if let Some(arch) = snapshot.get_mut("archetypes").and_then(|v| v.as_array_mut()).and_then(|a| a.iter_mut().find(|a| a.get("id").and_then(|v| v.as_u64()) == Some(aid))) {
-                    if let Some(col) = arch.get_mut("columns").and_then(|v| v.as_array_mut()).and_then(|c| c.iter_mut().find(|c| c.get("component_id").and_then(|v| v.as_u64()) == Some(cid))) {
-                        let start = cpu.get("row_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let total = col.get("row_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let mut entities = vec![serde_json::Value::Null; total];
-                        for (i, v) in cpu.get("entities").and_then(|v| v.as_array()).cloned().unwrap_or_default().into_iter().enumerate() { if start + i < total { entities[start + i] = v; } }
-                        col["entities"] = serde_json::Value::Array(entities);
-                        if let Some(values) = cpu.get("rows_reflected").and_then(|v| v.as_array()) {
-                            let mut all = vec![serde_json::Value::Null; total];
-                            for (i, v) in values.iter().cloned().enumerate() { if start + i < total { all[start + i] = v; } }
-                            col["rows_reflected"] = serde_json::Value::Array(all);
-                        } else if let Some(values) = cpu.get("rows_hex").and_then(|v| v.as_array()) {
-                            let mut all = vec![serde_json::Value::String(String::new()); total];
-                            for (i, v) in values.iter().cloned().enumerate() { if start + i < total { all[start + i] = v; } }
-                            col["rows_hex"] = serde_json::Value::Array(all);
-                        }
-                    }
-                }
+            merge_cpu_response(snapshot, cpu);
+        }
+        if let Some(ranges) = response.get("cpu_ranges").and_then(|v| v.as_array()) {
+            for cpu in ranges {
+                merge_cpu_response(snapshot, cpu);
             }
         }
         if let Some(gpu) = response.get("gpu") {
@@ -951,11 +993,38 @@ impl InspectorApp {
 
     fn request_current_details(&mut self) {
         let Some(snapshot) = self.last_snapshot.as_ref() else { return; };
-        let mut cpu = None;
+        // The bridge only delivers the *latest* request, so everything the
+        // current selection needs goes into one request's `cpu_ranges`:
+        //  1. the entity viewport (entity bits + values for the visible rows),
+        //     sourced from the first column since entity bits are
+        //     archetype-wide, and
+        //  2. one row per component for the selected entity, so the
+        //     components pane can preview every value and the details pane
+        //     already has the one it needs.
+        let mut cpu_ranges: Vec<serde_json::Value> = Vec::new();
         if !self.gpu_tab {
             if let Some(arch) = snapshot.get("archetypes").and_then(|v| v.as_array()).and_then(|a| a.get(self.selected_archetype)) {
-                if let Some(col) = arch.get("columns").and_then(|v| v.as_array()).and_then(|c| c.get(self.selected_column)) {
-                    cpu = Some(serde_json::json!({ "archetype_id": arch.get("id").and_then(|v| v.as_u64()).unwrap_or(0), "component_id": col.get("component_id").and_then(|v| v.as_u64()).unwrap_or(0), "row_start": self.cpu_visible_start, "row_count": self.cpu_visible_count.max(1) }));
+                let aid = arch.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let columns = arch.get("columns").and_then(|v| v.as_array());
+                if let Some(first) = columns.and_then(|c| c.first()) {
+                    let cid = first.get("component_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    cpu_ranges.push(serde_json::json!({
+                        "archetype_id": aid,
+                        "component_id": cid,
+                        "row_start": self.entity_visible_start,
+                        "row_count": self.entity_visible_count.max(1),
+                    }));
+                }
+                if let (Some(row), Some(columns)) = (self.selected_entity, columns) {
+                    for col in columns {
+                        let cid = col.get("component_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        cpu_ranges.push(serde_json::json!({
+                            "archetype_id": aid,
+                            "component_id": cid,
+                            "row_start": row,
+                            "row_count": 1,
+                        }));
+                    }
                 }
             }
         }
@@ -981,16 +1050,80 @@ impl InspectorApp {
                 gpu = Some(serde_json::json!({ "buffer": name, "byte_offset": byte_offset, "byte_len": byte_len, "cell": cell }));
             }
         }}
-        if cpu.is_none() && gpu.is_none() { return; }
-        let key = serde_json::json!({ "cpu": cpu, "gpu": gpu }).to_string();
+        if cpu_ranges.is_empty() && gpu.is_none() { return; }
+        let key = serde_json::json!({ "cpu_ranges": cpu_ranges, "gpu": gpu }).to_string();
         if self.last_request_key.as_deref() == Some(key.as_str()) { return; }
-        let request = serde_json::json!({ "request_id": self.next_request_id, "cpu": cpu, "gpu": gpu });
+        let request = serde_json::json!({ "request_id": self.next_request_id, "cpu": null, "cpu_ranges": cpu_ranges, "gpu": gpu });
         let Ok(bytes) = serde_json::to_vec(&request) else { return; };
         if let Some(view) = self.session.as_ref().and_then(|s| s.view.as_ref()) { if view.publish_request(self.request_slot, &bytes) {
             self.request_slot = (self.request_slot + 1) % view.slot_count();
             self.next_request_id = self.next_request_id.wrapping_add(1);
             self.last_request_key = Some(key);
         }}
+    }
+}
+
+/// Splice one CPU range response back into the matching archetype column of
+/// `snapshot`. Entities, reflected values, and raw hex are *merged* into the
+/// existing arrays (grown to `row_count` first) rather than replacing them,
+/// so a one-row request for the selected entity does not erase the viewport
+/// window another range request just fetched for the same column.
+fn merge_cpu_response(snapshot: &mut serde_json::Value, cpu: &serde_json::Value) {
+    let aid = cpu.get("archetype_id").and_then(|v| v.as_u64());
+    let cid = cpu.get("component_id").and_then(|v| v.as_u64());
+    let (Some(aid), Some(cid)) = (aid, cid) else { return; };
+    let Some(arch) = snapshot
+        .get_mut("archetypes")
+        .and_then(|v| v.as_array_mut())
+        .and_then(|a| a.iter_mut().find(|a| a.get("id").and_then(|v| v.as_u64()) == Some(aid)))
+    else {
+        return;
+    };
+    let Some(col) = arch
+        .get_mut("columns")
+        .and_then(|v| v.as_array_mut())
+        .and_then(|c| c.iter_mut().find(|c| c.get("component_id").and_then(|v| v.as_u64()) == Some(cid)))
+    else {
+        return;
+    };
+    let start = cpu.get("row_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let total = col.get("row_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let entities = cpu.get("entities").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    merge_range_into(&mut col["entities"], total, start, &entities, serde_json::Value::Null);
+    if let Some(values) = cpu.get("rows_reflected").and_then(|v| v.as_array()).cloned() {
+        merge_range_into(&mut col["rows_reflected"], total, start, &values, serde_json::Value::Null);
+    } else if let Some(values) = cpu.get("rows_hex").and_then(|v| v.as_array()).cloned() {
+        merge_range_into(
+            &mut col["rows_hex"],
+            total,
+            start,
+            &values,
+            serde_json::Value::String(String::new()),
+        );
+    }
+}
+
+/// Write `values[i]` into `slot[start + i]`, growing `slot` to `total`
+/// entries (padded with `pad`) if needed. Values outside `start..` are left
+/// untouched.
+fn merge_range_into(
+    slot: &mut serde_json::Value,
+    total: usize,
+    start: usize,
+    values: &[serde_json::Value],
+    pad: serde_json::Value,
+) {
+    if !slot.is_array() {
+        *slot = serde_json::Value::Array(Vec::new());
+    }
+    let Some(arr) = slot.as_array_mut() else { return; };
+    if arr.len() < total {
+        arr.resize(total, pad);
+    }
+    for (i, value) in values.iter().enumerate() {
+        if let Some(slot) = arr.get_mut(start + i) {
+            *slot = value.clone();
+        }
     }
 }
 
