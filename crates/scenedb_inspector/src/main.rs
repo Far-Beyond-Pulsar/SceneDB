@@ -179,7 +179,7 @@ impl InspectorApp {
                 .unwrap_or_default()
         );
 
-        let args: Vec<&str> = self.target_args.split_whitespace().collect();
+        let args = split_args(&self.target_args);
         match std::process::Command::new(path)
             .args(&args)
             .env("SCENEDB_INSPECTOR_SHM", &shm_name)
@@ -1019,5 +1019,58 @@ fn show_json_field(ui: &mut egui::Ui, key: &str, value: &serde_json::Value) {
                 ui.monospace(format_json_inline(other));
             });
         }
+    }
+}
+
+/// Split a command-line string into arguments the way a shell would for the
+/// common cases: whitespace separates arguments, and single or double quotes
+/// group text (and are removed), including mid-token as in
+/// `--project-path="C:\My Projects\Game"`. There is no shell here -- the
+/// target is spawned directly -- so without this the quotes would reach the
+/// target verbatim. Backslashes are literal, so Windows paths work unescaped.
+fn split_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    for c in input.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_token = true;
+            }
+            None if c.is_whitespace() => {
+                if in_token {
+                    args.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        args.push(current);
+    }
+    args
+}
+
+#[cfg(test)]
+mod split_args_tests {
+    use super::split_args;
+
+    #[test]
+    fn quotes_group_and_are_stripped() {
+        assert_eq!(
+            split_args(r#"--project-path="C:\Users\me\My Game" -v"#),
+            vec![r"--project-path=C:\Users\me\My Game", "-v"]
+        );
+        assert_eq!(split_args("  a   'b c' "), vec!["a", "b c"]);
+        assert_eq!(split_args(r#"x "" y"#), vec!["x", "", "y"]);
+        assert!(split_args("   ").is_empty());
     }
 }
