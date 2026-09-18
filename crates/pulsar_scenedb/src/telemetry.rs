@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::cell::CellStorage;
 use crate::cell_type::RegisteredCellType;
 use crate::component::ComponentId;
-use crate::gpu::{CellId, GpuBufferDispatch, SceneGpuStore};
+use crate::gpu::{CellId, GpuBufferDispatch, SceneGpuStore, TextureStore};
 use crate::page::Pod;
 use crate::token::TypeToken;
 
@@ -21,7 +21,7 @@ use crate::token::TypeToken;
 
 /// Complete snapshot of SceneDB state, collected from the main thread
 /// and served to HTTP clients by the background telemetry server.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TelemetrySnapshot {
     /// Per-cell storage data (from CellStorage).
     pub cells: Vec<CellSnapshot>,
@@ -33,7 +33,7 @@ pub struct TelemetrySnapshot {
     pub pools: PoolSnapshot,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CellSnapshot {
     pub id: u32,
     pub rows_in_use: u32,
@@ -53,7 +53,7 @@ pub struct CellSnapshot {
     pub cell_type_name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ColumnData {
     pub component_id: u32,
     pub element_size: usize,
@@ -61,25 +61,66 @@ pub struct ColumnData {
     pub rows_hex: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GpuSnapshot {
     pub gen_writes: u64,
     pub sync_ranges: u64,
     pub sync_bytes: u64,
     pub write_ops: u64,
     pub buffers: Vec<GpuBufferSnapshot>,
+    pub registry_buffers: Vec<GpuRegistryBufferSnapshot>,
+    pub textures: Vec<GpuTextureSnapshot>,
     /// Per-cell GPU state (dirty column counts, pending retires).
     pub cell_gpu_states: Vec<CellGpuSnapshot>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GpuBufferSnapshot {
     pub component_id: u32,
     pub element_size: usize,
     pub capacity: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
+pub struct GpuTextureSnapshot {
+    pub slot: usize,
+    pub width: u32,
+    pub height: u32,
+    pub depth_or_array_layers: u32,
+    pub mip_level_count: u32,
+    pub sample_count: u32,
+    pub format: String,
+    pub usage: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct GpuRegistryBufferSnapshot {
+    pub name: String,
+    pub kind: String,
+    pub element_size: usize,
+    pub capacity_bytes: Option<u64>,
+    pub epoch: Option<u64>,
+    pub access: String,
+    pub mirror_mode: Option<String>,
+    pub element_type_name: Option<String>,
+    pub cells: Vec<GpuCellSnapshot>,
+    pub cells_truncated: bool,
+    pub raw_chunks: Vec<GpuRawChunkSnapshot>,
+}
+
+# [derive(Clone, Serialize)]
+pub struct GpuRawChunkSnapshot {
+    pub offset: u64,
+    pub bytes_hex: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct GpuCellSnapshot {
+    pub index: u32,
+    pub bytes_hex: String,
+    pub reflected: serde_json::Value,
+}
+# [derive(Clone, Serialize)]
 pub struct CellGpuSnapshot {
     pub id: u32,
     pub class: usize,
@@ -91,7 +132,7 @@ pub struct CellGpuSnapshot {
     pub alive: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TypeSchema {
     pub component_id: u32,
     pub type_name: String,
@@ -99,13 +140,13 @@ pub struct TypeSchema {
     pub align: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PoolSnapshot {
     pub row: Vec<PoolInfo>,
     pub slot: Vec<PoolInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PoolInfo {
     pub region_size: u32,
     pub total: u32,
@@ -224,7 +265,69 @@ pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned
 
 // ── Snapshot collection ───────────────────────────────────────────────────
 
-pub fn collect_gpu_snapshot(store: &SceneGpuStore) -> GpuSnapshot {
+pub fn collect_gpu_snapshot_metadata(store: &SceneGpuStore, texture_store: Option<&TextureStore>) -> GpuSnapshot {
+    GpuSnapshot {
+        gen_writes: store.generation_write_count(),
+        sync_ranges: 0,
+        sync_bytes: 0,
+        write_ops: 0,
+        buffers: store.telemetry_gpu_buffers().iter().map(|(id, buf)| GpuBufferSnapshot {
+            component_id: id.0,
+            element_size: buf.element_size(),
+            capacity: buf.capacity(),
+        }).collect(),
+        registry_buffers: store.buffer_registry().telemetry_entries().into_iter().map(|(key, kind, element_size, access, mirror_mode, capacity_bytes, epoch)| {
+            GpuRegistryBufferSnapshot {
+                name: key.as_str().to_owned(),
+                kind: kind.to_owned(),
+                element_size,
+                capacity_bytes,
+                epoch,
+                access: format!("{access:?}"),
+                mirror_mode: mirror_mode.map(|mode| format!("{mode:?}")),
+                element_type_name: None,
+                cells: Vec::new(),
+                cells_truncated: false,
+                raw_chunks: Vec::new(),
+            }
+        }).collect(),
+        textures: texture_store.map(|textures| {
+            (0..textures.slot_count()).filter_map(|slot| textures.texture(slot).map(|texture| GpuTextureSnapshot {
+                slot: slot as usize,
+                width: texture.width(),
+                height: texture.height(),
+                depth_or_array_layers: texture.depth_or_array_layers(),
+                mip_level_count: texture.mip_level_count(),
+                sample_count: texture.sample_count(),
+                format: format!("{:?}", texture.format()),
+                usage: format!("{:?}", texture.usage()),
+            })).collect()
+        }).unwrap_or_default(),
+        cell_gpu_states: store.telemetry_cells().iter().enumerate().map(|(i, c)| match c {
+            Some(state) => CellGpuSnapshot {
+                id: i as u32,
+                class: state.class,
+                row_base: state.row_base,
+                slot_base: state.slot_base,
+                slot_capacity: state.slot_capacity,
+                dirty_column_count: state.dirty_columns.iter().filter(|m| m.is_some()).count(),
+                pending_retire_count: state.pending.len(),
+                alive: true,
+            },
+            None => CellGpuSnapshot {
+                id: i as u32,
+                class: 0,
+                row_base: 0,
+                slot_base: 0,
+                slot_capacity: 0,
+                dirty_column_count: 0,
+                pending_retire_count: 0,
+                alive: false,
+            },
+        }).collect(),
+    }
+}
+pub fn collect_gpu_snapshot(store: &SceneGpuStore, texture_store: Option<&TextureStore>) -> GpuSnapshot {
     GpuSnapshot {
         gen_writes: store.generation_write_count(),
         sync_ranges: 0,
@@ -239,7 +342,61 @@ pub fn collect_gpu_snapshot(store: &SceneGpuStore) -> GpuSnapshot {
                 capacity: buf.capacity(),
             })
             .collect(),
-        cell_gpu_states: store
+        registry_buffers: store
+            .buffer_registry()
+            .telemetry_entries()
+            .into_iter()
+            .map(|(key, kind, element_size, access, mirror_mode, capacity_bytes, epoch)| {
+                let device = store.device_arc();
+                let inspected = store.buffer_registry().inspect_rows(
+                    &device,
+                    store.queue(),
+                    key,
+                    4 * 1024 * 1024,
+                );
+                let raw_chunks = store.buffer_registry().inspect_bytes(&device, store.queue(), key, 4 * 1024 * 1024);
+                let (element_type_name, cells, cells_truncated) = inspected
+                    .map(|(type_name, cells, truncated)| (
+                        type_name.map(str::to_owned),
+                        cells.into_iter().map(|(index, bytes_hex, reflected)| GpuCellSnapshot {
+                            index,
+                            bytes_hex,
+                            reflected,
+                        }).collect(),
+                        truncated,
+                    ))
+                    .unwrap_or((None, Vec::new(), false));
+                GpuRegistryBufferSnapshot {
+                    name: key.as_str().to_owned(),
+                    kind: kind.to_owned(),
+                    element_size,
+                    capacity_bytes,
+                    epoch,
+                    access: format!("{access:?}"),
+                    mirror_mode: mirror_mode.map(|mode| format!("{mode:?}")),
+                    element_type_name,
+                    cells,
+                    cells_truncated,
+                    raw_chunks: raw_chunks.into_iter().map(|(offset, bytes_hex)| GpuRawChunkSnapshot { offset, bytes_hex }).collect(),
+                }
+            })
+            .collect(),
+        textures: texture_store
+            .map(|textures| {
+                (0..textures.slot_count())
+                    .filter_map(|slot| textures.texture(slot).map(|texture| GpuTextureSnapshot {
+                        slot: slot as usize,
+                        width: texture.width(),
+                        height: texture.height(),
+                        depth_or_array_layers: texture.depth_or_array_layers(),
+                        mip_level_count: texture.mip_level_count(),
+                        sample_count: texture.sample_count(),
+                        format: format!("{:?}", texture.format()),
+                        usage: format!("{:?}", texture.usage()),
+                    }))
+                    .collect()
+            })
+            .unwrap_or_default(),        cell_gpu_states: store
             .telemetry_cells()
             .iter()
             .enumerate()
@@ -403,6 +560,8 @@ impl TelemetrySnapshot {
                 sync_bytes: 0,
                 write_ops: 0,
                 buffers: Vec::new(),
+                registry_buffers: Vec::new(),
+                textures: Vec::new(),
                 cell_gpu_states: Vec::new(),
             },
             schema: Vec::new(),
@@ -415,7 +574,7 @@ impl TelemetrySnapshot {
 
     /// Collect a full snapshot from GPU store + cell storage pairs.
     pub fn collect(store: &SceneGpuStore, cells: &[(CellId, &CellStorage)]) -> Self {
-        let gpu = collect_gpu_snapshot(store);
+        let gpu = collect_gpu_snapshot(store, None);
         let pools = collect_pool_snapshot(store);
         let schema = collect_schema_snapshot();
 

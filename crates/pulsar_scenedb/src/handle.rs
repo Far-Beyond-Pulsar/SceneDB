@@ -10,6 +10,60 @@ use std::fmt;
 #[repr(transparent)]
 pub struct Handle(u64);
 
+impl pulsar_reflection::Reflectable for Handle {
+    fn type_info() -> &'static pulsar_reflection::RuntimeTypeInfo {
+        static CELL: std::sync::OnceLock<pulsar_reflection::RuntimeTypeInfo> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            let fields: &'static [pulsar_reflection::FieldInfo] = Box::leak(Box::new([
+                pulsar_reflection::FieldInfo::new("bits", <u64 as pulsar_reflection::Reflectable>::type_info(), 0),
+            ]));
+            pulsar_reflection::RuntimeTypeInfo {
+                type_id: std::any::TypeId::of::<Handle>(),
+                type_name: "Handle",
+                size: std::mem::size_of::<Handle>(),
+                align: std::mem::align_of::<Handle>(),
+                structure: pulsar_reflection::TypeStructure::Struct { fields },
+                color: None,
+            }
+        })
+    }
+
+    fn serialize(&self, serializer: &mut dyn pulsar_reflection::TypeSerializer) -> pulsar_reflection::ReflectResult<()> {
+        let bits = self.bits();
+        serializer.serialize_struct(&[("bits", &bits as &dyn std::any::Any)])
+    }
+
+    fn deserialize(deserializer: &mut dyn pulsar_reflection::TypeDeserializer) -> pulsar_reflection::ReflectResult<Self> {
+        let fields = deserializer.deserialize_struct(Self::type_info().fields().unwrap())?;
+        let bits = fields.get("bits")
+            .and_then(|value| value.downcast_ref::<u64>())
+            .copied()
+            .ok_or_else(|| pulsar_reflection::ReflectError::MissingField { struct_name: "Handle", field_name: "bits" })?;
+        Ok(Self(bits))
+    }
+
+    fn clone_any(&self) -> Box<dyn std::any::Any> { Box::new(*self) }
+}
+
+pulsar_reflection::inventory::submit! {
+    pulsar_reflection::RuntimeTypeRegistration {
+        type_info: <Handle as pulsar_reflection::Reflectable>::type_info,
+        serialize_json: |value: &dyn std::any::Any| {
+            let typed = value.downcast_ref::<Handle>().ok_or_else(|| pulsar_reflection::ReflectError::TypeMismatch {
+                expected: "Handle",
+                found: format!("{:?}", value.type_id()),
+            })?;
+            let mut serializer = pulsar_reflection::JsonSerializer::new();
+            <Handle as pulsar_reflection::Reflectable>::serialize(typed, &mut serializer)?;
+            Ok(serializer.into_json())
+        },
+        deserialize_json: |value: serde_json::Value| {
+            let mut deserializer = pulsar_reflection::JsonDeserializer::new(value);
+            let typed = <Handle as pulsar_reflection::Reflectable>::deserialize(&mut deserializer)?;
+            Ok(Box::new(typed) as Box<dyn std::any::Any>)
+        },
+    }
+}
 impl Handle {
     /// The canonical invalid handle (all zero — generation 0).
     pub const INVALID: Handle = Handle(0);

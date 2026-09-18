@@ -64,7 +64,7 @@
 //! attempt, despite compiling cleanly with no errors or warnings pointing
 //! at the problem, was not.
 use crate::component::ComponentId;
-use crate::gpu::{DirtyTrackedSceneBuffer, GpuColumnSet, SceneGpuStore};
+use crate::gpu::{DirtyTrackedSceneBuffer, GpuColumnSet, SceneGpuStore, TextureStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -274,18 +274,36 @@ impl GpuMirroredRows {
 /// liveness/generation mirror (see [`GenerationMirror`]).
 ///
 /// Attach via [`crate::world::World::attach_gpu_mirror`]. Cheap to clone
-/// (`Arc<SceneGpuStore>` + `Arc<wgpu::Queue>` + `Arc<GenerationMirror>`).
+/// (`Arc<SceneGpuStore>` + `Arc<wgpu::Queue>` + `Arc<GenerationMirror>`),
+/// plus any optional SceneDB-owned asset stores attached to the projection.
 #[derive(Clone)]
 pub struct GpuMirrorHandle {
     store: Arc<SceneGpuStore>,
     queue: Arc<wgpu::Queue>,
     generations: Arc<GenerationMirror>,
+    texture_store: Option<Arc<RwLock<TextureStore>>>,
 }
 
 impl GpuMirrorHandle {
     pub fn new(store: Arc<SceneGpuStore>, queue: Arc<wgpu::Queue>) -> Self {
         let generations = Arc::new(GenerationMirror::new(store.device_arc()));
-        Self { store, queue, generations }
+        Self { store, queue, generations, texture_store: None }
+    }
+
+    pub fn with_texture_store(
+        mut self,
+        texture_store: Arc<RwLock<TextureStore>>,
+    ) -> Result<Self, crate::gpu::BufferRegistrationError> {
+        texture_store
+            .read()
+            .expect("SceneDB texture store lock poisoned")
+            .register_key(self.store.buffer_registry())?;
+        self.texture_store = Some(texture_store);
+        Ok(self)
+    }
+
+    pub fn texture_store(&self) -> Option<Arc<RwLock<TextureStore>>> {
+        self.texture_store.clone()
     }
 
     #[inline]
@@ -465,6 +483,7 @@ pub fn write_var_len_field_at_row<T: crate::page::Pod + Send + Sync + crate::tok
     let handle = pool
         .write_var_row(queue, prev, data)
         .expect("var-len GPU pool is never registered with a max_capacity ceiling -- growth cannot fail");
+    store.sync_var_len_pool(pool_key, &pool);
 
     // SAFETY: `VarLenHandle` is `Pod` (#[repr(C)], two plain u32s) -- every
     // byte of it is a valid, fully-initialized byte.
@@ -510,6 +529,7 @@ pub fn write_interned_var_len_field_at_row<
     };
     let id = content_source.content_id();
     let handle = pool.upsert_row(queue, row, id, data);
+    store.sync_var_len_pool(pool_key, pool.underlying());
 
     // SAFETY: same argument as `write_var_len_field_at_row`'s identical
     // block — `VarLenHandle` is `Pod`, exactly `size_of::<VarLenHandle>()`

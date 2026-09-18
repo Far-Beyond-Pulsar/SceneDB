@@ -53,7 +53,19 @@ use std::fmt;
 use std::sync::RwLock;
 
 use super::MirrorMode;
+use serde_json::Value;
+use pulsar_reflection::RUNTIME_TYPE_REGISTRY;
 
+type RowInspector = fn(&[u8]) -> Value;
+
+fn inspect_row<T: Pod + pulsar_reflection::Reflectable + 'static>(bytes: &[u8]) -> Value {
+    assert_eq!(bytes.len(), std::mem::size_of::<T>());
+    let value = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) };
+    let mut serializer = pulsar_reflection::JsonSerializer::new();
+    <T as pulsar_reflection::Reflectable>::serialize(&value, &mut serializer)
+        .map(|_| serializer.into_json())
+        .unwrap_or_else(|error| serde_json::json!({ "__reflection_error__": error.to_string() }))
+}
 /// A named, `'static` buffer key — the string a `#[gpu(buffer = "...")]`
 /// field (or a hand-built asset buffer) declares, and the handle a system
 /// uses to resolve the buffer from [`GpuBufferRegistry`].
@@ -241,6 +253,8 @@ struct RegistryEntry {
     /// `Some` for `Row`/`Resource` (buffer-backed); `None` for
     /// `TextureArray`, which has no `wgpu::Buffer` to hold.
     inner: Option<RwLock<EntryInner>>,
+    row_inspector: Option<RowInspector>,
+    row_type_name: Option<&'static str>,
 }
 
 struct EntryInner {
@@ -261,6 +275,8 @@ struct InsertSpec {
     access: BufferAccess,
     mirror_mode: Option<MirrorMode>,
     buffer: wgpu::Buffer,
+    row_inspector: Option<RowInspector>,
+    row_type_name: Option<&'static str>,
 }
 
 /// The single keyed buffer registry (Tier 1). Maps [`BufferKey`] → the
@@ -292,7 +308,7 @@ impl GpuBufferRegistry {
     /// changes (the shared-key rule: two components declaring the same key
     /// share one physical buffer only when they agree on everything the
     /// layout engine validates).
-    pub fn register_row<T: Pod + HasTypeToken + 'static>(
+    pub fn register_row<T: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static>(
         &self,
         key: BufferKey,
         buffer: wgpu::Buffer,
@@ -307,6 +323,8 @@ impl GpuBufferRegistry {
             access,
             mirror_mode: Some(mode),
             buffer,
+            row_inspector: Some(inspect_row::<T>),
+            row_type_name: Some(<T as pulsar_reflection::Reflectable>::type_info().type_name),
         })
     }
 
@@ -333,6 +351,8 @@ impl GpuBufferRegistry {
             access,
             mirror_mode: None,
             buffer,
+            row_inspector: None,
+            row_type_name: None,
         })
     }
 
@@ -388,6 +408,8 @@ impl GpuBufferRegistry {
                 access,
                 mirror_mode: None,
                 inner: None,
+                row_inspector: None,
+            row_type_name: None,
             },
         );
         Ok(())
@@ -411,7 +433,7 @@ impl GpuBufferRegistry {
     }
 
     fn insert(&self, spec: InsertSpec) -> Result<(), BufferRegistrationError> {
-        let InsertSpec { key, kind, element_type_id, element_size, access, mirror_mode, buffer } = spec;
+        let InsertSpec { key, kind, element_type_id, element_size, access, mirror_mode, buffer, row_inspector, row_type_name } = spec;
         let mut entries = self.entries.write().expect("GpuBufferRegistry lock poisoned");
         if let Some(existing) = entries.get(&key) {
             if existing.kind != kind {
@@ -469,6 +491,8 @@ impl GpuBufferRegistry {
                 access,
                 mirror_mode,
                 inner: Some(RwLock::new(EntryInner { buffer, epoch: 0 })),
+                row_inspector,
+                row_type_name,
             },
         );
         Ok(())
@@ -545,7 +569,109 @@ impl GpuBufferRegistry {
         self.entries.read().expect("GpuBufferRegistry lock poisoned").keys().copied().collect()
     }
 
-    /// Number of registered entries.
+    /// Return a stable description of every registered SceneDB GPU entry.
+    /// This is the source for the SceneDB inspector inventory.
+    pub fn telemetry_entries(&self) -> Vec<(BufferKey, &'static str, usize, BufferAccess, Option<MirrorMode>, Option<u64>, Option<u64>)> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        entries.values().map(|entry| {
+            let kind = match entry.kind {
+                EntryKind::Row => "row",
+                EntryKind::Resource => "resource",
+                EntryKind::TextureArray => "texture_array",
+            };
+            let (capacity_bytes, epoch) = entry.inner.as_ref()
+                .map(|inner| {
+                    let inner = inner.read().expect("GpuBufferRegistry lock poisoned");
+                    (Some(inner.buffer.size()), Some(inner.epoch))
+                })
+                .unwrap_or((None, None));
+            (entry.key, kind, entry.element_size, entry.access, entry.mirror_mode, capacity_bytes, epoch)
+        }).collect()
+    }
+
+
+    /// Read back bounded raw chunks for any buffer-backed registry entry.
+    pub fn inspect_bytes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: BufferKey,
+        max_bytes: u64,
+    ) -> Vec<(u64, String)> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let Some(entry) = entries.get(&key) else { return Vec::new() };
+        let Some(inner) = entry.inner.as_ref() else { return Vec::new() };
+        let inner = inner.read().expect("GpuBufferRegistry lock poisoned");
+        let bytes_to_read = inner.buffer.size().min(max_bytes);
+        if bytes_to_read == 0 { return Vec::new(); }
+        let bytes = super::readback_bytes(device, queue, &inner.buffer, 0..bytes_to_read);
+        bytes.chunks(16).enumerate().map(|(i, chunk)| {
+            (i as u64 * 16, chunk.iter().map(|byte| format!("{byte:02x}")).collect())
+        }).collect()
+    }
+
+    /// Resolve an inspector-supplied name without manufacturing a
+    /// non-static BufferKey.
+    pub fn key_named(&self, name: &str) -> Option<BufferKey> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        entries.keys().copied().find(|key| key.as_str() == name)
+    }
+
+    /// Read exactly one bounded byte range from a registered GPU buffer.
+    /// This is intentionally a diagnostic operation; callers should run it
+    /// away from the render thread because the readback waits for the GPU.
+    pub fn inspect_bytes_range(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: BufferKey,
+        offset: u64,
+        len: u64,
+    ) -> Option<Vec<u8>> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let entry = entries.get(&key)?;
+        let inner = entry.inner.as_ref()?.read().expect("GpuBufferRegistry lock poisoned");
+        let end = offset.checked_add(len)?;
+        if len == 0 || end > inner.buffer.size() { return None; }
+        Some(super::readback_bytes(device, queue, &inner.buffer, offset..end))
+    }
+    /// Read back a bounded set of row cells for diagnostic inspection.
+    /// Returns the reflected value when the registered element type has a
+    /// reflection serializer, plus the raw bytes for every returned cell.
+    pub fn inspect_rows(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: BufferKey,
+        max_bytes: u64,
+    ) -> Option<(Option<&'static str>, Vec<(u32, String, Value)>, bool)> {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        let entry = entries.get(&key)?;
+        if entry.kind != EntryKind::Row || entry.element_size == 0 {
+            return None;
+        }
+        let inner = entry.inner.as_ref()?.read().expect("GpuBufferRegistry lock poisoned");
+        let bytes_available = inner.buffer.size();
+        let bytes_to_read = bytes_available.min(max_bytes);
+        let cell_size = entry.element_size as u64;
+        let cell_count = (bytes_to_read / cell_size) as usize;
+        if cell_count == 0 {
+            return Some((None, Vec::new(), bytes_available > bytes_to_read));
+        }
+        let bytes = super::readback_bytes(device, queue, &inner.buffer, 0..(cell_count as u64 * cell_size));
+        let type_name = entry.row_type_name;
+        let cells = (0..cell_count)
+            .map(|index| {
+                let start = index * entry.element_size;
+                let end = start + entry.element_size;
+                let raw = &bytes[start..end];
+                let hex = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+                let value = entry.row_inspector.map(|inspect| inspect(raw));
+                (index as u32, hex, value.unwrap_or(Value::Null))
+            })
+            .collect();
+        Some((type_name, cells, bytes_available > bytes_to_read))
+    }    /// Number of registered entries.
     pub fn len(&self) -> usize {
         self.entries.read().expect("GpuBufferRegistry lock poisoned").len()
     }

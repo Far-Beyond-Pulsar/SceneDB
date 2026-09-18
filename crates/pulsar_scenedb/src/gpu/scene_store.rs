@@ -83,7 +83,7 @@ pub const CELL_METADATA_BUFFER_KEY: BufferKey = BufferKey::of("builtin_cell_meta
 /// calls it always did: this type documents that layout for the registry,
 /// it does not change it.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct CellMetadataRow {
     pub alpha: f32,
     pub domain: u32,
@@ -662,7 +662,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -828,7 +828,13 @@ impl SceneGpuStore {
     pub fn resolve_buffer_handle(&self, key: BufferKey) -> Option<BufferHandle> {
         let (buffer, epoch) = {
             let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
-            let owner = owners.get(&key)?;
+            // Variable-length payload pools are registry-owned resources,
+            // not fixed/growable column owners. Their writes keep the
+            // registry current through `sync_var_len_pool`, so let that
+            // registry be the resolution path when no column owner exists.
+            let Some(owner) = owners.get(&key) else {
+                return self.registry.resolve(key);
+            };
             match &owner.kind {
                 SharedKind::Fixed(b) => (b.buffer().clone(), 0u64),
                 SharedKind::Growable(b) => (Self::current_handle(&mut |f| b.with_buffer(f)), b.epoch()),
@@ -910,7 +916,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -1767,7 +1773,7 @@ impl SceneGpuStore {
         mode: MirrorMode,
     ) where
         T: Pod + Send + Sync + HasTypeToken + 'static,
-        E: Pod + HasTypeToken + 'static,
+        E: Pod + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         assert_eq!(
             std::mem::size_of::<T>(),
@@ -1851,7 +1857,7 @@ impl SceneGpuStore {
         key: BufferKey,
     ) where
         Wrapper: Pod + Send + Sync + HasTypeToken + 'static,
-        Element: Pod + Send + Sync + HasTypeToken + 'static,
+        Element: Pod + Send + Sync + HasTypeToken + pulsar_reflection::Reflectable + 'static,
     {
         let mode = MirrorMode::Once;
         let id = <Wrapper as HasTypeToken>::type_token().id();
@@ -1999,6 +2005,16 @@ impl SceneGpuStore {
             initial_capacity,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         ));
+        // Variable-length pools are first-class SceneDB GPU resources. Keep
+        // them in the same keyed registry as fixed columns so renderers and
+        // inspector projections receive the payload buffer, not only the
+        // per-row VarLenHandle table.
+        let mut resource_buffer = None;
+        pool.with_buffer(&mut |buffer| resource_buffer = Some(buffer.clone()));
+        let resource_buffer = resource_buffer.expect("var-len pool buffer was not exposed");
+        self.registry
+            .register_resource(key, resource_buffer.size() as usize, resource_buffer, BufferAccess::ReadOnly)
+            .unwrap_or_else(|error| panic!("failed to register var-len GPU pool {key:?}: {error}"));
         if tier_participation {
             pool.set_tier_participation(Arc::clone(&self.tier_engine), key);
             self.tier_pools
@@ -2008,6 +2024,23 @@ impl SceneGpuStore {
         }
         pools.insert(key, Arc::clone(&pool) as Arc<dyn std::any::Any + Send + Sync>);
         pool
+    }
+
+    /// Refresh the registry snapshot for a variable-length payload pool after
+    /// a write. Pools grow independently of the fixed-column owners map, so
+    /// this keeps the renderer's keyed projection on the current allocation.
+    pub fn sync_var_len_pool<T: Pod + Send + Sync + HasTypeToken + 'static>(
+        &self,
+        key: BufferKey,
+        pool: &crate::gpu::VarLenGpuPool<T>,
+    ) {
+        let mut buffer = None;
+        pool.with_buffer(&mut |current| buffer = Some(current.clone()));
+        self.registry.sync(
+            key,
+            buffer.expect("var-len pool buffer was not exposed"),
+            pool.epoch(),
+        );
     }
 
     /// Looks up an already-registered [`crate::gpu::VarLenGpuPool<T>`] by

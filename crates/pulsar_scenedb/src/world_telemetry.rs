@@ -33,7 +33,8 @@
 //! the right (monomorphized, macro-generated) serializer without this
 //! module ever needing to know `T` at compile time.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::component::{self, ComponentId, ErasedColumn};
 use crate::world::World;
@@ -41,14 +42,81 @@ use pulsar_reflection::RUNTIME_TYPE_REGISTRY;
 
 /// Full snapshot of a [`World`]'s live entities and components, in
 /// archetype-major order.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct WorldSnapshot {
     /// Total live entity count across all archetypes.
     pub entity_count: usize,
     pub archetypes: Vec<ArchetypeSnapshot>,
+    /// SceneDB-owned GPU storage snapshot, when this world has a mirror.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<crate::telemetry::GpuSnapshot>,
+    /// Optional SceneDB-owned projections, including the GPU mirror and upload state.
+    #[serde(flatten)]
+    pub extensions: std::collections::BTreeMap<String, Value>,
 }
 
-#[derive(Serialize)]
+/// Request sent by the standalone inspector. Ranges are deliberately
+/// explicit: a target never has to serialize rows that are outside the
+/// inspector viewport or a GPU buffer that is not selected.
+#[derive(Clone, Debug, Deserialize)]
+pub struct InspectorRequest {
+    pub request_id: u64,
+    pub cpu: Option<InspectorCpuRequest>,
+    pub gpu: Option<InspectorGpuRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InspectorCpuRequest {
+    pub archetype_id: u32,
+    pub component_id: u32,
+    pub row_start: usize,
+    pub row_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InspectorGpuRequest {
+    pub buffer: String,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+    pub cell: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct InspectorResponse {
+    pub kind: &'static str,
+    pub request_id: u64,
+    pub cpu: Option<InspectorCpuResponse>,
+    pub gpu: Option<InspectorGpuResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct InspectorCpuResponse {
+    pub archetype_id: u32,
+    pub component_id: u32,
+    pub row_start: usize,
+    pub entities: Vec<u64>,
+    pub rows_hex: Vec<String>,
+    pub rows_reflected: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct InspectorGpuResponse {
+    pub buffer: String,
+    pub byte_offset: u64,
+    pub bytes_hex: String,
+    pub cell: Option<u32>,
+}
+
+impl WorldSnapshot {
+    /// Attach a serializable projection owned by SceneDB, such as GPU mirror or upload diagnostics.
+    pub fn insert_snapshot_extension(&mut self, key: impl Into<String>, value: Value) {
+        self.extensions.insert(key.into(), value);
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub struct ArchetypeSnapshot {
     pub id: u32,
     pub entity_count: usize,
@@ -58,7 +126,7 @@ pub struct ArchetypeSnapshot {
     pub columns: Vec<ArchetypeColumnSnapshot>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ArchetypeColumnSnapshot {
     pub component_id: u32,
     /// `std::any::type_name::<T>()` recorded when this component type was
@@ -70,6 +138,9 @@ pub struct ArchetypeColumnSnapshot {
     /// column's type is registered with `pulsar_reflection`; `None` for a
     /// type with no reflection registration, in which case `rows_hex` is
     /// the only available view of this column's contents.
+    /// Total rows in this column. Metadata snapshots fill this without
+    /// copying any row bytes or invoking reflection.
+    pub row_count: usize,
     pub rows_reflected: Option<Vec<serde_json::Value>>,
     /// Hex-encoded raw bytes, row-major: `[row0_bytes, row1_bytes, ...]`,
     /// same order as the owning [`ArchetypeSnapshot::entities`]. Only
@@ -115,7 +186,6 @@ impl World {
                         let is_reflectable = RUNTIME_TYPE_REGISTRY
                             .get_by_id(ErasedColumn::type_id(&**col))
                             .is_some();
-
                         let mut rows_hex = Vec::new();
                         let mut rows_reflected_vec = Vec::new();
 
@@ -152,6 +222,7 @@ impl World {
                             component_id,
                             type_name: component::type_name(ComponentId(component_id)),
                             element_size,
+                            row_count: len,
                             rows_reflected,
                             rows_hex,
                         })
@@ -169,8 +240,71 @@ impl World {
 
         WorldSnapshot {
             entity_count: archetypes.iter().map(|a| a.entity_count).sum(),
+            gpu: self.gpu_mirror().map(|mirror| {
+                let texture_store = mirror.texture_store();
+                let texture_store = texture_store.as_ref().and_then(|store| store.read().ok());
+                crate::telemetry::collect_gpu_snapshot(mirror.store(), texture_store.as_deref())
+            }),
+            extensions: std::collections::BTreeMap::new(),
             archetypes,
         }
+    }
+
+    /// Metadata-only counterpart to [Self::telemetry_snapshot]. It walks
+    /// archetype/column headers but never visits an ECS row, calls reflection,
+    /// or performs GPU readback.
+    pub fn telemetry_snapshot_metadata(&self) -> WorldSnapshot {
+        let archetypes = self.archetypes.iter().map(|archetype| ArchetypeSnapshot {
+            id: archetype.id.0,
+            entity_count: archetype.entities.len(),
+            entities: Vec::new(),
+            columns: archetype.columns.iter().enumerate().filter_map(|(idx, col)| {
+                let col = col.as_ref()?;
+                Some(ArchetypeColumnSnapshot {
+                    component_id: idx as u32,
+                    type_name: component::type_name(ComponentId(idx as u32)),
+                    element_size: col.element_size(),
+                    row_count: col.len(),
+                    rows_reflected: None,
+                    rows_hex: Vec::new(),
+                })
+            }).collect(),
+        }).collect::<Vec<_>>();
+        WorldSnapshot {
+            entity_count: archetypes.iter().map(|a| a.entity_count).sum(),
+            gpu: self.gpu_mirror().map(|mirror| {
+                let texture_store = mirror.texture_store();
+                let texture_store = texture_store.as_ref().and_then(|store| store.read().ok());
+                crate::telemetry::collect_gpu_snapshot_metadata(mirror.store(), texture_store.as_deref())
+            }),
+            extensions: std::collections::BTreeMap::new(),
+            archetypes,
+        }
+    }
+
+    /// Capture one CPU column window. The requested bounds are clamped before
+    /// any row access, so this method is genuinely range-limited rather than
+    /// a full snapshot followed by pruning.
+    pub fn inspector_cpu_range(&self, request: &InspectorCpuRequest) -> Option<InspectorCpuResponse> {
+        let archetype = self.archetypes.get(request.archetype_id as usize)?;
+        let col = archetype.columns.get(request.component_id as usize)?.as_ref()?;
+        let start = request.row_start.min(col.len());
+        let end = start.saturating_add(request.row_count).min(col.len());
+        let reflected = RUNTIME_TYPE_REGISTRY.get_by_id(ErasedColumn::type_id(&**col)).is_some();
+        let mut entities = Vec::with_capacity(end.saturating_sub(start));
+        let mut rows_hex = Vec::new();
+        let mut rows_reflected = reflected.then(Vec::new);
+        for row in start..end {
+            entities.push(archetype.entities[row].bits());
+            if let Some(values) = rows_reflected.as_mut() {
+                values.push(RUNTIME_TYPE_REGISTRY.serialize_json_for_any(col.get_any(row)).unwrap_or_else(|error| serde_json::json!({"__reflection_error__": error.to_string()})));
+            } else {
+                let ptr = unsafe { col.get_raw(row) } as *const u8;
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, col.element_size()) };
+                rows_hex.push(hex_encode(bytes));
+            }
+        }
+        Some(InspectorCpuResponse { archetype_id: request.archetype_id, component_id: request.component_id, row_start: start, entities, rows_hex, rows_reflected })
     }
 }
 

@@ -760,7 +760,6 @@ pub fn generate_var_len_bearing_type(
         .collect();
 
     Ok(quote! {
-        #[cfg(feature = "gpu")]
         const _: () = {
             #(#gpu_wrapper_defs)*
 

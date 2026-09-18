@@ -170,7 +170,7 @@ impl GeometryArena {
 /// column below and the const size assert) — if the size assert ever fails,
 /// fix the field order/types, never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct MeshMetadata {
     pub vertex_offset: u32,          // 0
     pub index_offset: u32,           // 4
@@ -313,7 +313,7 @@ impl MeshRegistry {
 /// load-bearing — if the size assert ever fails, fix the field order/types,
 /// never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct ClusterNode {
     pub meshlet_offset: u32,      // 0
     pub meshlet_count: u32,       // 4
@@ -501,7 +501,7 @@ impl ClusterBuffer {
 /// const size assert) — if the size assert ever fails, fix the field
 /// order/types, never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct MeshletEntry {
     pub sphere_x: f32,      // 0   bounding sphere center
     pub sphere_y: f32,      // 4
@@ -712,7 +712,7 @@ impl MeshletBuffer {
 /// stays full-precision `f32` (packing it, like `base_color`, would clamp
 /// emissive to LDR).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 pub struct MaterialRow {
     pub base_color: u32,             // 0  RGBA8-unorm packed base color factor (linear)
     pub metallic: f32,               // 4  metallic factor ∈ [0, 1]

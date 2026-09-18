@@ -175,4 +175,4 @@ pub use world::{Mut, World};
 #[cfg(feature = "telemetry")]
 pub use telemetry::{TelemetryServer, TelemetrySnapshot};
 #[cfg(feature = "telemetry")]
-pub use world_telemetry::{ArchetypeColumnSnapshot, ArchetypeSnapshot, WorldSnapshot};
+pub use world_telemetry::{ArchetypeColumnSnapshot, ArchetypeSnapshot, InspectorCpuRequest, InspectorCpuResponse, InspectorGpuRequest, InspectorGpuResponse, InspectorRequest, InspectorResponse, WorldSnapshot};

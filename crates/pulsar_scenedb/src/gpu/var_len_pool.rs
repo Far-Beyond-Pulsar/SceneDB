@@ -65,7 +65,7 @@ fn padded_alloc_len(count: u32, align: u64) -> u64 {
 /// field. `count == 0` means "no allocation" (an empty or never-written
 /// `Vec`) — `offset` is meaningless in that case, never dereferenced.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, pulsar_reflection::Reflectable)]
 pub struct VarLenHandle {
     pub offset: u32,
     pub count: u32,
