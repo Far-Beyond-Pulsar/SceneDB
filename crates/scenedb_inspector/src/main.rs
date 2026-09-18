@@ -95,6 +95,8 @@ struct InspectorApp {
     gpu_zoom: f32,
     gpu_pan: egui::Vec2,
     selected_gpu_cell: Option<usize>,
+    gpu_visible_start: usize,
+    gpu_visible_count: usize,
     request_slot: u32,
     next_request_id: u64,
     last_request_key: Option<String>,
@@ -120,6 +122,22 @@ fn detail_cache_key(response: &serde_json::Value) -> Option<String> {
     ))
 }
 
+fn decode_hex(text: &str) -> Vec<u8> {
+    text.as_bytes()
+        .chunks(2)
+        .filter_map(|pair| {
+            if pair.len() != 2 { return None; }
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl InspectorApp {
     fn new(target_path: String, target_args: Vec<String>) -> Self {
         let mut app = Self {
@@ -141,6 +159,8 @@ impl InspectorApp {
             gpu_zoom: 1.0,
             gpu_pan: egui::Vec2::ZERO,
             selected_gpu_cell: None,
+            gpu_visible_start: 0,
+            gpu_visible_count: 16,
             request_slot: 0,
             next_request_id: 1,
             last_request_key: None,
@@ -378,7 +398,7 @@ impl eframe::App for InspectorApp {
         });
 
         if self.gpu_tab {
-            egui::CentralPanel::default().show(ctx, |ui| show_gpu_tab(ui, &snapshot, &mut self.selected_gpu_buffer, &mut self.gpu_textures_tab, &mut self.gpu_zoom, &mut self.gpu_pan, &mut self.selected_gpu_cell));
+            egui::CentralPanel::default().show(ctx, |ui| show_gpu_tab(ui, &snapshot, &mut self.selected_gpu_buffer, &mut self.gpu_textures_tab, &mut self.gpu_zoom, &mut self.gpu_pan, &mut self.selected_gpu_cell, &mut self.gpu_visible_start, &mut self.gpu_visible_count));
             return;
         }
         egui::SidePanel::left("archetypes")
@@ -565,6 +585,8 @@ fn show_gpu_tab(
     zoom: &mut f32,
     pan: &mut egui::Vec2,
     selected_cell: &mut Option<usize>,
+    visible_start: &mut usize,
+    visible_count: &mut usize,
 ) {
     ui.heading("SceneDB GPU storage");
     let Some(gpu) = snapshot.get("gpu") else {
@@ -585,6 +607,8 @@ fn show_gpu_tab(
     if selected.as_ref().map(|name| !entries.iter().any(|b| b.get("name").and_then(|v| v.as_str()) == Some(name))).unwrap_or(true) {
         *selected = entries.first().and_then(|b| b.get("name")).and_then(|v| v.as_str()).map(str::to_owned);
         *selected_cell = None;
+        *visible_start = 0;
+        *visible_count = 16;
     }
     ui.label(format!("{} registered SceneDB GPU entries", entries.len()));
     ui.separator();
@@ -597,8 +621,8 @@ fn show_gpu_tab(
         .min_width(160.0)
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.selectable_label(!*textures_tab, "Buffers").clicked() { *textures_tab = false; *selected = None; *selected_cell = None; }
-                if ui.selectable_label(*textures_tab, "Textures").clicked() { *textures_tab = true; *selected = None; *selected_cell = None; }
+                if ui.selectable_label(!*textures_tab, "Buffers").clicked() { *textures_tab = false; *selected = None; *selected_cell = None; *visible_start = 0; *visible_count = 16; }
+                if ui.selectable_label(*textures_tab, "Textures").clicked() { *textures_tab = true; *selected = None; *selected_cell = None; *visible_start = 0; *visible_count = 16; }
             });
             egui::ScrollArea::vertical()
                 .id_salt("scenedb_gpu_buffer_list")
@@ -624,6 +648,8 @@ fn show_gpu_tab(
                         {
                             *selected = Some(name.to_owned());
                             *selected_cell = None;
+                            *visible_start = 0;
+                            *visible_count = 16;
                         }
                     }
                 });
@@ -696,9 +722,6 @@ fn show_gpu_tab(
                 .checked_div(element_size)
                 .unwrap_or(0)
                 .saturating_sub(1);
-            if selected_cell.is_none() {
-                *selected_cell = Some(0);
-            }
             let mut cell_index = (*selected_cell).unwrap_or(0) as u64;
             cell_index = cell_index.min(max_cell);
             ui.horizontal(|ui| {
@@ -736,6 +759,16 @@ fn show_gpu_tab(
             .id_salt("scenedb_gpu_cells")
             .auto_shrink([false, false])
             .show_rows(ui, 24.0, cells.len(), |ui, range| {
+                let new_start = range.start;
+                let new_count = range.len().max(1);
+                if new_start != *visible_start || new_count != *visible_count {
+                    *visible_start = new_start;
+                    *visible_count = new_count;
+                    // Scrolling resumes viewport range reads; a selected cell
+                    // remains an explicit granular-detail request only until
+                    // the user moves the viewport again.
+                    *selected_cell = None;
+                }
                 for position in range {
                     let cell = &cells[position];
                     let index = cell.get("index").and_then(|v| v.as_u64()).unwrap_or(position as u64) as usize;
@@ -901,9 +934,16 @@ impl InspectorApp {
         if let Some(gpu) = response.get("gpu") {
             if let Some(name) = gpu.get("buffer").and_then(|v| v.as_str()) {
                 if let Some(buffer) = snapshot.get_mut("gpu").and_then(|v| v.get_mut("registry_buffers")).and_then(|v| v.as_array_mut()).and_then(|a| a.iter_mut().find(|b| b.get("name").and_then(|v| v.as_str()) == Some(name))) {
-                    let bytes = gpu.get("bytes_hex").cloned().unwrap_or(serde_json::Value::String(String::new()));
-                    buffer["raw_chunks"] = serde_json::json!([{ "offset": gpu.get("byte_offset").cloned().unwrap_or(0.into()), "bytes_hex": bytes }]);
-                    if let Some(cell) = gpu.get("cell").and_then(|v| v.as_u64()) { buffer["cells"] = serde_json::json!([{ "index": cell, "bytes_hex": gpu.get("bytes_hex").cloned().unwrap_or(serde_json::Value::String(String::new())), "reflected": null }]); }
+                    let byte_offset = gpu.get("byte_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let bytes_hex = gpu.get("bytes_hex").and_then(|v| v.as_str()).unwrap_or("");
+                    buffer["raw_chunks"] = serde_json::json!([{ "offset": byte_offset, "bytes_hex": bytes_hex }]);
+                    if let Some(cell) = gpu.get("cell").and_then(|v| v.as_u64()) {
+                        buffer["cells"] = serde_json::json!([{ "index": cell, "bytes_hex": bytes_hex, "reflected": null }]);
+                    } else if let Some(element_size) = buffer.get("element_size").and_then(|v| v.as_u64()).filter(|size| *size != 0) {
+                        let bytes = decode_hex(bytes_hex);
+                        let first_cell = byte_offset / element_size;
+                        buffer["cells"] = serde_json::Value::Array(bytes.chunks(element_size as usize).enumerate().map(|(offset, bytes)| serde_json::json!({ "index": first_cell + offset as u64, "bytes_hex": encode_hex(bytes), "reflected": null })).collect());
+                    }
                 }
             }
         }
@@ -921,9 +961,25 @@ impl InspectorApp {
         }
         let mut gpu = None;
         if self.gpu_tab { if let Some(name) = self.selected_gpu_buffer.as_deref() {
-            let size = snapshot.get("gpu").and_then(|v| v.get("registry_buffers")).and_then(|v| v.as_array()).and_then(|a| a.iter().find(|b| b.get("name").and_then(|v| v.as_str()) == Some(name))).and_then(|b| b.get("element_size")).and_then(|v| v.as_u64()).unwrap_or(16);
-            let cell = self.selected_gpu_cell.map(|v| v as u32);
-            gpu = Some(serde_json::json!({ "buffer": name, "byte_offset": cell.map(|v| v as u64 * size).unwrap_or(0), "byte_len": size.max(16), "cell": cell }));
+            let buffer = snapshot.get("gpu").and_then(|v| v.get("registry_buffers")).and_then(|v| v.as_array()).and_then(|a| a.iter().find(|b| b.get("name").and_then(|v| v.as_str()) == Some(name)));
+            let kind = buffer.and_then(|b| b.get("kind")).and_then(|v| v.as_str()).unwrap_or("");
+            let size = buffer.and_then(|b| b.get("element_size")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let capacity = buffer.and_then(|b| b.get("capacity_bytes")).and_then(|v| v.as_u64()).unwrap_or(0);
+            // Textures and the synthetic demo entry have no SceneDB buffer
+            // key to read. Real buffers use a viewport range until a cell is
+            // explicitly selected in the central list.
+            if kind != "texture" && !name.contains("[synthetic]") && size != 0 && capacity != 0 {
+                let max_cell = capacity.checked_div(size).unwrap_or(0).saturating_sub(1);
+                let cell = self.selected_gpu_cell.map(|v| v as u64).filter(|v| *v <= max_cell).map(|v| v as u32);
+                let (byte_offset, byte_len) = if let Some(cell) = cell {
+                    (cell as u64 * size, size.max(4))
+                } else {
+                    let start = (self.gpu_visible_start as u64).min(max_cell);
+                    let count = (self.gpu_visible_count.max(1) as u64).min(max_cell.saturating_sub(start) + 1);
+                    (start * size, count * size)
+                };
+                gpu = Some(serde_json::json!({ "buffer": name, "byte_offset": byte_offset, "byte_len": byte_len, "cell": cell }));
+            }
         }}
         if cpu.is_none() && gpu.is_none() { return; }
         let key = serde_json::json!({ "cpu": cpu, "gpu": gpu }).to_string();
