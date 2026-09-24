@@ -685,6 +685,54 @@ pub(crate) fn dispatch_for(id: ComponentId) -> Option<DispatchFn> {
     registry_map().get(&id).copied()
 }
 
+/// Removal counterpart to [`write_gpu_columns_at_row`]: writes zeros into
+/// every fixed-size `#[gpu]` column of `T` at `row`, through the same
+/// registration path the write would take. `heavy` columns (whose GPU
+/// element size differs from the field) are left alone; their liveness is
+/// the generation mirror's job.
+pub fn clear_gpu_columns_at_row<T: GpuColumnSet>(store: &SceneGpuStore, queue: &wgpu::Queue, row: u32) {
+    for col in T::gpu_columns() {
+        if col.upload.is_some() {
+            continue;
+        }
+        let zeros = vec![0u8; col.field_token.desc().size as usize];
+        let id = col.field_token.id();
+        if store.mark_gpu_row_dirty(id, row, &zeros) || store.write_row_bytes(id, queue, &zeros, row) {
+            continue;
+        }
+        // Growable registration: never grow a buffer just to clear a row it
+        // does not hold.
+        let _ = store.write_row_bytes_growing(id, queue, &zeros, row);
+    }
+}
+
+/// Zeroes a component type's GPU row when that component leaves an entity.
+/// Emitted by `#[derive(SceneStore)]` for every type with `#[gpu]` fields;
+/// `row` = `entity.index()`.
+pub type ClearFn = fn(&GpuMirrorHandle, u32);
+
+pub struct GpuClearRegistration {
+    pub component_id: fn() -> ComponentId,
+    pub clear: ClearFn,
+}
+
+pulsar_reflection::inventory::collect!(GpuClearRegistration);
+
+fn clear_registry_map() -> &'static HashMap<ComponentId, ClearFn> {
+    static MAP: OnceLock<HashMap<ComponentId, ClearFn>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        pulsar_reflection::inventory::iter::<GpuClearRegistration>()
+            .map(|r| ((r.component_id)(), r.clear))
+            .collect()
+    })
+}
+
+/// Looks up `id`'s GPU-row clear function, if the derive generated one.
+#[inline]
+pub(crate) fn clear_dispatch_for(id: ComponentId) -> Option<ClearFn> {
+    clear_registry_map().get(&id).copied()
+}
+
 /// Despawn/removal counterpart to [`DispatchFn`]/[`GpuMirrorRegistration`]:
 /// `row` = `entity.index()`, same key every other World-mirror row uses.
 /// Only emitted by the derive for var-len-bearing structs (see

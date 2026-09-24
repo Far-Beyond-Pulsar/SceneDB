@@ -112,6 +112,11 @@ pub struct World {
     /// no allocation, nothing on any drop path. Not feature-gated: live-UI
     /// consumers are always available (CONTRACTS C0).
     subscriptions: Option<crate::subscriptions::SubscriptionRegistryHandle>,
+    /// Multi-reader change journals (see [`crate::change_journal`]). Created
+    /// by the first [`World::open_change_cursor`]; until then every mutating
+    /// path pays one atomic load for it. `OnceLock` rather than `Option` so a
+    /// reader holding only `&World` can open a cursor.
+    change_journals: std::sync::OnceLock<crate::change_journal::ChangeJournalHandle>,
     /// Counted-handle bookkeeping (see [`crate::handle_ledger`]) -- ALWAYS
     /// present, unlike the three optional capabilities above it. There is no
     /// attach/detach ceremony: handle counting must simply be correct with
@@ -162,6 +167,9 @@ pub struct Mut<'a, T> {
     /// unsubscribed `get_mut` costs one `Option` check on construction and
     /// one bool store per `DerefMut`.
     sub_hook: Option<SubMutHook>,
+    /// Precomputed at [`World::get_mut`] time: `None` until any change
+    /// journal exists. Fires on an actual write, like `sub_hook`.
+    journal_hook: Option<JournalMutHook>,
     /// Precomputed at [`World::get_mut`] time (not resolved again in
     /// [`Drop::drop`]): `None` whenever the `gpu` feature is off, no mirror
     /// is attached, or `T` has no `#[gpu]` fields — the exact same
@@ -263,6 +271,13 @@ impl HandleMutHook {
     }
 }
 
+/// See [`Mut::journal_hook`]'s doc.
+struct JournalMutHook {
+    journals: crate::change_journal::ChangeJournalHandle,
+    entity: Entity,
+    component_id: ComponentId,
+}
+
 impl SubMutHook {
     /// Deliver the `Mutated` event. One lock acquisition, one hash probe;
     /// never runs user code (batched delivery -- see
@@ -346,6 +361,13 @@ impl<'a, T> Mut<'a, T> {
         if let Some(hook) = self.sub_hook.take() {
             hook.fire();
         }
+        if let Some(hook) = self.journal_hook.take() {
+            crate::change_journal::lock(&hook.journals).record(
+                hook.entity,
+                hook.component_id,
+                crate::subscriptions::ComponentChangeKind::Mutated,
+            );
+        }
         let ptr: *mut T = self.value as *mut T;
         // SAFETY: `ptr` is `self.value`, a `&'a mut T` this `Mut` uniquely
         // owned. `mem::forget` below means `self` (and its `Drop` impl,
@@ -403,6 +425,13 @@ impl<'a, T> Drop for Mut<'a, T> {
             if let Some(hook) = &self.sub_hook {
                 hook.fire();
             }
+            if let Some(hook) = &self.journal_hook {
+                crate::change_journal::lock(&hook.journals).record(
+                    hook.entity,
+                    hook.component_id,
+                    crate::subscriptions::ComponentChangeKind::Mutated,
+                );
+            }
         }
     }
 }
@@ -432,6 +461,7 @@ impl World {
             #[cfg(feature = "telemetry")]
             inspector_response_callback: None,
             subscriptions: None,
+            change_journals: std::sync::OnceLock::new(),
             handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::handle_ledger::HandleCounts::default(),
             )),
@@ -610,6 +640,51 @@ impl World {
     /// them -- the cheap "is the world dirty?" check for idle frames and panels.
     pub fn revision(&self) -> u64 {
         self.change_tracker.as_ref().map_or(0, |tracker| tracker.revision())
+    }
+
+    // ── Change journals ─────────────────────────────────────────────────────
+
+    /// Start journaling changes to component `T` (if nothing already is) and
+    /// return a cursor positioned after every change made so far. Takes
+    /// `&self`, so a consumer holding only a shared borrow can open one. See
+    /// [`crate::change_journal`] for the model: open, do one full scan, then
+    /// call [`Self::read_changes`] each frame.
+    pub fn open_change_cursor<T: Component>(&self) -> crate::change_journal::ChangeCursor {
+        self.open_change_cursor_id(crate::component::component_id::<T>())
+    }
+
+    /// Untyped [`Self::open_change_cursor`].
+    pub fn open_change_cursor_id(&self, component: ComponentId) -> crate::change_journal::ChangeCursor {
+        let journals = self.change_journals.get_or_init(Default::default);
+        crate::change_journal::lock(journals).open(component)
+    }
+
+    /// Append every change recorded for `cursor`'s component type since the
+    /// cursor's last read to `out`, in order, and advance the cursor. Other
+    /// readers are unaffected. Returns [`crate::change_journal::ChangeRead::Overflowed`]
+    /// (appending nothing) when the journal evicted unread entries; rescan
+    /// in that case.
+    pub fn read_changes(
+        &self,
+        cursor: &mut crate::change_journal::ChangeCursor,
+        out: &mut Vec<crate::change_journal::ComponentChange>,
+    ) -> crate::change_journal::ChangeRead {
+        match self.change_journals.get() {
+            Some(journals) => crate::change_journal::lock(journals).read(cursor, out),
+            None => crate::change_journal::ChangeRead::Overflowed,
+        }
+    }
+
+    #[inline]
+    fn record_journal(
+        &self,
+        entity: Entity,
+        component: ComponentId,
+        kind: crate::subscriptions::ComponentChangeKind,
+    ) {
+        if let Some(journals) = self.change_journals.get() {
+            crate::change_journal::lock(journals).record(entity, component, kind);
+        }
     }
 
     // ── Component subscriptions (SceneDB#47) ────────────────────────────────
@@ -1145,6 +1220,13 @@ impl World {
                     {
                         release(mirror, entity.index());
                     }
+                    // Zero the departed component's GPU row: consumers
+                    // reading these buffers by row must not keep seeing it.
+                    if let Some(clear) =
+                        crate::gpu::world_mirror::clear_dispatch_for(ComponentId(i as u32))
+                    {
+                        clear(mirror, entity.index());
+                    }
                 }
             }
         }
@@ -1250,6 +1332,12 @@ impl World {
         // handle, so a surviving subscription could never fire again and is
         // pure bookkeeping weight. This is the ONLY implicit unsubscribe:
         // live-entity subscriptions stay armed until explicitly dropped.
+        if let Some(journals) = self.change_journals.get() {
+            let mut journals = crate::change_journal::lock(journals);
+            for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
+                journals.record(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
+            }
+        }
         if let Some(registry) = &self.subscriptions {
             let mut guard = crate::subscriptions::lock(registry);
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
@@ -1469,6 +1557,7 @@ impl World {
                 t.record_component_change(entity, cid, 0, bytes.to_vec());
             }
             col.data[old_row] = value;
+            self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
             // Subscription delivery (SceneDB#47): an in-place overwrite IS a
             // real change to `(entity, T)`. Reported as `Inserted` -- from a
             // subscriber's perspective this call made `T` present with a new
@@ -1559,6 +1648,8 @@ impl World {
             t.record_component_change(entity, cid, 0, Vec::new());
         }
 
+        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
+
         // Subscription delivery (SceneDB#47): same contract as the in-place
         // insert path above -- `T` is now present on `entity` with a new
         // value. See `insert_inner`'s other delivery site for the cost shape.
@@ -1631,6 +1722,9 @@ impl World {
             if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(cid) {
                 release(mirror, entity.index());
             }
+            if let Some(clear) = crate::gpu::world_mirror::clear_dispatch_for(cid) {
+                clear(mirror, entity.index());
+            }
         }
 
         // Pull the value out of the column. `remove_inner<T>` already knows
@@ -1691,6 +1785,8 @@ impl World {
             // list instead.
             t.record_component_removal(entity, cid);
         }
+
+        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
 
         // Subscription delivery (SceneDB#47): the component's lifetime on
         // this entity ended -- subscribers must see it so a cache-until-
@@ -1774,6 +1870,11 @@ impl World {
             entity,
             component_id: cid,
         });
+        let journal_hook = self.change_journals.get().map(|journals| JournalMutHook {
+            journals: std::sync::Arc::clone(journals),
+            entity,
+            component_id: cid,
+        });
 
         // Handle hook: capture the OLD handle values NOW (the caller is one
         // `DerefMut` away from overwriting them, and there is no shadow to
@@ -1796,6 +1897,7 @@ impl World {
             value,
             mutated_via_deref_mut: false,
             sub_hook,
+            journal_hook,
             #[cfg(feature = "gpu")]
             gpu_hook,
             change_hook,
@@ -2045,6 +2147,8 @@ impl World {
         if let Some(t) = tracker.as_deref_mut() {
             t.record_component_change(entity, cid, 0, Vec::new());
         }
+
+        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
 
         // Subscription delivery (SceneDB#47): a bundle component pushed
         // onto a freshly spawned entity is an insert like any other -- same
