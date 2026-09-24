@@ -69,8 +69,9 @@ pub mod bundle;
 pub mod cell;
 pub mod cell_type;
 pub mod change_journal;
+pub mod component_ref;
+pub mod mut_guard;
 pub mod component;
-pub mod component_store;
 pub mod entity;
 pub mod handle;
 pub mod handle_ledger;
@@ -113,7 +114,6 @@ pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use change_journal::{ChangeCursor, ChangeRead, ComponentChange};
 pub use component::{component_id, Component, ComponentId};
-pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp, ComponentStore};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
@@ -172,7 +172,9 @@ pub use spatial::{
 };
 pub use time::GameTime;
 pub use token::{HasTypeToken, TypeToken};
-pub use world::{Mut, World};
+pub use component_ref::{ComponentHandle, ComponentRef};
+pub use mut_guard::{Mut, MutDyn};
+pub use world::World;
 
 #[cfg(feature = "telemetry")]
 pub use telemetry::{TelemetryServer, TelemetrySnapshot};

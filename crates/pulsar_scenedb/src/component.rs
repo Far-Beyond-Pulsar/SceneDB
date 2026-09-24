@@ -195,6 +195,9 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
     /// contract requires the caller to already uphold; enforced here
     /// instead of left unchecked, since this method is otherwise safe).
     fn get_any(&self, row: usize) -> &dyn Any;
+    /// Mutable counterpart to [`get_any`](Self::get_any), erased to the
+    /// element type `T`. Bounds-checked; panics if `row >= self.len()`.
+    fn get_any_mut(&mut self, row: usize) -> &mut dyn Any;
     /// Return a mutable raw pointer to the element at `row`.
     ///
     /// # Safety
@@ -303,6 +306,10 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     fn get_any(&self, row: usize) -> &dyn Any {
         &self.data[row]
+    }
+
+    fn get_any_mut(&mut self, row: usize) -> &mut dyn Any {
+        &mut self.data[row]
     }
 
     unsafe fn get_raw_mut(&mut self, row: usize) -> *mut () {
