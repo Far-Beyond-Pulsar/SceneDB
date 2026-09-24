@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemImpl};
 
 mod cell;
+mod component_methods;
 mod gpu;
 mod replicate;
 mod scene_store;
@@ -97,4 +98,36 @@ pub fn scenedb_subsystem(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn subsystem_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
+}
+
+/// Register methods callable on a component from scripts and tools.
+///
+/// On an inherent impl block of a component type, registers:
+///
+/// - methods marked `#[reflect_method(...)]` (`&self` / `&mut self` /
+///   associated fns), exactly as `pulsar_reflection`'s `#[reflect_methods]`;
+/// - methods marked `#[world_method(...)]`, whose first two parameters are
+///   the world (`&mut World` or `&World`) and the entity. They are called
+///   with the entity whose component the script refers to, and can reach
+///   anything else in the world.
+///
+/// Both markers take the same options: `pure`, `side_effect_free`,
+/// `deterministic`, `name = "..."` and free-form `key = "value"` pairs.
+///
+/// ```ignore
+/// #[pulsar_scenedb::component_methods]
+/// impl Health {
+///     #[reflect_method(pure)]
+///     pub fn current(&self) -> f32 { self.value }
+///
+///     #[world_method]
+///     pub fn transfer(world: &mut World, entity: Entity, to: Entity, amount: f32) { .. }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn component_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let impl_block = parse_macro_input!(item as ItemImpl);
+    component_methods::expand(attr.into(), impl_block)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
 }

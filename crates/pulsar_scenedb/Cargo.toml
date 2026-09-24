@@ -10,12 +10,12 @@ gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
-# Repinned onto the `dyn-method-registry` branch (Pulsar-Reflection#3) for
-# DynMethodRegistry/DYN_METHOD_REGISTRY, which `subsystem.rs`'s dynamic
-# dispatch path needs. Additive-only on the Pulsar-Reflection side (see
-# that PR), so this is safe ahead of merge; repin to whatever commit
-# Pulsar-Reflection#3 merges as once that lands.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "1c64758" }
+# Pinned to Pulsar-Reflection's `claude/serene-keller-ma920s` branch for
+# the TypeId-keyed method registry (`pulsar_reflection::methods`) that
+# component methods are built on; it also carries the built-in array
+# registrations from 1c64758 (the previous pin). Keep in step with the
+# `pulsar_reflection_codegen` pin in pulsar_scenedb_derive.
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "3daa98e" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }

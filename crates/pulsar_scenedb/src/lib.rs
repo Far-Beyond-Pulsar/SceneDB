@@ -69,6 +69,7 @@ pub mod bundle;
 pub mod cell;
 pub mod cell_type;
 pub mod change_journal;
+pub mod component_methods;
 pub mod component_ref;
 pub mod mut_guard;
 pub mod component;
@@ -139,7 +140,11 @@ pub use pulsar_reflection;
 // emitting `::pulsar_scenedb::SceneStore` as one more `#[derive(...)]` entry
 // in their own generated token stream, instead of hand-rolling equivalent
 // `Pod`/`HasTypeToken`/`SceneColumnSet`/`GpuColumnSet` codegen themselves.
-pub use pulsar_scenedb_derive::SceneStore;
+pub use pulsar_scenedb_derive::{component_methods, SceneStore};
+pub use component_methods::{
+    component_methods as methods_of_component, find_component_method, ComponentCallError,
+    ComponentMethod, WorldMethod,
+};
 #[cfg(feature = "gpu")]
 pub use subsystem::{Subsystem, SubsystemRegistry};
 #[cfg(feature = "gpu")]

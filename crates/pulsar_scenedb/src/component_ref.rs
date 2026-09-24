@@ -53,6 +53,16 @@ impl ComponentRef {
         world.get_dyn_mut(self.entity, self.component)
     }
 
+    /// Call the component method `name` (see [`crate::component_methods`]).
+    pub fn call(
+        &self,
+        world: &mut World,
+        name: &str,
+        args: &mut [Box<dyn Any>],
+    ) -> Result<Option<Box<dyn Any>>, crate::ComponentCallError> {
+        world.call_component_method(self.entity, self.component, name, args)
+    }
+
     /// Typed view of this reference, if it names a `T`.
     pub fn typed<T: Component>(&self) -> Option<ComponentHandle<T>> {
         (self.component == component_id::<T>()).then(|| ComponentHandle::new(self.entity))
