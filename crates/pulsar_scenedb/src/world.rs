@@ -1220,6 +1220,13 @@ impl World {
                     {
                         release(mirror, entity.index());
                     }
+                    // Zero the departed component's GPU row: consumers
+                    // reading these buffers by row must not keep seeing it.
+                    if let Some(clear) =
+                        crate::gpu::world_mirror::clear_dispatch_for(ComponentId(i as u32))
+                    {
+                        clear(mirror, entity.index());
+                    }
                 }
             }
         }
@@ -1714,6 +1721,9 @@ impl World {
         if let Some(mirror) = &self.gpu_mirror {
             if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(cid) {
                 release(mirror, entity.index());
+            }
+            if let Some(clear) = crate::gpu::world_mirror::clear_dispatch_for(cid) {
+                clear(mirror, entity.index());
             }
         }
 

@@ -524,10 +524,49 @@ pub fn generate_gpu_column_set(
         }
     };
 
+    // Removal counterpart to the dispatch above: zeroes this type's GPU row
+    // when the component leaves an entity (remove or despawn), so consumers
+    // stop seeing the departed value. Packed types clear their one packed
+    // row; per-field types clear each fixed-size column.
+    let clear_fn_name = quote::format_ident!("__scenedb_gpu_clear_{}", name);
+    let clear_body = if is_packed {
+        quote! {
+            let id = ::pulsar_scenedb::component::component_id::<#packed_view_ident>();
+            let zeros = ::std::vec![0u8; ::std::mem::size_of::<#packed_view_ident>()];
+            mirror.store().mark_gpu_row_dirty(id, row, &zeros);
+        }
+    } else {
+        quote! {
+            ::pulsar_scenedb::gpu::world_mirror::clear_gpu_columns_at_row::<#name #ty_generics>(
+                mirror.store(),
+                mirror.queue(),
+                row,
+            );
+        }
+    };
+    let world_mirror_clear_registration = quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #clear_fn_name(mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle, row: u32) {
+            #clear_body
+        }
+
+        ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
+            ::pulsar_scenedb::gpu::world_mirror::GpuClearRegistration {
+                component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                clear: #clear_fn_name,
+            }
+        }
+    };
+
     let (register_growable_calls, world_mirror_registration) = if is_packed {
         (vec![register_growable_calls_packed], world_mirror_registration_packed)
     } else {
         (register_growable_calls, world_mirror_registration_default)
+    };
+    let world_mirror_registration = quote! {
+        #world_mirror_registration
+        #world_mirror_clear_registration
     };
 
     // Only emitted for packed types: the packed view struct is intentionally
