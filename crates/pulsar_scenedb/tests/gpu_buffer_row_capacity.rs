@@ -52,3 +52,40 @@ fn row_capacity_follows_growth() {
     assert!(grown.row_capacity() >= 100, "capacity {} did not follow growth", grown.row_capacity());
     assert_eq!(grown.buffer.size() / grown.row_bytes, grown.row_capacity() as u64);
 }
+
+#[test]
+fn content_generation_tracks_uploaded_writes_only() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    };
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+    let ctx = EngineGpuContext::new(Arc::new(device), Arc::new(queue));
+    let mut store = SceneGpuStore::new(
+        &ctx,
+        SceneGpuConfig { classes: vec![], tombstone_headroom: 0, max_cells_metadata: 0 },
+    );
+    Row::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(store.clone(), ctx.queue().clone()));
+    let key = BufferKey::of("row_capacity_rows");
+    let generation = || store.resolve_buffer_handle(key).unwrap().content_generation;
+
+    let e = world.spawn();
+    world.insert(e, Row { model: [0.0; 16], tag: 1 });
+    world.flush_gpu_mirror(ctx.queue());
+    let after_insert = generation();
+
+    world.flush_gpu_mirror(ctx.queue());
+    assert_eq!(generation(), after_insert, "a flush with nothing dirty is not a write");
+    let _ = world.get::<Row>(e);
+    world.flush_gpu_mirror(ctx.queue());
+    assert_eq!(generation(), after_insert, "reading is not a write");
+
+    world.get_mut::<Row>(e).unwrap().tag = 2;
+    world.flush_gpu_mirror(ctx.queue());
+    assert!(generation() > after_insert, "an in-place edit must bump the generation");
+}

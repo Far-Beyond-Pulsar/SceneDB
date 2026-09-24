@@ -138,6 +138,13 @@ pub struct BufferHandle {
     /// anything else without a fixed row. A growable row buffer's current
     /// capacity is [`Self::row_capacity`], not a compile-time constant.
     pub row_bytes: u64,
+    /// Bumped whenever SceneDB uploads new contents into this buffer (a
+    /// mirror flush that wrote rows, an immediate row write, a var-len pool
+    /// write). Unchanged means no CPU-side write reached the buffer since
+    /// the value was observed, so a consumer may reuse results derived from
+    /// it; pair it with [`Self::epoch`] for bind-group identity. Writes made
+    /// by GPU passes into a buffer they own are not tracked here.
+    pub content_generation: u64,
 }
 
 impl BufferHandle {
@@ -275,6 +282,7 @@ struct RegistryEntry {
 struct EntryInner {
     buffer: wgpu::Buffer,
     epoch: u64,
+    content_generation: u64,
 }
 
 /// Bundles [`GpuBufferRegistry::insert`]'s parameters — a private helper
@@ -505,7 +513,7 @@ impl GpuBufferRegistry {
                 element_size,
                 access,
                 mirror_mode,
-                inner: Some(RwLock::new(EntryInner { buffer, epoch: 0 })),
+                inner: Some(RwLock::new(EntryInner { buffer, epoch: 0, content_generation: 0 })),
                 row_inspector,
                 row_type_name,
             },
@@ -540,6 +548,17 @@ impl GpuBufferRegistry {
         }
     }
 
+    /// Record that new contents were uploaded into `key`'s buffer (see
+    /// [`BufferHandle::content_generation`]). No-op for unknown keys and
+    /// texture arrays.
+    pub fn note_content_write(&self, key: BufferKey) {
+        let entries = self.entries.read().expect("GpuBufferRegistry lock poisoned");
+        if let Some(inner) = entries.get(&key).and_then(|entry| entry.inner.as_ref()) {
+            let mut inner = inner.write().expect("GpuBufferRegistry lock poisoned");
+            inner.content_generation = inner.content_generation.wrapping_add(1);
+        }
+    }
+
     /// Resolve `key` to its current [`BufferHandle`] (owned buffer + epoch).
     /// `None` if the key was never registered, OR if it was registered as a
     /// texture array ([`Self::register_texture_array`]) — a texture array
@@ -558,6 +577,7 @@ impl GpuBufferRegistry {
         Some(BufferHandle {
             buffer: inner.buffer.clone(),
             epoch: inner.epoch,
+            content_generation: inner.content_generation,
             row_bytes: if entry.kind == EntryKind::Row {
                 entry.element_size as u64
             } else {

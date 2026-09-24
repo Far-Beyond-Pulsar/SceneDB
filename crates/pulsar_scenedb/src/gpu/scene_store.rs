@@ -1679,12 +1679,23 @@ impl SceneGpuStore {
     /// via `register_gpu_buffer` — a caller inserting a component before its
     /// GPU buffer is wired up is expected during bring-up, not a bug.
     pub fn write_row_bytes(&self, id: ComponentId, queue: &wgpu::Queue, data: &[u8], row: u32) -> bool {
-        match self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned").get(&id) {
+        let written = match self.gpu_buffers.read().expect("SceneGpuStore gpu_buffers lock poisoned").get(&id) {
             Some(buf) => {
                 buf.write_rows_raw(queue, data, row);
                 true
             }
             None => false,
+        };
+        if written {
+            self.note_content_write_for_id(id);
+        }
+        written
+    }
+
+    /// Bumps the registry's content generation for the buffer `id` lives in.
+    fn note_content_write_for_id(&self, id: ComponentId) {
+        if let Some(key) = self.buffer_key_for(id) {
+            self.registry.note_content_write(key);
         }
     }
 
@@ -1712,11 +1723,16 @@ impl SceneGpuStore {
         data: &[u8],
         row: u32,
     ) -> Option<Result<(), CapacityError>> {
-        self.growable_gpu_buffers
+        let result = self
+            .growable_gpu_buffers
             .read()
             .expect("SceneGpuStore growable_gpu_buffers lock poisoned")
             .get(&id)
-            .map(|buf| buf.write_row_growing(queue, row, data))
+            .map(|buf| buf.write_row_growing(queue, row, data));
+        if matches!(result, Some(Ok(()))) {
+            self.note_content_write_for_id(id);
+        }
+        result
     }
 
     /// Lock-safe access to a growable column's current buffer, by
@@ -2041,6 +2057,8 @@ impl SceneGpuStore {
             buffer.expect("var-len pool buffer was not exposed"),
             pool.epoch(),
         );
+        // Every caller syncs right after writing into the pool.
+        self.registry.note_content_write(key);
     }
 
     /// Looks up an already-registered [`crate::gpu::VarLenGpuPool<T>`] by
@@ -3125,8 +3143,11 @@ impl SceneGpuStore {
     /// harmless no-op).
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
         let mut total = SyncStats { ranges: 0, bytes: 0 };
-        for buf in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").values() {
+        for (&id, buf) in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").iter() {
             let stats = buf.flush(queue);
+            if stats.ranges > 0 {
+                self.note_content_write_for_id(id);
+            }
             total.ranges += stats.ranges;
             total.bytes += stats.bytes;
         }
