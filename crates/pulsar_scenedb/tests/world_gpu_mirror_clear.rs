@@ -103,3 +103,18 @@ fn reinserting_in_the_same_frame_keeps_the_new_value() {
     world.flush_gpu_mirror(ctx.queue());
     assert_eq!(row_words(&ctx, &store, "clear_test_packed", e.index(), 2), [3, 4]);
 }
+
+#[test]
+fn erased_writes_reach_the_gpu_mirror() {
+    let Some((ctx, store, mut world)) = setup() else {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    };
+    let e = world.spawn();
+    world.insert(e, Packed { a: 1, b: 2 });
+    world.flush_gpu_mirror(ctx.queue());
+    let id = pulsar_scenedb::component_id::<Packed>();
+    world.get_dyn_mut(e, id).unwrap().downcast_mut::<Packed>().unwrap().b = 42;
+    world.flush_gpu_mirror(ctx.queue());
+    assert_eq!(row_words(&ctx, &store, "clear_test_packed", e.index(), 2), [1, 42]);
+}

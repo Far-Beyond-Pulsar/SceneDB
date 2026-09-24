@@ -4,7 +4,7 @@ use crate::entity::{Entity, EntitySlot};
 use crate::replication::ChangeTracker;
 use ahash::AHashMap;
 use std::mem::MaybeUninit;
-use std::ops::{Deref, DerefMut};
+use std::any::Any;
 
 /// Fixed-capacity, over-aligned scratch buffer for a single erased-component
 /// move (swap-remove -> push) during archetype migration
@@ -137,304 +137,8 @@ pub struct World {
     handle_counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
 }
 
-/// A mutable borrow of component `T` on some entity, returned by
-/// [`World::get_mut`]. `Deref`/`DerefMut` to `T`, so every existing call
-/// site (`*guard = value`, `guard.field += 1`, method calls) keeps working
-/// unchanged — the only observable difference from the old `&mut T` is that
-/// dropping this guard, not the mutation itself, is when a `#[gpu]`-bearing
-/// component's fields reach the GPU mirror (see the struct's field doc).
-///
-/// This exists to close a real gap: before this type, `World::insert` had a
-/// GPU dispatch hook but `get_mut` had none at all — mutating a `#[gpu]`
-/// field through `get_mut` silently never reached the GPU, for EITHER
-/// `MirrorMode`, not just `Once`. `Mut` gives `get_mut` the same hook
-/// `insert_inner` already has, reusing the identical link-time dispatch
-/// registry (`crate::gpu::world_mirror::dispatch_for`) — no new registration
-/// mechanism.
-pub struct Mut<'a, T> {
-    value: &'a mut T,
-    /// Set by [`DerefMut::deref_mut`]: whether the caller actually wrote
-    /// through the guard. The subscription hook (see `sub_hook` below) only
-    /// fires when this is set -- a borrow-only `get_mut` is not a mutation,
-    /// and a cache-until-signaled consumer must not be re-pulled for one.
-    /// (`change_hook` above deliberately does NOT gate on this: recording a
-    /// replication change for every `get_mut` is that mechanism's existing,
-    /// shipped behavior, and changing it here is out of scope.)
-    mutated_via_deref_mut: bool,
-    /// Precomputed at [`World::get_mut`] time (not resolved again in
-    /// [`Drop::drop`]): `None` whenever no subscription registry is attached
-    /// -- the exact same short-circuit `gpu_hook`/`change_hook` apply, so an
-    /// unsubscribed `get_mut` costs one `Option` check on construction and
-    /// one bool store per `DerefMut`.
-    sub_hook: Option<SubMutHook>,
-    /// Precomputed at [`World::get_mut`] time: `None` until any change
-    /// journal exists. Fires on an actual write, like `sub_hook`.
-    journal_hook: Option<JournalMutHook>,
-    /// Precomputed at [`World::get_mut`] time (not resolved again in
-    /// [`Drop::drop`]): `None` whenever the `gpu` feature is off, no mirror
-    /// is attached, or `T` has no `#[gpu]` fields — the exact same
-    /// short-circuit `insert_inner` already applies, so a `get_mut` on a
-    /// plain (non-GPU) component costs one `Option`/`HashMap`-miss check on
-    /// construction and nothing at all on drop.
-    #[cfg(feature = "gpu")]
-    gpu_hook: Option<GpuMutHook>,
-    /// Precomputed at [`World::get_mut`] time, same shape as `gpu_hook`
-    /// above: `None` unless a [`crate::replication::SharedChangeTracker`]
-    /// is attached ([`World::attach_change_tracker`]). Lets `get_mut`
-    /// mutations record automatically on drop, the same way `insert`
-    /// already does when a tracker is attached — no `_tracked` call, no
-    /// separate `get_mut_tracked` method to remember.
-    change_hook: Option<ChangeMutHook>,
-    /// Precomputed at [`World::get_mut`] time: `None` whenever `T` has no
-    /// `HandleId`/content-id-linked fields (handle counting itself is
-    /// always on -- see `World::handle_counts`'s doc -- so the only miss
-    /// here is "this type has nothing to count"). Captures the OLD handle
-    /// values at construction (after that point they are unrecoverable --
-    /// the caller is holding `&mut T`) so [`Drop::drop`] can report a
-    /// proper swap instead of silently losing accounting for handle fields
-    /// mutated through `DerefMut`. See [`HandleMutHook`] for why this fires
-    /// only on an actual write, unlike the GPU hook above.
-    handle_hook: Option<HandleMutHook>,
-}
-
-#[cfg(feature = "gpu")]
-struct GpuMutHook {
-    mirror: crate::gpu::GpuMirrorHandle,
-    row: u32,
-    dispatch: crate::gpu::world_mirror::DispatchFn,
-}
-
-/// See [`Mut::change_hook`]'s doc. Records into the SAME `SharedChangeTracker`
-/// `insert`/`spawn`/`remove`/`despawn` already record into when one is
-/// attached to the `World` this entity belongs to — captured at `get_mut`
-/// time (not re-resolved in `Drop`) since `Mut` doesn't keep a `&World`
-/// borrow alive across its own lifetime.
-struct ChangeMutHook {
-    tracker: crate::replication::SharedChangeTracker,
-    entity: Entity,
-    component_id: ComponentId,
-}
-
-/// See [`Mut::sub_hook`]'s doc. Delivers a `Mutated` event into the SAME
-/// subscription registry `insert`/`remove`/`despawn` already deliver into
-/// when one is attached to the `World` this entity belongs to -- captured at
-/// `get_mut` time (not re-resolved in `Drop`) since `Mut` doesn't keep a
-/// `&World` borrow alive across its own lifetime.
-struct SubMutHook {
-    registry: crate::subscriptions::SubscriptionRegistryHandle,
-    entity: Entity,
-    component_id: ComponentId,
-}
-
-/// See [`Mut::handle_hook`]'s doc. Holds an owned clone of `World`'s
-/// `handle_counts` handle (independent of `self`'s borrow -- `Mut` already
-/// holds `value: &'a mut T` derived from `self`, so reaching back into
-/// `self.handle_counts` directly in `Drop` would need an aliasing argument
-/// this crate's safe-Rust discipline doesn't want to make; cloning the
-/// `Arc<Mutex<..>>` sidesteps the question entirely, same reason
-/// `GpuMutHook`/`ChangeMutHook`/`SubMutHook` above each hold their own
-/// owned handle rather than a borrow of `self`), the OLD handle values
-/// captured when `get_mut` handed out the guard, and the concrete type's
-/// collector fn (resolved once here, not re-probed in `Drop`). Firing is a
-/// [`crate::handle_ledger::report_captured_swap`] call: fields whose value
-/// survived the mutation produce nothing; changed fields release-old /
-/// acquire-new exactly like an in-place insert would have.
-///
-/// Deliberately fires ONLY when the guard was actually written through
-/// (`mutated_via_deref_mut`), unlike the GPU hook which re-dispatches on
-/// every drop: a borrow-only `get_mut` leaves old and new identical by
-/// definition, so firing it could only ever be a no-op comparison -- and
-/// unlike the GPU path there is no "Once must re-upload on explicit
-/// mutation" subtlety to preserve. Skipping the work entirely keeps a
-/// read-heavy `get_mut` workload allocation-free (the capture Vec exists
-/// only while a guard is live).
-struct HandleMutHook {
-    counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
-    /// Old values, field-declaration order (the collector's contract), as
-    /// of `get_mut` time.
-    captured: Vec<crate::handle_ledger::HandleId>,
-    collect: crate::handle_ledger::CollectHandlesFn,
-}
-
-impl HandleMutHook {
-    fn fire(&self, current_value: *const ()) {
-        let mut counts = self
-            .counts
-            .lock()
-            .expect("World handle_counts: mutex poisoned");
-        crate::handle_ledger::report_captured_swap(
-            &mut counts,
-            self.collect,
-            &self.captured,
-            current_value,
-        );
-    }
-}
-
-/// See [`Mut::journal_hook`]'s doc.
-struct JournalMutHook {
-    journals: crate::change_journal::ChangeJournalHandle,
-    entity: Entity,
-    component_id: ComponentId,
-}
-
-impl SubMutHook {
-    /// Deliver the `Mutated` event. One lock acquisition, one hash probe;
-    /// never runs user code (batched delivery -- see
-    /// [`crate::subscriptions`]'s module doc on why callbacks-in-Drop were
-    /// rejected).
-    fn fire(&self) {
-        crate::subscriptions::lock(&self.registry).record(
-            self.entity,
-            self.component_id,
-            crate::subscriptions::ComponentChangeKind::Mutated,
-        );
-    }
-}
-
-impl<'a, T> Deref for Mut<'a, T> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &T {
-        self.value
-    }
-}
-
-impl<'a, T> DerefMut for Mut<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        self.mutated_via_deref_mut = true;
-        self.value
-    }
-}
-
-impl<'a, T> Mut<'a, T> {
-    /// Escape hatch back to a bare `&'a mut T`, for callers that need to
-    /// hand this reference across an API boundary that has no room for
-    /// `Mut`'s guard (e.g. a plain `fn(&mut World, Entity) -> Option<&mut
-    /// dyn SomeTrait>` function-pointer signature — Pulsar-Native's
-    /// `engine_class_derive`-generated `WorldComponentRegistration.
-    /// get_as_engine_class_mut` shim is the motivating caller).
-    ///
-    /// Runs the same GPU dirty-mark dispatch AND change-tracking record
-    /// [`Drop::drop`] would (see this struct's top doc), immediately, for
-    /// whatever value is in the field *right now* — then hands back the raw
-    /// reference with no guard left to fire again later. **Any further
-    /// mutation through the returned reference is NOT automatically
-    /// tracked.** For a `T` with `#[gpu]` fields, or with a change tracker
-    /// attached, mutating again after calling this means the caller is
-    /// responsible for re-marking that row dirty / re-recording the change
-    /// themselves (or, better, preferring to keep mutating through
-    /// `DerefMut` on a live `Mut` instead of calling this at all — that
-    /// stays automatically tracked for the whole borrow). For a `T` with no
-    /// `#[gpu]` fields and no change tracker attached (nothing all the way
-    /// through `Drop` happens either way), this is indistinguishable from
-    /// the guard never having existed.
-    pub fn into_inner(mut self) -> &'a mut T {
-        #[cfg(feature = "gpu")]
-        if let Some(hook) = self.gpu_hook.take() {
-            (hook.dispatch)(
-                &hook.mirror,
-                hook.row,
-                self.value as *const T as *const (),
-                true,
-            );
-        }
-        // Same "run me immediately" boundary the GPU hook above treats
-        // `into_inner` as: handing the unique `&mut T` out ends all further
-        // automatic observation, so fire now against whatever is in the
-        // field right now -- unconditionally (NOT gated on
-        // `mutated_via_deref_mut`, matching this method's other hooks).
-        if let Some(hook) = self.handle_hook.take() {
-            hook.fire(self.value as *const T as *const ());
-        }
-        if let Some(hook) = self.change_hook.take() {
-            hook.tracker
-                .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
-        }
-        // Deliberately NOT gated on `mutated_via_deref_mut`: handing the
-        // unique `&mut T` out of the guard is itself the handoff point after
-        // which no further automatic tracking is possible -- fire now, so a
-        // subscriber sees at least this one event, matching how the GPU and
-        // change hooks above already treat `into_inner` as an unconditional
-        // "run me immediately" boundary.
-        if let Some(hook) = self.sub_hook.take() {
-            hook.fire();
-        }
-        if let Some(hook) = self.journal_hook.take() {
-            crate::change_journal::lock(&hook.journals).record(
-                hook.entity,
-                hook.component_id,
-                crate::subscriptions::ComponentChangeKind::Mutated,
-            );
-        }
-        let ptr: *mut T = self.value as *mut T;
-        // SAFETY: `ptr` is `self.value`, a `&'a mut T` this `Mut` uniquely
-        // owned. `mem::forget` below means `self` (and its `Drop` impl,
-        // whose only remaining job — both hooks already fired above — is a
-        // no-op) never runs again and no other code observes `self` — so
-        // reconstituting a fresh `&'a mut T` from `ptr` under lifetime `'a`
-        // aliases nothing; it is exactly the same unique borrow handed back
-        // under its original lifetime, not a new one.
-        std::mem::forget(self);
-        unsafe { &mut *ptr }
-    }
-}
-
-impl<'a, T> Drop for Mut<'a, T> {
-    fn drop(&mut self) {
-        // Handle-ledger swap report -- gated on an ACTUAL write (see
-        // `HandleMutHook`'s doc for why this differs from the GPU hook's
-        // unconditional fire: a borrow-only guard cannot have changed any
-        // handle value, so the comparison would be a guaranteed no-op).
-        if self.mutated_via_deref_mut {
-            if let Some(hook) = &self.handle_hook {
-                hook.fire(self.value as *const T as *const ());
-            }
-        }
-        #[cfg(feature = "gpu")]
-        if let Some(hook) = &self.gpu_hook {
-            // `is_new_insert = true`: from `write_gpu_columns_at_row`'s
-            // perspective this bool means "write `Once` fields too, don't
-            // skip them" — exactly right here. `Once`'s "never re-write
-            // after the first insert" pinning is specifically an
-            // INSERT-path behavior (a routine re-insert of the same
-            // component shouldn't silently re-upload static data); an
-            // explicit `get_mut` mutation is, by construction, the caller
-            // deliberately changing the value, so `Once` fields re-upload
-            // here exactly like `DirtyTracked` ones do (see the module doc
-            // on `MirrorMode::Once` / `GpuUploadSource` for the full
-            // contract this is the write-side half of).
-            (hook.dispatch)(
-                &hook.mirror,
-                hook.row,
-                self.value as *const T as *const (),
-                true,
-            );
-        }
-        if let Some(hook) = &self.change_hook {
-            // Same "0, empty bytes" shape `insert_inner`'s tracked path
-            // already uses (see its own call to `record_component_change`
-            // below) -- the actual field-level bytes are reconstructed by
-            // the replication schema encoder from the live component at
-            // encode time, not captured here.
-            hook.tracker
-                .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
-        }
-        if self.mutated_via_deref_mut {
-            if let Some(hook) = &self.sub_hook {
-                hook.fire();
-            }
-            if let Some(hook) = &self.journal_hook {
-                crate::change_journal::lock(&hook.journals).record(
-                    hook.entity,
-                    hook.component_id,
-                    crate::subscriptions::ComponentChangeKind::Mutated,
-                );
-            }
-        }
-    }
-}
+pub use crate::mut_guard::{Mut, MutDyn};
+use crate::mut_guard::{HookSources, MutHooks};
 
 impl World {
     /// Create an empty world with one empty archetype and no entities.
@@ -1845,64 +1549,81 @@ impl World {
                     .downcast_mut::<Column<T>>()
                     .map(|col| &mut col.data[row])
             })?;
-
-        #[cfg(feature = "gpu")]
-        let gpu_hook = self.gpu_mirror.as_ref().and_then(|mirror| {
-            crate::gpu::world_mirror::dispatch_for(cid).map(|dispatch| GpuMutHook {
-                mirror: mirror.clone(),
-                row: entity.index(),
-                dispatch,
-            })
-        });
-
-        let change_hook = self.change_tracker.as_ref().map(|tracker| ChangeMutHook {
-            tracker: tracker.clone(),
+        let hooks = MutHooks::new(
+            HookSources {
+                #[cfg(feature = "gpu")]
+                gpu_mirror: self.gpu_mirror.as_ref(),
+                change_tracker: self.change_tracker.as_ref(),
+                subscriptions: self.subscriptions.as_ref(),
+                change_journals: &self.change_journals,
+                handle_counts: &self.handle_counts,
+            },
             entity,
-            component_id: cid,
-        });
+            cid,
+            &*value as *const T as *const (),
+        );
+        Some(Mut::new(value, hooks))
+    }
 
-        // Subscription hook (SceneDB#47), same precompute-at-get_mut-time
-        // shape as the two hooks above. `mutated_via_deref_mut` starts false
-        // and is set only by an actual `DerefMut`, so the drop path fires
-        // nothing for a borrow-only `get_mut`.
-        let sub_hook = self.subscriptions.as_ref().map(|registry| SubMutHook {
-            registry: std::sync::Arc::clone(registry),
+    // ── Type-erased component access ───────────────────────────────────────
+
+    /// Whether `entity` is alive and currently has the component `component`.
+    pub fn has_component(&self, entity: Entity, component: ComponentId) -> bool {
+        self.locate(entity)
+            .is_some_and(|(arch, _)| Self::has_column_id(&self.archetypes[arch.0 as usize], component))
+    }
+
+    /// The components `entity` currently has, or an empty iterator if it is
+    /// not alive. Order is unspecified.
+    pub fn component_ids(&self, entity: Entity) -> impl Iterator<Item = ComponentId> + '_ {
+        self.locate(entity)
+            .map(|(arch, _)| self.archetypes[arch.0 as usize].active_cids.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+    }
+
+    /// Shared, type-erased access to `entity`'s `component`: a `&dyn Any`
+    /// of the component's own type (so `downcast_ref::<T>()` works).
+    /// `None` if the entity is dead or lacks the component.
+    pub fn get_dyn(&self, entity: Entity, component: ComponentId) -> Option<&dyn Any> {
+        let (arch, row) = self.locate(entity)?;
+        Self::get_erased(&self.archetypes[arch.0 as usize], component).map(|col| col.get_any(row))
+    }
+
+    /// Mutable, type-erased access to `entity`'s `component`. The returned
+    /// [`MutDyn`] fires every hook a [`World::get_mut`] guard for the same
+    /// component would (GPU mirror, change tracker, subscriptions, change
+    /// journals, handle ledger) when it drops.
+    pub fn get_dyn_mut(&mut self, entity: Entity, component: ComponentId) -> Option<MutDyn<'_>> {
+        let (arch, row) = self.locate(entity)?;
+        let value = Self::get_erased_mut(&mut self.archetypes[arch.0 as usize], component)
+            .map(|col| col.get_any_mut(row))?;
+        let value_ptr: *const dyn Any = &*value;
+        let hooks = MutHooks::new(
+            HookSources {
+                #[cfg(feature = "gpu")]
+                gpu_mirror: self.gpu_mirror.as_ref(),
+                change_tracker: self.change_tracker.as_ref(),
+                subscriptions: self.subscriptions.as_ref(),
+                change_journals: &self.change_journals,
+                handle_counts: &self.handle_counts,
+            },
             entity,
-            component_id: cid,
-        });
-        let journal_hook = self.change_journals.get().map(|journals| JournalMutHook {
-            journals: std::sync::Arc::clone(journals),
-            entity,
-            component_id: cid,
-        });
+            component,
+            value_ptr as *const (),
+        );
+        Some(MutDyn::new(value, hooks))
+    }
 
-        // Handle hook: capture the OLD handle values NOW (the caller is one
-        // `DerefMut` away from overwriting them, and there is no shadow to
-        // re-read them from -- plain component fields have no CPU-side copy
-        // outside the archetype column). Only built when `T` actually has
-        // handle/content-id-linked fields; a miss costs one probe, nothing
-        // else. The capture Vec is small (one entry per handle field of T)
-        // and lives only as long as the guard.
-        let handle_hook = crate::handle_ledger::collect_fn_for(cid).map(|collect| {
-            let mut captured = Vec::new();
-            (collect)(&*value as *const T as *const (), &mut captured);
-            HandleMutHook {
-                counts: std::sync::Arc::clone(&self.handle_counts),
-                captured,
-                collect,
-            }
-        });
-
-        Some(Mut {
-            value,
-            mutated_via_deref_mut: false,
-            sub_hook,
-            journal_hook,
-            #[cfg(feature = "gpu")]
-            gpu_hook,
-            change_hook,
-            handle_hook,
-        })
+    /// `(archetype, row)` of a live entity.
+    #[inline]
+    fn locate(&self, entity: Entity) -> Option<(ArchetypeId, usize)> {
+        if !self.is_alive(entity) {
+            return None;
+        }
+        let slot = &self.entity_slots[entity.index() as usize];
+        Some((slot.archetype, slot.row as usize))
     }
 
     //  Archetype graph â”€
