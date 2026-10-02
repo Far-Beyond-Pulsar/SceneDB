@@ -22,6 +22,12 @@
 //! file's allocator is a separate instance — each `tests/*.rs` file compiles
 //! to its own test binary, so each may declare its own `#[global_allocator]`.
 
+// The `telemetry` feature logs every query through a formatted entry, which
+// allocates by design, so these zero-allocation gates only hold without it.
+// (CI runs them in the default and `gpu` configurations; `--all-features`
+// compiles this file to nothing.)
+#![cfg(not(feature = "telemetry"))]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;

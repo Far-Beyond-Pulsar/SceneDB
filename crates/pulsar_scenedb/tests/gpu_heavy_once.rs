@@ -77,7 +77,7 @@ unsafe impl Pod for MeshHandle {}
 /// The heavy GPU-resident record -- 32 bytes, only ever assembled by
 /// `upload_element`, never held by the CPU column.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 struct MeshMetadataRow {
     vertex_count: u32,
     index_count: u32,

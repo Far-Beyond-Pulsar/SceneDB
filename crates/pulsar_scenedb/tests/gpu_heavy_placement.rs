@@ -286,7 +286,7 @@ struct MeshHandle(u32);
 unsafe impl Pod for MeshHandle {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, pulsar_reflection::Reflectable)]
 struct MeshMetadataRow {
     vertex_count: u32,
     index_count: u32,
