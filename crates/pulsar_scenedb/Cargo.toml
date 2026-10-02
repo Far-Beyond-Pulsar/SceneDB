@@ -10,12 +10,11 @@ gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
-# Pinned to Pulsar-Reflection's `claude/serene-keller-ma920s` branch for
-# the TypeId-keyed method registry (`pulsar_reflection::methods`) that
-# component methods are built on; it also carries the built-in array
-# registrations from 1c64758 (the previous pin). Keep in step with the
+# Pulsar-Reflection `main` (PR #8, merged): the TypeId-keyed method registry
+# (`pulsar_reflection::methods`) that component methods are built on, plus the
+# built-in array registrations from 1c64758. Keep in step with the
 # `pulsar_reflection_codegen` pin in pulsar_scenedb_derive.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "3daa98e" }
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "091eae569b4dce9de7def958e8a77ff620b07047" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }

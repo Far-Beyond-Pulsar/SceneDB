@@ -89,7 +89,7 @@ fn scene_cfg() -> SceneGpuConfig {
 /// even by accident (the point being proven is type-level isolation, not
 /// merely "these two happen not to overlap").
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, pulsar_reflection::Reflectable)]
 struct TestMaterial {
     base_color: [f32; 4],
     roughness: f32,
@@ -131,7 +131,7 @@ impl GpuColumnSet for TestMaterial {
 
 /// Stand-in for a light row.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, pulsar_reflection::Reflectable)]
 struct TestLight {
     position: [f32; 3],
     intensity: f32,

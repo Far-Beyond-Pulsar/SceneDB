@@ -127,19 +127,23 @@ fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() 
 }
 
 #[test]
-fn non_gpu_component_still_registers_a_growable_stub_with_no_effect() {
-    // GrowableTagComponent's own register_gpu_columns_growable is exercised
-    // above; this proves a type with ZERO #[gpu] fields also gets a valid
-    // (no-op) register_gpu_columns_growable, so generic code that calls it
-    // uniformly across every #[derive(SceneStore)] type doesn't need to
-    // special-case "has no #[gpu] fields."
-    #[derive(SceneStore, Clone, Copy)]
+fn a_component_with_no_gpu_fields_derives_no_gpu_surface_and_lives_in_the_world() {
+    // A type with ZERO #[gpu] fields gets no `GpuColumnSet` impl and no
+    // `register_gpu_columns*`: the derive cannot know whether the consumer
+    // builds with the `gpu` feature, so it emits nothing GPU-related for
+    // such a type (generic code that registers columns is bounded by
+    // `GpuColumnSet`, which only mirrored types implement). It must still be
+    // an ordinary world component, untouched by an attached mirror store.
+    #[derive(SceneStore, Clone, Copy, Debug, PartialEq)]
     struct NoGpuFields {
         value: u32,
     }
 
     let ctx = test_context();
-    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
-    NoGpuFields::register_gpu_columns_growable(&mut store, 4, ctx.device());
-    assert!(NoGpuFields::gpu_columns().is_empty());
+    let store = Arc::new(SceneGpuStore::new(&ctx, scene_cfg()));
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    let entity = world.spawn();
+    world.insert(entity, NoGpuFields { value: 7 });
+    assert_eq!(world.get::<NoGpuFields>(entity), Some(&NoGpuFields { value: 7 }));
 }

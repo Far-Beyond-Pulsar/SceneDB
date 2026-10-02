@@ -79,6 +79,21 @@ jobs:
       continue-on-error: true
       run: cargo test -p pulsar_scenedb --features gpu --test alloc_gate_gpu --verbose
 
+  all-features:
+    # The whole suite with every feature on (#842): `cargo test -p pulsar_scenedb
+    # --all-features` is what a contributor runs locally. The allocation gates
+    # compile out under `telemetry` (it allocates per query by design); they
+    # run in the jobs above.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install lavapipe (software Vulkan) for headless GPU testing
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+    - name: Test pulsar_scenedb with all features
+      run: cargo test -p pulsar_scenedb --all-features --no-fail-fast --verbose
+
   transport:
     # Explicit, separate job for the real-socket replication transport
     # tests (TCP/UDP loopback, multi-client, reconnect+resync) — `build`
