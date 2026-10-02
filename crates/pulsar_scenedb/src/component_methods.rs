@@ -214,6 +214,10 @@ impl World {
         };
         let result = match method {
             ComponentMethod::Reflected(method) if method.receiver == ReceiverKind::Mut => {
+                if !self.has_component(entity, cid) {
+                    return Err(missing());
+                }
+                validate_reflected_args(method, args).map_err(ComponentCallError::Call)?;
                 let mut guard = self.get_dyn_mut(entity, cid).ok_or_else(missing)?;
                 method.call(Receiver::Mut(&mut *guard), args)
             }
@@ -230,4 +234,30 @@ impl World {
         };
         result.map_err(ComponentCallError::Call)
     }
+}
+
+/// Validate the script-facing arguments before `invoke_component_method`
+/// obtains a `MutDyn` guard. The reflected shim validates these again when
+/// it invokes the method; doing the metadata check here keeps rejected calls
+/// from firing mutable-borrow hooks (subscriptions, journals, or GPU uploads).
+fn validate_reflected_args(
+    method: &ReflectedMethod,
+    args: &[Box<dyn Any>],
+) -> Result<(), CallError> {
+    if args.len() != method.info.params.len() {
+        return Err(CallError::ArgCount {
+            expected: method.info.params.len(),
+            found: args.len(),
+        });
+    }
+
+    for (index, (arg, param)) in args.iter().zip(method.info.params).enumerate() {
+        if arg.as_ref().type_id() != param.ty.type_id() {
+            return Err(CallError::ArgType {
+                index,
+                expected: param.ty.type_name(),
+            });
+        }
+    }
+    Ok(())
 }

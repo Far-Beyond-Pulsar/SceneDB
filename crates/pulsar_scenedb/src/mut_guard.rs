@@ -33,9 +33,9 @@ pub struct Mut<'a, T> {
 
 /// Type-erased counterpart to [`Mut`], returned by
 /// [`crate::World::get_dyn_mut`]: a mutable borrow of whichever component a
-/// `ComponentId` names, as `dyn Any` of the component's own type (so
-/// `downcast_mut::<T>()` works). Fires exactly the hooks a [`Mut`] for the
-/// same component would.
+/// `ComponentId` names, as `dyn Any` of the component's own type. Mutable
+/// access fires its write hooks on drop; read-only access through
+/// [`Self::downcast_ref`] does not.
 pub struct MutDyn<'a> {
     value: &'a mut dyn Any,
     mutated_via_deref_mut: bool,
@@ -279,9 +279,19 @@ impl<'a> MutDyn<'a> {
         Self { value, mutated_via_deref_mut: false, hooks }
     }
 
-    /// Typed view of the guarded component, if it is a `T`. Returns a
-    /// reference into the guard, so the write is still observed on drop.
+    /// Read-only typed view of the guarded component, if it is a `T`.
+    /// Unlike [`Self::downcast_mut`], this does not mark the guard as mutated.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.value.downcast_ref::<T>()
+    }
+
+    /// Typed mutable view of the guarded component, if it is a `T`. The guard
+    /// is marked as mutated when the downcast succeeds, and its write hooks
+    /// run on drop. Use [`Self::downcast_ref`] for reads.
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
+        if !self.value.is::<T>() {
+            return None;
+        }
         self.mutated_via_deref_mut = true;
         self.value.downcast_mut::<T>()
     }
@@ -314,7 +324,9 @@ impl<'a> DerefMut for MutDyn<'a> {
 
 impl<'a> Drop for MutDyn<'a> {
     fn drop(&mut self) {
-        let value: *const dyn Any = self.value;
-        self.hooks.fire_on_drop(value as *const (), self.mutated_via_deref_mut);
+        if self.mutated_via_deref_mut {
+            let value: *const dyn Any = self.value;
+            self.hooks.fire_on_drop(value as *const (), true);
+        }
     }
 }
