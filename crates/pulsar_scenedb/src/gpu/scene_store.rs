@@ -3142,6 +3142,7 @@ impl SceneGpuStore {
     /// [`Self::flush_tier_transitions`] directly (a second drain is a
     /// harmless no-op).
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> SyncStats {
+        profiling::profile_scope_loc!("SceneGpuStore::flush_gpu_mirror");
         let mut total = SyncStats { ranges: 0, bytes: 0 };
         for (&id, buf) in self.dirty_tracked_gpu_buffers.read().expect("SceneGpuStore dirty_tracked_gpu_buffers lock poisoned").iter() {
             let stats = buf.flush(queue);
@@ -3192,6 +3193,7 @@ impl SceneGpuStore {
     /// failing one keep whatever capacity they were successfully grown to
     /// — this is a best-effort batch operation, not transactional.
     pub fn reserve_world_mirror_capacity(&self, queue: &wgpu::Queue, n: u32) -> Result<(), CapacityError> {
+        profiling::profile_scope_loc!("SceneGpuStore::reserve_world_mirror_capacity");
         for buf in self.growable_gpu_buffers.read().expect("SceneGpuStore growable_gpu_buffers lock poisoned").values() {
             buf.reserve(queue, n)?;
         }

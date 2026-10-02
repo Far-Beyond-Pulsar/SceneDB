@@ -205,6 +205,7 @@ impl GenerationMirror {
     /// (not instead of) [`super::SceneGpuStore::flush_gpu_mirror`] — call
     /// both once per frame, same as before this type deferred its writes.
     pub(crate) fn flush(&self, queue: &wgpu::Queue) {
+        profiling::profile_scope_loc!("World::gpu::GenerationMirror::flush");
         self.buf.flush(queue);
     }
 

@@ -175,6 +175,7 @@ impl World {
     /// external inspector/debug tooling (e.g. once every few frames), not
     /// the hot render/simulation path.
     pub fn telemetry_snapshot(&self) -> WorldSnapshot {
+        profiling::profile_scope_loc!("World::telemetry_snapshot");
         let archetypes: Vec<ArchetypeSnapshot> = self
             .archetypes
             .iter()
@@ -299,6 +300,7 @@ impl World {
     /// any row access, so this method is genuinely range-limited rather than
     /// a full snapshot followed by pruning.
     pub fn inspector_cpu_range(&self, request: &InspectorCpuRequest) -> Option<InspectorCpuResponse> {
+        profiling::profile_scope_loc!("World::telemetry::inspector_cpu_range");
         let archetype = self.archetypes.get(request.archetype_id as usize)?;
         let col = archetype.columns.get(request.component_id as usize)?.as_ref()?;
         let start = request.row_start.min(col.len());

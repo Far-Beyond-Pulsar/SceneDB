@@ -184,6 +184,7 @@ impl World {
 
     #[cfg(feature = "telemetry")]
     fn notify_inspector(&self) {
+        profiling::profile_scope_loc!("World::telemetry::notify_inspector");
         if let Some(callback) = &self.inspector_callback {
             let snapshot = self.telemetry_snapshot();
             callback(&snapshot);
@@ -227,6 +228,7 @@ impl World {
 
     #[cfg(feature = "telemetry")]
     fn service_inspector_requests(&self) {
+        profiling::profile_scope_loc!("World::telemetry::service_inspector_requests");
         let Some(queue) = &self.inspector_request_queue else { return };
         let requests = {
             let mut queue = queue.lock().expect("SceneDB inspector request queue poisoned");
@@ -635,6 +637,7 @@ impl World {
     /// attached but nothing was pending.
     #[cfg(feature = "gpu")]
     pub fn flush_gpu_mirror(&self, queue: &wgpu::Queue) -> Option<crate::gpu::SyncStats> {
+        profiling::profile_scope_loc!("World::flush_gpu_mirror");
         let stats = self.gpu_mirror.as_ref().map(|m| {
             m.generations().flush(queue);
             m.store().flush_gpu_mirror(queue)
@@ -646,6 +649,7 @@ impl World {
     /// Call this after the GPU flush has returned, never from inside a
     /// storage-locking operation.
     pub fn publish_inspector_snapshot(&self) {
+        profiling::profile_scope_loc!("World::publish_inspector_snapshot");
         #[cfg(feature = "telemetry")]
         {
         let now = std::time::Instant::now();
@@ -777,6 +781,7 @@ impl World {
     /// loop to avoid repeated capacity-doubling reallocations of the slot vec
     /// and the empty archetype's entity vec.
     pub fn reserve_entities(&mut self, count: u32) {
+        profiling::profile_scope_loc!("World::reserve_entities");
         self.entity_slots.reserve(count as usize);
         self.archetypes[ArchetypeId::EMPTY.0 as usize]
             .entities
@@ -795,6 +800,7 @@ impl World {
     /// only if you additionally need to record into a *different*,
     /// explicitly-held tracker.
     pub fn spawn(&mut self) -> Entity {
+        profiling::profile_scope_loc!("World::spawn");
         let entity = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.spawn_inner(Some(&mut guard))
@@ -814,6 +820,7 @@ impl World {
     /// used when nothing is attached, preserving this method's exact prior
     /// behavior for a `World` that never calls `attach_change_tracker`.
     pub fn spawn_tracked(&mut self, tracker: &mut ChangeTracker) -> Entity {
+        profiling::profile_scope_loc!("World::spawn_tracked");
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.spawn_inner(Some(&mut guard))
@@ -871,6 +878,7 @@ impl World {
     /// Records into the attached change tracker automatically, same as
     /// [`Self::spawn`] — see that method's doc.
     pub fn despawn(&mut self, entity: Entity) -> bool {
+        profiling::profile_scope_loc!("World::despawn");
         let removed = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.despawn_inner(entity, Some(&mut guard))
@@ -884,6 +892,7 @@ impl World {
     /// `tracker`. Redundant with plain [`Self::despawn`] once a change
     /// tracker is attached — see [`Self::spawn_tracked`]'s doc for why.
     pub fn despawn_tracked(&mut self, entity: Entity, tracker: &mut ChangeTracker) -> bool {
+        profiling::profile_scope_loc!("World::despawn_tracked");
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             return self.despawn_inner(entity, Some(&mut guard));
@@ -1141,6 +1150,7 @@ impl World {
     /// Records into the attached change tracker automatically, same as
     /// [`Self::spawn`] — see that method's doc.
     pub fn insert<T: Component>(&mut self, entity: Entity, value: T) {
+        profiling::profile_scope_loc!("World::insert");
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.insert_inner(entity, value, Some(&mut guard));
@@ -1158,6 +1168,7 @@ impl World {
         value: T,
         tracker: &mut ChangeTracker,
     ) {
+        profiling::profile_scope_loc!("World::insert_tracked");
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.insert_inner(entity, value, Some(&mut guard));
@@ -1376,6 +1387,7 @@ impl World {
     /// Records into the attached change tracker automatically, same as
     /// [`Self::spawn`] — see that method's doc.
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
+        profiling::profile_scope_loc!("World::remove");
         let removed = if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             self.remove_inner(entity, Some(&mut guard))
@@ -1393,6 +1405,7 @@ impl World {
         entity: Entity,
         tracker: &mut ChangeTracker,
     ) -> Option<T> {
+        profiling::profile_scope_loc!("World::remove_tracked");
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
             return self.remove_inner(entity, Some(&mut guard));
@@ -1512,6 +1525,7 @@ impl World {
     /// Returns a shared reference to component `T` on `entity`, if present.
     #[inline]
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
+        profiling::profile_scope_loc!("World::get");
         if !self.is_alive(entity) {
             return None;
         }
@@ -1535,6 +1549,7 @@ impl World {
     /// does on every insert. See [`Mut`]'s doc for why this exists.
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<Mut<'_, T>> {
+        profiling::profile_scope_loc!("World::get_mut");
         if !self.is_alive(entity) {
             return None;
         }
@@ -1592,9 +1607,9 @@ impl World {
     }
 
     /// Mutable, type-erased access to `entity`'s `component`. The returned
-    /// [`MutDyn`] fires every hook a [`World::get_mut`] guard for the same
-    /// component would (GPU mirror, change tracker, subscriptions, change
-    /// journals, handle ledger) when it drops.
+    /// [`MutDyn`] fires write hooks (GPU mirror, change tracker, subscriptions,
+    /// change journals, handle ledger) when mutable access is requested. Use
+    /// `downcast_ref` for reads that should not report a mutation.
     pub fn get_dyn_mut(&mut self, entity: Entity, component: ComponentId) -> Option<MutDyn<'_>> {
         let (arch, row) = self.locate(entity)?;
         let value = Self::get_erased_mut(&mut self.archetypes[arch.0 as usize], component)
