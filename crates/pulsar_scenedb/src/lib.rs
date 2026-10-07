@@ -114,7 +114,7 @@ pub use bundle::Bundle;
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use change_journal::{ChangeCursor, ChangeRead, ComponentChange};
-pub use component::{component_id, Component, ComponentId};
+pub use component::{component_id, register_component, Component, ComponentId};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
@@ -179,7 +179,7 @@ pub use time::GameTime;
 pub use token::{HasTypeToken, TypeToken};
 pub use component_ref::{ComponentHandle, ComponentRef};
 pub use mut_guard::{Mut, MutDyn};
-pub use world::World;
+pub use world::{InsertDynError, World};
 
 #[cfg(feature = "telemetry")]
 pub use telemetry::{TelemetryServer, TelemetrySnapshot};

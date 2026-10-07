@@ -84,8 +84,8 @@ pub use tracker::SubmissionTracker;
 pub use var_len_pool::{VarLenBufferRef, VarLenGpuPool, VarLenHandle};
 pub use view_upload::ViewTokenBuffers;
 pub use world_mirror::{
-    free_interned_var_len_field_at_row, free_var_len_field_at_row, write_gpu_columns_at_row,
-    write_interned_var_len_field_at_row, write_interned_var_len_field_with_id_at_row, write_var_len_field_at_row, GenerationMirror,
+    clear_derived_row, free_interned_var_len_field_at_row, free_var_len_field_at_row, write_gpu_columns_at_row,
+    write_interned_var_len_field_at_row, write_interned_var_len_field_with_id_at_row, write_var_len_field_at_row, write_derived_row, GenerationMirror,
     GpuMirrorHandle, GpuMirrorRegistration, VarLenReleaseRegistration,
 };
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)

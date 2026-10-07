@@ -307,6 +307,14 @@ impl GpuMirrorHandle {
         self.texture_store.clone()
     }
 
+    /// Whether `other` is a clone of this handle (same store, queue and
+    /// liveness mirror), as opposed to an independently constructed one.
+    pub fn shares_state_with(&self, other: &GpuMirrorHandle) -> bool {
+        Arc::ptr_eq(&self.store, &other.store)
+            && Arc::ptr_eq(&self.queue, &other.queue)
+            && Arc::ptr_eq(&self.generations, &other.generations)
+    }
+
     #[inline]
     pub fn store(&self) -> &SceneGpuStore {
         &self.store
@@ -691,6 +699,46 @@ pub(crate) fn dispatch_for(id: ComponentId) -> Option<DispatchFn> {
 /// registration path the write would take. `heavy` columns (whose GPU
 /// element size differs from the field) are left alone; their liveness is
 /// the generation mirror's job.
+/// Write `value`'s `#[gpu]` fields at `row` through `M`'s own registered
+/// dispatch -- exactly what `World::insert` of an `M` at that row does,
+/// including auto-registration of `M`'s buffers.
+///
+/// For a component whose GPU representation is a different, derived type
+/// (a generated companion computed from the authored value): the authored
+/// component submits its own [`GpuMirrorRegistration`] whose dispatch
+/// derives the `M` value and forwards it here. The derived rows then follow
+/// every insert, mutation and replay of the authored component through
+/// SceneDB's normal write path, instead of living as a second component
+/// that callers must keep in step. Returns `false` if `M` has no `#[gpu]`
+/// fields.
+pub fn write_derived_row<M: 'static>(
+    mirror: &GpuMirrorHandle,
+    row: u32,
+    value: &M,
+    is_new_insert: bool,
+) -> bool {
+    match dispatch_for(crate::component::component_id::<M>()) {
+        Some(dispatch) => {
+            dispatch(mirror, row, value as *const M as *const (), is_new_insert);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Clear `M`'s GPU row at `row` (and release any var-len allocation it
+/// holds) -- the removal counterpart of [`write_derived_row`], for the
+/// authored component's own [`GpuClearRegistration`] to forward to.
+pub fn clear_derived_row<M: 'static>(mirror: &GpuMirrorHandle, row: u32) {
+    let id = crate::component::component_id::<M>();
+    if let Some(release) = release_dispatch_for(id) {
+        release(mirror, row);
+    }
+    if let Some(clear) = clear_dispatch_for(id) {
+        clear(mirror, row);
+    }
+}
+
 pub fn clear_gpu_columns_at_row<T: GpuColumnSet>(store: &SceneGpuStore, queue: &wgpu::Queue, row: u32) {
     for col in T::gpu_columns() {
         if col.upload.is_some() {

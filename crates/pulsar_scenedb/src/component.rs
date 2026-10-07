@@ -93,6 +93,82 @@ pub fn resolve_id(type_id: TypeId) -> ComponentId {
     panic!("TypeId {:?} is not registered as a component", type_id);
 }
 
+/// Resolve a [`TypeId`] to its [`ComponentId`], or `None` if no
+/// `component_id::<T>()` call has registered it yet. The non-panicking
+/// counterpart of [`resolve_id`].
+pub fn try_resolve_id(type_id: TypeId) -> Option<ComponentId> {
+    let reg = registry().lock().expect("ComponentId registry lock");
+    reg.iter()
+        .position(|&(tid, _)| tid == type_id)
+        .map(|i| ComponentId(i as u32 + 1))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Erased component registration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What `World` needs to store a component whose concrete type it only sees
+/// at run time: a constructor for an empty column of that type. Captured
+/// once, by [`register_component`], where `T` is still concrete.
+#[derive(Clone, Copy)]
+pub(crate) struct ErasedComponentInfo {
+    pub(crate) id: ComponentId,
+    pub(crate) new_column: fn() -> Box<dyn ErasedColumn>,
+}
+
+type ErasedRegistry = std::sync::RwLock<std::collections::HashMap<TypeId, ErasedComponentInfo>>;
+
+fn erased_registry() -> &'static ErasedRegistry {
+    static REG: OnceLock<ErasedRegistry> = OnceLock::new();
+    REG.get_or_init(Default::default)
+}
+
+fn new_column_of<T: Component>() -> Box<dyn ErasedColumn> {
+    Box::new(Column::<T>::new())
+}
+
+/// Register `T` for type-erased insertion through
+/// [`crate::World::insert_dyn`], returning its [`ComponentId`].
+///
+/// Erased insertion receives only a `Box<dyn Any>`, which cannot build the
+/// typed column a first value of `T` needs; this captures that constructor
+/// while `T` is concrete. Idempotent. Registration is explicit and never a
+/// side effect of a typed insert, so whether `insert_dyn` accepts a type does
+/// not depend on what else happened to run first.
+pub fn register_component<T: Component>() -> ComponentId {
+    let id = component_id::<T>();
+    let tid = TypeId::of::<T>();
+    if erased_registry()
+        .read()
+        .expect("erased component registry lock")
+        .contains_key(&tid)
+    {
+        return id;
+    }
+    erased_registry()
+        .write()
+        .expect("erased component registry lock")
+        .entry(tid)
+        .or_insert(ErasedComponentInfo { id, new_column: new_column_of::<T> });
+    id
+}
+
+/// Whether `type_id` has been registered with [`register_component`].
+pub fn is_registered_for_erased_insert(type_id: TypeId) -> bool {
+    erased_registry()
+        .read()
+        .expect("erased component registry lock")
+        .contains_key(&type_id)
+}
+
+pub(crate) fn erased_info(type_id: TypeId) -> Option<ErasedComponentInfo> {
+    erased_registry()
+        .read()
+        .expect("erased component registry lock")
+        .get(&type_id)
+        .copied()
+}
+
 /// Returns the total number of component types registered so far.
 ///
 /// This is the number of distinct `T` for which `component_id::<T>()` has
@@ -169,6 +245,23 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
     /// - `ptr` must be a valid, properly-aligned, heap-allocated value of the
     ///   concrete type stored in this column.
     unsafe fn drop_erased(&self, ptr: *mut ());
+
+    /// Push an owned boxed value. Returns it unchanged if it is not this
+    /// column's type.
+    fn push_boxed(
+        &mut self,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<(), Box<dyn Any + Send + Sync>>;
+    /// Replace the value at `row` with an owned boxed value, returning the
+    /// old one. Returns the new value unchanged (and leaves the row as it
+    /// was) if it is not this column's type.
+    fn replace_boxed(
+        &mut self,
+        row: usize,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<Box<dyn Any + Send + Sync>, Box<dyn Any + Send + Sync>>;
+    /// Swap-remove the value at `row` and return it boxed.
+    fn swap_remove_boxed(&mut self, row: usize) -> Box<dyn Any + Send + Sync>;
 
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -291,6 +384,28 @@ impl<T: Component> ErasedColumn for Column<T> {
     unsafe fn drop_erased(&self, ptr: *mut ()) {
         // SAFETY: reconstruct Box to run Drop, then it falls out of scope.
         drop(Box::from_raw(ptr as *mut T));
+    }
+
+    fn push_boxed(
+        &mut self,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<(), Box<dyn Any + Send + Sync>> {
+        let value = value.downcast::<T>()?;
+        self.data.push(*value);
+        Ok(())
+    }
+
+    fn replace_boxed(
+        &mut self,
+        row: usize,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<Box<dyn Any + Send + Sync>, Box<dyn Any + Send + Sync>> {
+        let value = value.downcast::<T>()?;
+        Ok(Box::new(std::mem::replace(&mut self.data[row], *value)))
+    }
+
+    fn swap_remove_boxed(&mut self, row: usize) -> Box<dyn Any + Send + Sync> {
+        Box::new(self.data.swap_remove(row))
     }
 
     fn as_any(&self) -> &dyn Any {

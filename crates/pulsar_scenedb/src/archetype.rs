@@ -31,7 +31,11 @@ impl ArchetypeKey {
     }
 
     pub fn with<T: Component>(&self) -> Self {
-        let cid = crate::component::component_id::<T>();
+        self.with_id(crate::component::component_id::<T>())
+    }
+
+    /// [`Self::with`] for a component known only by its [`ComponentId`].
+    pub fn with_id(&self, cid: ComponentId) -> Self {
         if self.0.contains(&cid) {
             return self.clone();
         }
@@ -51,7 +55,11 @@ impl ArchetypeKey {
     }
 
     pub fn without<T: Component>(&self) -> Self {
-        let cid = crate::component::component_id::<T>();
+        self.without_id(crate::component::component_id::<T>())
+    }
+
+    /// [`Self::without`] for a component known only by its [`ComponentId`].
+    pub fn without_id(&self, cid: ComponentId) -> Self {
         let ids: Vec<_> = self.0.iter().copied().filter(|c| *c != cid).collect();
         Self(ids)
     }
