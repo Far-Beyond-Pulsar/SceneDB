@@ -72,7 +72,7 @@ pub(crate) struct HookSources<'w> {
 struct GpuHook {
     mirror: crate::gpu::GpuMirrorHandle,
     row: u32,
-    dispatch: crate::gpu::world_mirror::DispatchFn,
+    dispatch: &'static [crate::gpu::world_mirror::DispatchFn],
 }
 
 struct ChangeHook {
@@ -158,7 +158,9 @@ impl MutHooks {
         }
         #[cfg(feature = "gpu")]
         if let Some(hook) = &self.gpu {
-            (hook.dispatch)(&hook.mirror, hook.row, value, true);
+            for dispatch in hook.dispatch {
+                dispatch(&hook.mirror, hook.row, value, true);
+            }
         }
         if let Some(hook) = &self.change {
             hook.tracker
@@ -180,7 +182,9 @@ impl MutHooks {
     fn fire_now(&mut self, value: *const ()) {
         #[cfg(feature = "gpu")]
         if let Some(hook) = self.gpu.take() {
-            (hook.dispatch)(&hook.mirror, hook.row, value, true);
+            for dispatch in hook.dispatch {
+                dispatch(&hook.mirror, hook.row, value, true);
+            }
         }
         if let Some(hook) = self.handle.take() {
             hook.fire(value);

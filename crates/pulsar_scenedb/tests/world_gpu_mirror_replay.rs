@@ -264,3 +264,118 @@ fn a_derived_gpu_row_follows_the_authored_component() {
     world.flush_gpu_mirror(ctx.queue());
     assert_eq!(row(&ctx, &store, "replay_derived", e.index(), 1), [0], "removal");
 }
+
+/// A type with its own `#[gpu]` columns that ALSO has a derived row
+/// registered for it elsewhere (the shape a component crate uses to add a
+/// renderer-facing row to a `SceneStore` type it does not want to reshape).
+/// Both registrations run on every write; neither replaces the other.
+#[derive(SceneStore, Clone, Copy)]
+struct OwnAndDerived {
+    #[gpu(buffer = "replay_own_columns")]
+    value: u32,
+}
+
+#[derive(SceneStore, Clone, Copy)]
+#[gpu(layout = packed, buffer = "replay_extra_derived")]
+struct OwnAndDerivedExtra {
+    #[gpu]
+    tripled: u32,
+}
+
+fn own_and_derived_dispatch(mirror: &GpuMirrorHandle, row: u32, data: *const (), is_new_insert: bool) {
+    let value = unsafe { &*(data as *const OwnAndDerived) };
+    let derived = OwnAndDerivedExtra { tripled: value.value * 3 };
+    assert!(pulsar_scenedb::gpu::world_mirror::write_derived_row(mirror, row, &derived, is_new_insert));
+}
+
+fn own_and_derived_clear(mirror: &GpuMirrorHandle, row: u32) {
+    pulsar_scenedb::gpu::world_mirror::clear_derived_row::<OwnAndDerivedExtra>(mirror, row);
+}
+
+pulsar_scenedb::pulsar_reflection::inventory::submit! {
+    pulsar_scenedb::gpu::GpuMirrorRegistration {
+        component_id: pulsar_scenedb::component_id::<OwnAndDerived>,
+        dispatch: own_and_derived_dispatch,
+    }
+}
+
+pulsar_scenedb::pulsar_reflection::inventory::submit! {
+    pulsar_scenedb::gpu::GpuClearRegistration {
+        component_id: pulsar_scenedb::component_id::<OwnAndDerived>,
+        clear: own_and_derived_clear,
+    }
+}
+
+#[test]
+fn a_derived_row_registered_next_to_a_types_own_columns_runs_with_them() {
+    let Some(ctx) = context() else {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    };
+    let mut world = World::new();
+    let before = world.spawn();
+    world.insert(before, OwnAndDerived { value: 2 });
+
+    let store = empty_store(&ctx);
+    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    let after = world.spawn();
+    world.insert(after, OwnAndDerived { value: 5 });
+    world.flush_gpu_mirror(ctx.queue());
+    for (entity, value) in [(before, 2), (after, 5)] {
+        assert_eq!(row(&ctx, &store, "replay_own_columns", entity.index(), 1), [value], "own column");
+        assert_eq!(row(&ctx, &store, "replay_extra_derived", entity.index(), 1), [value * 3], "derived row");
+    }
+
+    world.get_mut::<OwnAndDerived>(after).unwrap().value = 7;
+    world.insert(before, OwnAndDerived { value: 1 });
+    world.flush_gpu_mirror(ctx.queue());
+    assert_eq!(row(&ctx, &store, "replay_own_columns", after.index(), 1), [7], "guarded write");
+    assert_eq!(row(&ctx, &store, "replay_extra_derived", after.index(), 1), [21], "guarded write");
+    assert_eq!(row(&ctx, &store, "replay_extra_derived", before.index(), 1), [3], "in-place insert");
+
+    world.remove::<OwnAndDerived>(after);
+    world.despawn(before);
+    world.flush_gpu_mirror(ctx.queue());
+    for entity in [before, after] {
+        assert_eq!(row(&ctx, &store, "replay_own_columns", entity.index(), 1), [0], "removal clears own");
+        assert_eq!(row(&ctx, &store, "replay_extra_derived", entity.index(), 1), [0], "removal clears derived");
+    }
+}
+
+#[test]
+fn the_generation_buffer_handle_follows_spawns_and_despawns() {
+    let Some(ctx) = context() else {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    };
+    let mut world = World::new();
+    let store = empty_store(&ctx);
+    let mirror = GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue()));
+    world.attach_gpu_mirror(mirror.clone());
+    let initial = mirror.generations().buffer_handle();
+    assert_eq!(initial.row_bytes, 4);
+
+    let e = world.spawn();
+    world.insert(e, PerField { value: 1 });
+    world.flush_gpu_mirror(ctx.queue());
+    let after_insert = mirror.generations().buffer_handle();
+    assert!(after_insert.content_generation > initial.content_generation, "an upload moves the generation");
+    assert_eq!(
+        read_words(&ctx, &after_insert.buffer, e.index() as u64 * 4, 1),
+        [e.generation()]
+    );
+
+    world.flush_gpu_mirror(ctx.queue());
+    assert_eq!(
+        mirror.generations().buffer_handle().content_generation,
+        after_insert.content_generation,
+        "an idle flush uploads nothing"
+    );
+
+    world.despawn(e);
+    world.flush_gpu_mirror(ctx.queue());
+    let after_despawn = mirror.generations().buffer_handle();
+    assert!(after_despawn.content_generation > after_insert.content_generation);
+    let row_generation = read_words(&ctx, &after_despawn.buffer, e.index() as u64 * 4, 1)[0];
+    assert_ne!(row_generation, e.generation(), "a despawn invalidates the recorded generation");
+}

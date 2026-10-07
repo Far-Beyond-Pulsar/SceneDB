@@ -156,7 +156,16 @@ pub const DEFAULT_AUTO_REGISTER_CAPACITY: u32 = 64;
 pub struct GenerationMirror {
     buf: DirtyTrackedSceneBuffer<u32>,
     gpu_mirrored_rows: GpuMirroredRows,
+    /// Bumped by every [`Self::flush`] that uploaded rows; see
+    /// [`Self::buffer_handle`].
+    content_generation: std::sync::atomic::AtomicU64,
 }
+
+/// The key a frontend publishes [`GenerationMirror::buffer_handle`] under
+/// when it hands SceneDB's buffers to GPU consumers. The mirror is owned by
+/// the [`GpuMirrorHandle`], not the store's buffer registry, so it is not
+/// among the store's own keys.
+pub const WORLD_GENERATION_BUFFER_KEY: super::BufferKey = super::BufferKey::of("world_entity_generations");
 
 impl GenerationMirror {
     fn new(device: Arc<wgpu::Device>) -> Self {
@@ -167,6 +176,7 @@ impl GenerationMirror {
         Self {
             buf: DirtyTrackedSceneBuffer::new(device, "scenedb-world-mirror-generations", 64),
             gpu_mirrored_rows: GpuMirroredRows::new(),
+            content_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -206,7 +216,27 @@ impl GenerationMirror {
     /// both once per frame, same as before this type deferred its writes.
     pub(crate) fn flush(&self, queue: &wgpu::Queue) {
         profiling::profile_scope_loc!("World::gpu::GenerationMirror::flush");
-        self.buf.flush(queue);
+        if self.buf.flush(queue).ranges > 0 {
+            self.content_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The generation buffer as a consumer-facing handle: one `u32` per
+    /// entity index, the entity's current generation for every row that has
+    /// ever carried a `#[gpu]` component (other rows read as zero). A shader
+    /// joining a row that records another entity's `(index, generation)`
+    /// compares the recorded generation against this one before trusting
+    /// that entity's rows. `content_generation` moves whenever a flush
+    /// uploaded generations, `epoch` when the buffer was reallocated.
+    pub fn buffer_handle(&self) -> super::BufferHandle {
+        let mut buffer = None;
+        self.buf.with_buffer(&mut |b| buffer = Some(b.clone()));
+        super::BufferHandle {
+            buffer: buffer.expect("with_buffer always yields the buffer"),
+            epoch: self.buf.epoch(),
+            row_bytes: std::mem::size_of::<u32>() as u64,
+            content_generation: self.content_generation.load(Ordering::Relaxed),
+        }
     }
 
     pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
@@ -674,24 +704,41 @@ pub struct GpuMirrorRegistration {
 
 pulsar_reflection::inventory::collect!(GpuMirrorRegistration);
 
-fn registry_map() -> &'static HashMap<ComponentId, DispatchFn> {
-    static MAP: OnceLock<HashMap<ComponentId, DispatchFn>> = OnceLock::new();
+/// Every registration submitted for one component, in link order. A
+/// component may carry several: its own `#[gpu]` columns and any derived
+/// rows registered for it elsewhere (see [`write_derived_row`]). Each one
+/// runs on every write; none replaces another.
+fn group_by_component<R, F: Copy>(
+    registrations: impl Iterator<Item = R>,
+    entry: impl Fn(R) -> (ComponentId, F),
+) -> HashMap<ComponentId, Vec<F>> {
+    let mut map: HashMap<ComponentId, Vec<F>> = HashMap::new();
+    for registration in registrations {
+        let (id, f) = entry(registration);
+        map.entry(id).or_default().push(f);
+    }
+    map
+}
+
+fn registry_map() -> &'static HashMap<ComponentId, Vec<DispatchFn>> {
+    static MAP: OnceLock<HashMap<ComponentId, Vec<DispatchFn>>> = OnceLock::new();
     MAP.get_or_init(|| {
-        pulsar_reflection::inventory::iter::<GpuMirrorRegistration>()
-            .map(|r| ((r.component_id)(), r.dispatch))
-            .collect()
+        group_by_component(pulsar_reflection::inventory::iter::<GpuMirrorRegistration>(), |r| {
+            ((r.component_id)(), r.dispatch)
+        })
     })
 }
 
-/// Looks up `id`'s dispatch function, if `#[derive(SceneStore)]` generated
-/// one for it (i.e. the type has at least one `#[gpu]` field). `id` is
-/// expected to already be in hand — [`crate::world::World::insert_inner`]
-/// computes it via `component_id::<T>()` for archetype indexing regardless
-/// of GPU mirroring, so this adds exactly one `HashMap` lookup on top, not
-/// a second `TypeId` resolution.
+/// Looks up `id`'s dispatch functions, if any were registered for it
+/// (`#[derive(SceneStore)]` registers one for a type with at least one
+/// `#[gpu]` field; a derived row registers another). `id` is expected to
+/// already be in hand — [`crate::world::World::insert_inner`] computes it
+/// via `component_id::<T>()` for archetype indexing regardless of GPU
+/// mirroring, so this adds exactly one `HashMap` lookup on top, not a
+/// second `TypeId` resolution. Callers run every function in the slice.
 #[inline]
-pub(crate) fn dispatch_for(id: ComponentId) -> Option<DispatchFn> {
-    registry_map().get(&id).copied()
+pub(crate) fn dispatch_for(id: ComponentId) -> Option<&'static [DispatchFn]> {
+    registry_map().get(&id).map(Vec::as_slice)
 }
 
 /// Removal counterpart to [`write_gpu_columns_at_row`]: writes zeros into
@@ -718,8 +765,10 @@ pub fn write_derived_row<M: 'static>(
     is_new_insert: bool,
 ) -> bool {
     match dispatch_for(crate::component::component_id::<M>()) {
-        Some(dispatch) => {
-            dispatch(mirror, row, value as *const M as *const (), is_new_insert);
+        Some(dispatches) => {
+            for dispatch in dispatches {
+                dispatch(mirror, row, value as *const M as *const (), is_new_insert);
+            }
             true
         }
         None => false,
@@ -731,10 +780,10 @@ pub fn write_derived_row<M: 'static>(
 /// authored component's own [`GpuClearRegistration`] to forward to.
 pub fn clear_derived_row<M: 'static>(mirror: &GpuMirrorHandle, row: u32) {
     let id = crate::component::component_id::<M>();
-    if let Some(release) = release_dispatch_for(id) {
+    for release in release_dispatch_for(id).unwrap_or_default() {
         release(mirror, row);
     }
-    if let Some(clear) = clear_dispatch_for(id) {
+    for clear in clear_dispatch_for(id).unwrap_or_default() {
         clear(mirror, row);
     }
 }
@@ -767,19 +816,20 @@ pub struct GpuClearRegistration {
 
 pulsar_reflection::inventory::collect!(GpuClearRegistration);
 
-fn clear_registry_map() -> &'static HashMap<ComponentId, ClearFn> {
-    static MAP: OnceLock<HashMap<ComponentId, ClearFn>> = OnceLock::new();
+fn clear_registry_map() -> &'static HashMap<ComponentId, Vec<ClearFn>> {
+    static MAP: OnceLock<HashMap<ComponentId, Vec<ClearFn>>> = OnceLock::new();
     MAP.get_or_init(|| {
-        pulsar_reflection::inventory::iter::<GpuClearRegistration>()
-            .map(|r| ((r.component_id)(), r.clear))
-            .collect()
+        group_by_component(pulsar_reflection::inventory::iter::<GpuClearRegistration>(), |r| {
+            ((r.component_id)(), r.clear)
+        })
     })
 }
 
-/// Looks up `id`'s GPU-row clear function, if the derive generated one.
+/// Looks up `id`'s GPU-row clear functions (the derive's own and any
+/// derived row's).
 #[inline]
-pub(crate) fn clear_dispatch_for(id: ComponentId) -> Option<ClearFn> {
-    clear_registry_map().get(&id).copied()
+pub(crate) fn clear_dispatch_for(id: ComponentId) -> Option<&'static [ClearFn]> {
+    clear_registry_map().get(&id).map(Vec::as_slice)
 }
 
 /// Despawn/removal counterpart to [`DispatchFn`]/[`GpuMirrorRegistration`]:
@@ -798,12 +848,12 @@ pub struct VarLenReleaseRegistration {
 
 pulsar_reflection::inventory::collect!(VarLenReleaseRegistration);
 
-fn release_registry_map() -> &'static HashMap<ComponentId, ReleaseFn> {
-    static MAP: OnceLock<HashMap<ComponentId, ReleaseFn>> = OnceLock::new();
+fn release_registry_map() -> &'static HashMap<ComponentId, Vec<ReleaseFn>> {
+    static MAP: OnceLock<HashMap<ComponentId, Vec<ReleaseFn>>> = OnceLock::new();
     MAP.get_or_init(|| {
-        pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>()
-            .map(|r| ((r.component_id)(), r.release))
-            .collect()
+        group_by_component(pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>(), |r| {
+            ((r.component_id)(), r.release)
+        })
     })
 }
 
@@ -815,8 +865,8 @@ fn release_registry_map() -> &'static HashMap<ComponentId, ReleaseFn> {
 /// ONLY scalar `#[gpu]` fields has a dispatch entry but no release entry,
 /// and the two dispatch signatures take different arguments).
 #[inline]
-pub(crate) fn release_dispatch_for(id: ComponentId) -> Option<ReleaseFn> {
-    release_registry_map().get(&id).copied()
+pub(crate) fn release_dispatch_for(id: ComponentId) -> Option<&'static [ReleaseFn]> {
+    release_registry_map().get(&id).map(Vec::as_slice)
 }
 
 #[cfg(test)]

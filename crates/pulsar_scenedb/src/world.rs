@@ -623,7 +623,7 @@ impl World {
                 continue;
             }
             for &cid in &arch.active_cids {
-                let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) else {
+                let Some(dispatches) = crate::gpu::world_mirror::dispatch_for(cid) else {
                     continue;
                 };
                 let Some(col) = Self::get_erased(arch, cid) else { continue };
@@ -632,9 +632,11 @@ impl World {
                         .generations()
                         .note_gpu_bearing_insert(entity.index(), entity.generation());
                     // SAFETY: `row` < `arch.entities.len()` == `col.len()`,
-                    // and `dispatch` was registered under this column's
+                    // and each dispatch was registered under this column's
                     // own `ComponentId`.
-                    dispatch(mirror, entity.index(), unsafe { col.get_raw(row) }, true);
+                    for dispatch in dispatches {
+                        dispatch(mirror, entity.index(), unsafe { col.get_raw(row) }, true);
+                    }
                 }
             }
         }
@@ -968,16 +970,13 @@ impl World {
             let arch = &self.archetypes[arch_id.0 as usize];
             for (i, col) in arch.columns.iter().enumerate() {
                 if col.is_some() {
-                    if let Some(release) =
-                        crate::gpu::world_mirror::release_dispatch_for(ComponentId(i as u32))
-                    {
+                    let cid = ComponentId(i as u32);
+                    for release in crate::gpu::world_mirror::release_dispatch_for(cid).unwrap_or_default() {
                         release(mirror, entity.index());
                     }
-                    // Zero the departed component's GPU row: consumers
+                    // Zero the departed component's GPU rows: consumers
                     // reading these buffers by row must not keep seeing it.
-                    if let Some(clear) =
-                        crate::gpu::world_mirror::clear_dispatch_for(ComponentId(i as u32))
-                    {
+                    for clear in crate::gpu::world_mirror::clear_dispatch_for(cid).unwrap_or_default() {
                         clear(mirror, entity.index());
                     }
                 }
@@ -1292,7 +1291,7 @@ impl World {
             // is false, so `Once`-mode `#[gpu]` fields skip this write.
             #[cfg(feature = "gpu")]
             if let Some(mirror) = &self.gpu_mirror {
-                if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+                for dispatch in crate::gpu::world_mirror::dispatch_for(cid).unwrap_or_default() {
                     dispatch(mirror, entity.index(), source.value_ptr(), false);
                 }
             }
@@ -1406,11 +1405,13 @@ impl World {
         // `is_new_insert` is true, so `Once`-mode fields write here.
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+            if let Some(dispatches) = crate::gpu::world_mirror::dispatch_for(cid) {
                 mirror
                     .generations()
                     .note_gpu_bearing_insert(entity.index(), entity.generation());
-                dispatch(mirror, entity.index(), source.value_ptr(), true);
+                for dispatch in dispatches {
+                    dispatch(mirror, entity.index(), source.value_ptr(), true);
+                }
             }
         }
 
@@ -1563,10 +1564,10 @@ impl World {
         // this component. Keyed by `entity.index()`.
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(cid) {
+            for release in crate::gpu::world_mirror::release_dispatch_for(cid).unwrap_or_default() {
                 release(mirror, entity.index());
             }
-            if let Some(clear) = crate::gpu::world_mirror::clear_dispatch_for(cid) {
+            for clear in crate::gpu::world_mirror::clear_dispatch_for(cid).unwrap_or_default() {
                 clear(mirror, entity.index());
             }
         }
