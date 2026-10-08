@@ -25,7 +25,8 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 use pulsar_reflection::methods::{
     CallError, MethodInfo, Receiver, ReceiverKind, ReflectedMethod, TypeRef, METHOD_REGISTRY,
@@ -131,10 +132,26 @@ impl From<CallError> for ComponentCallError {
     }
 }
 
-/// Component methods by component `TypeId`: every type's reflected methods
-/// with a receiver, then its world methods. A world method that shares a
-/// reflected method's name is dropped (names are how scripts bind).
-static BY_TYPE: LazyLock<HashMap<TypeId, Vec<ComponentMethod>>> = LazyLock::new(|| {
+/// Every `#[component_methods]` block's world methods: this copy's, and
+/// every attached copy's (see `crate::runtime`).
+static WORLD_METHODS: crate::runtime::AppendList<WorldMethodRegistration> =
+    crate::runtime::AppendList::new(|| {
+        pulsar_reflection::inventory::iter::<WorldMethodRegistration>
+            .into_iter()
+            .collect()
+    });
+
+/// Component methods by component `TypeId`, built from [`METHOD_REGISTRY`]
+/// and [`WORLD_METHODS`], and built again when an attached copy adds to
+/// either (the old table is leaked).
+static BY_TYPE: AtomicPtr<HashMap<TypeId, Vec<ComponentMethod>>> =
+    AtomicPtr::new(std::ptr::null_mut());
+static BY_TYPE_WRITE: Mutex<()> = Mutex::new(());
+
+/// Every type's reflected methods with a receiver, then its world methods. A
+/// world method that shares a reflected method's name is dropped (names are
+/// how scripts bind).
+fn build_by_type() -> HashMap<TypeId, Vec<ComponentMethod>> {
     let mut by_type: HashMap<TypeId, Vec<ComponentMethod>> = HashMap::new();
     for ty in METHOD_REGISTRY.types() {
         let methods: Vec<_> = ty
@@ -147,7 +164,7 @@ static BY_TYPE: LazyLock<HashMap<TypeId, Vec<ComponentMethod>>> = LazyLock::new(
             by_type.insert(ty.ty.type_id(), methods);
         }
     }
-    for registration in pulsar_reflection::inventory::iter::<WorldMethodRegistration> {
+    for registration in WORLD_METHODS.get() {
         let methods = by_type.entry(registration.component.type_id()).or_default();
         for method in registration.methods {
             if methods.iter().any(|m| m.name() == method.info.name) {
@@ -162,11 +179,43 @@ static BY_TYPE: LazyLock<HashMap<TypeId, Vec<ComponentMethod>>> = LazyLock::new(
         }
     }
     by_type
-});
+}
+
+fn by_type_locked() -> &'static HashMap<TypeId, Vec<ComponentMethod>> {
+    let table = BY_TYPE.load(Ordering::Acquire);
+    if !table.is_null() {
+        // SAFETY: tables are leaked, never freed.
+        return unsafe { &*table };
+    }
+    let built = Box::leak(Box::new(build_by_type()));
+    BY_TYPE.store(built, Ordering::Release);
+    built
+}
+
+/// This copy's table (the runtime's function, for the copy that owns it).
+pub(crate) fn own_methods_of_type(ty: TypeId) -> &'static [ComponentMethod] {
+    let table = BY_TYPE.load(Ordering::Acquire);
+    let table = if table.is_null() {
+        let _write = BY_TYPE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        by_type_locked()
+    } else {
+        // SAFETY: tables are leaked, never freed.
+        unsafe { &*table }
+    };
+    table.get(&ty).map_or(&[], Vec::as_slice)
+}
+
+/// Add an attached copy's world methods, and pick up the reflected methods
+/// its reflection registrations added.
+pub(crate) fn extend(registrations: &[&'static WorldMethodRegistration]) {
+    let _write = BY_TYPE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    WORLD_METHODS.extend(registrations);
+    BY_TYPE.store(Box::leak(Box::new(build_by_type())), Ordering::Release);
+}
 
 /// Every method callable on a component with `TypeId` `ty`.
 pub fn component_methods_of_type(ty: TypeId) -> &'static [ComponentMethod] {
-    BY_TYPE.get(&ty).map_or(&[], Vec::as_slice)
+    (crate::runtime::runtime().component_methods)(ty)
 }
 
 /// Every method callable on component `cid`.

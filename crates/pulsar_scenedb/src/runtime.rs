@@ -74,6 +74,8 @@ pub struct Runtime {
     pub(crate) next_journals_id: fn() -> u64,
     pub(crate) next_subscription_id: fn() -> u64,
     pub(crate) collect_handles: fn(ComponentId) -> Option<CollectHandlesFn>,
+    pub(crate) component_methods:
+        fn(TypeId) -> &'static [crate::component_methods::ComponentMethod],
     #[cfg(feature = "gpu")]
     pub(crate) gpu: crate::gpu::world_mirror::GpuDispatchRuntime,
     pub(crate) add_registrations: fn(&Registrations),
@@ -83,6 +85,7 @@ pub struct Runtime {
 /// by [`attach`].
 pub struct Registrations {
     pub(crate) handle_ledger: Vec<&'static HandleLedgerRegistration>,
+    pub(crate) world_methods: Vec<&'static crate::component_methods::WorldMethodRegistration>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu: crate::gpu::world_mirror::GpuRegistrations,
 }
@@ -92,6 +95,10 @@ impl Registrations {
         Self {
             handle_ledger: pulsar_reflection::inventory::iter::<HandleLedgerRegistration>()
                 .collect(),
+            world_methods: pulsar_reflection::inventory::iter::<
+                crate::component_methods::WorldMethodRegistration,
+            >()
+            .collect(),
             #[cfg(feature = "gpu")]
             gpu: crate::gpu::world_mirror::GpuRegistrations::collected(),
         }
@@ -112,6 +119,7 @@ static OWN: Runtime = Runtime {
     next_journals_id: own::next_journals_id,
     next_subscription_id: own::next_subscription_id,
     collect_handles: own::collect_handles,
+    component_methods: crate::component_methods::own_methods_of_type,
     #[cfg(feature = "gpu")]
     gpu: crate::gpu::world_mirror::GpuDispatchRuntime::OWN,
     add_registrations: own::add_registrations,
@@ -445,6 +453,7 @@ mod own {
 
     pub(super) fn add_registrations(registrations: &Registrations) {
         crate::handle_ledger::extend(&registrations.handle_ledger);
+        crate::component_methods::extend(&registrations.world_methods);
         #[cfg(feature = "gpu")]
         crate::gpu::world_mirror::extend(&registrations.gpu);
     }
