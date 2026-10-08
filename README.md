@@ -303,45 +303,41 @@ world.insert_bundle(e, (Pos(1.0, 1.0, 1.0), Vel(0.0, 0.0, 0.0)));
 
 `spawn_bundle`/`insert_bundle` have `_tracked` counterparts (`spawn_bundle_tracked`, `insert_bundle_tracked`) that additionally record every component into a `ChangeTracker`, exactly like `spawn_tracked`/`insert_tracked` — see [Change tracking at the frame boundary](#change-tracking-at-the-frame-boundary).
 
-### Component subscriptions: `subscribe`/`take_component_change_events`
+### Object subscriptions: `subscribe_object`
 
-When a consumer outside your frame loop reads `World` directly (an editor properties panel, any live UI), it otherwise has no way to know whether a value it already read actually changed — so it re-polls on every redraw. Subscriptions fix that: arm one per `(Entity, ComponentType)` key you display, cache the value, and re-pull only when an event for that key arrives.
+Data normally flows one way: an edit writes straight into `World`, `World` replicates to the GPU, and anything that needs data reads `World`. Subscriptions are for the other direction: a view showing one object (an editor properties panel on the selection) must follow writes made elsewhere -- a gizmo drag, a script, a replicated update -- without polling. Systems that read a lot of data, such as renderers, should not subscribe; they read `World` and use change-journal cursors (`World::open_change_cursor`, `World::read_changes`) for incremental work.
 
 ```rust
-use pulsar_scenedb::{ComponentChangeKind, World, component_id};
+use pulsar_scenedb::{ObjectEvent, World};
 
 let mut world = World::new();
-let e = world.spawn();
-world.insert(e, Health(100));
+// A host whose objects keep components on their own entities maps those
+// entities to their owner; the default maps every entity to itself.
+world.set_object_resolver(|world, entity| world.get::<Owner>(entity).map_or(entity, |o| o.0));
 
-// Arm once, when the card/panel mounts:
-let sub = world.subscribe::<Health>(e).unwrap();
-// ...or by ComponentId, for callers that resolve types at runtime
-// (e.g. through a reflection registry):
-let sub_erased = world.subscribe_id(e, component_id::<Health>()).unwrap();
+let object = world.spawn();
+let sub = world
+    .subscribe_object(object, move |object, event| match event {
+        ObjectEvent::Changed(change) => {
+            // `change.value` is the component's full new value (by reference).
+            if let Some(health) = change.value.and_then(|v| v.downcast_ref::<Health>()) {
+                ui_sender.send((object, change.entity, *health)).ok();
+            }
+        }
+        ObjectEvent::Despawned => { /* the subscription has ended */ }
+    })
+    .unwrap();
 
-// Mutations queue events; nothing calls back into you mid-drop.
-world.get_mut::<Health>(e).unwrap().0 = 42; // real write -> 1 event
-// A get_mut that never writes through DerefMut fires NOTHING.
-
-// Once per frame, at your frame boundary: drain and re-pull what changed.
-for event in world.take_component_change_events() {
-    if event.subscription == sub {
-        // (entity = e, Health) changed -- invalidate the cached snapshot.
-    }
-}
-
-world.unsubscribe(sub); // when the card unmounts
+world.get_mut::<Health>(object).unwrap().0 = 42; // calls back with Health(42)
+world.unsubscribe_object(sub);
 ```
 
 Delivery contract, in short:
 
-- **Granularity** is the exact `(Entity, ComponentId)` pair — other entities and other components stay silent; several subscribers to one key each get their own event.
-- **Batched, never callbacks**: mutations append to a bounded pending queue (`MAX_PENDING_EVENTS`; overflow drops the oldest events and counts them via `dropped_component_change_events()`), so a listener can never re-enter `World` while a `Mut` guard's drop is unwinding.
-- **Kinds**: `Inserted` (insert / bundle insert / in-place overwrite), `Mutated` (`get_mut` written through `DerefMut`, or `into_inner`), `Removed` (`remove`, or `despawn` — which also auto-unsubscribes that entity's subscriptions).
-- **Cost with no subscribers**: one `Option::is_none()` check per mutating call — same shape as the attached-mirror/attached-tracker short-circuits.
-
-This sits alongside [`ChangeTracker`](#change-tracking-at-the-frame-boundary), not instead of it: replication captures batched new-state diffs for a specific target, while a subscription is a push notification to arbitrary live consumers about one specific key.
+- **Scope** is an object: every component of every entity the resolver maps to it, including components attached after subscribing.
+- **Callback inside the write**, after the value is stored, with the full new value by reference. GPU-heavy payloads are not copied: `GpuHeavy<T>` fields hold only their reference. The callback gets no `World` and must not reach for one; copy what you need and hand it to your own thread.
+- **Kinds**: `Inserted` (insert / bundle insert / in-place overwrite), `Mutated` (`get_mut` / `get_dyn_mut` written through, `into_inner`, or a replicated write), `Removed` (`remove` / `remove_dyn` with the removed value, or a despawn). `ObjectEvent::Despawned` when the object itself despawns, which ends its subscriptions.
+- **Cost**: with no subscriptions, one `Option` check per write; with subscriptions, a write resolves its object and probes one map.
 
 ---
 
@@ -682,7 +678,7 @@ pub struct StaticMeshInstance {
 **Consequences — read this carefully, the `insert`/`get_mut` distinction is real and easy to get wrong**:
 
 - **`World::insert`**: written on the row's first insert of this component. A *routine* re-insert later (e.g. re-inserting the whole component because one OTHER field changed) leaves the `Once` field's GPU bytes untouched — it does not re-upload, by design, because re-inserting the same component isn't "the value changed," it's "some system touched this component again."
-- **`World::get_mut`**: **always re-uploads**, even for a `Once`-mode field. An explicit `get_mut` mutation is, by construction, the caller deliberately changing the value — so on `Mut`'s `Drop` (or `Mut::into_inner`), a `Once` field re-uploads exactly like a `DirtyTracked` one would. This is deliberate, not a bug: `Once`'s "never again" guarantee is specifically about *insert-time noise* (a re-insert you didn't cause, from some unrelated field changing), not about preventing a change you explicitly asked for through `get_mut`.
+- **`World::get_mut`**: a write through the guard **always re-uploads**, even for a `Once`-mode field (a guard that is only read uploads nothing). An explicit `get_mut` mutation is, by construction, the caller deliberately changing the value — so on `Mut`'s `Drop` (or `Mut::into_inner`), a `Once` field re-uploads exactly like a `DirtyTracked` one would. This is deliberate, not a bug: `Once`'s "never again" guarantee is specifically about *insert-time noise* (a re-insert you didn't cause, from some unrelated field changing), not about preventing a change you explicitly asked for through `get_mut`.
 
 If you want a field to be genuinely, permanently immutable after spawn, don't expose a `get_mut` path to it — `Once` alone doesn't enforce that; it only skips the *incidental* re-upload path.
 
@@ -1323,6 +1319,10 @@ db.step(); // flushes it to the GPU. That's the whole loop.
 
 Prefer `World` directly, without `SceneDb`? The same mirror attaches with `World::new_with_gpu_mirror(mirror)` (or `world.attach_gpu_mirror(mirror)` post-construction), and `world.flush_gpu_mirror(&queue)` performs the same flush `step()`/`step_gpu()` call for you — call it once per frame yourself if you're driving your own loop.
 
+Attach order does not matter: `attach_gpu_mirror` writes every `#[gpu]`-bearing component already in the world as a first insert (auto-registering its buffers, `Once` fields and liveness rows included), so populating a world and attaching a mirror later — or attaching a fresh mirror after a device loss — yields the same GPU state as attaching first. Re-attaching a clone of the current handle replays nothing.
+
+Type-erased writes take the same path. `World::insert_dyn(entity, Box<dyn Any + Send + Sync>)` and `World::remove_dyn(entity, ComponentId)` run exactly the hooks typed `insert`/`remove` run (GPU mirror, handle ledger, change tracker, journals, object subscriptions); a type is accepted by `insert_dyn` once `pulsar_scenedb::register_component::<T>()` has captured its column constructor. A component whose GPU representation is a derived type can submit its own `GpuMirrorRegistration` that computes the derived value and forwards it with `gpu::write_derived_row` (and `gpu::clear_derived_row` on removal), so the derived rows follow the authored component's writes without being a second component.
+
 Skip the mirror entirely and `World` behaves exactly as it always has — this is opt-in end to end, and a `--no-default-features` build never sees any of it (**CONTRACTS C0**).
 
 **Why this needs a link-time registry, not compile-time generics.** The obvious-looking design — have `World::insert<T: Component>` itself decide, per `T`, whether to call into the GPU path — doesn't work in stable Rust for a subtle but hard reason: `insert`'s body is generic and unconstrained (`T: Component` only), and Rust resolves method calls inside a generic function body once, using only `T`'s *declared* bounds, never per-monomorphization. A specialization trick (e.g. "autoref specialization", competing an inherent method against a blanket trait method) can't observe whether the *substituted* `T` additionally implements `GpuColumnSet` from inside that shared generic body — only code where `T` is already concrete can. (This was verified empirically, not assumed: a minimal repro of the compile-time approach silently no-op'd for every type when called through a generic wrapper, confirmed by a real-device buffer readback coming back all zero, before this design replaced it.)
@@ -1331,7 +1331,7 @@ The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type w
 
 **`get_mut` reaches the GPU too — and NOT quite "the same way `insert` does" for a `Once` field, which matters.** `world.get_mut::<T>(entity)` returns a `Mut<'_, T>` guard, not a raw `&mut T` — it derefs identically, but on drop (or `Mut::into_inner`), a `#[gpu]`-bearing component's mutated fields write through to the mirror. This closes what used to be a real gap: mutating a `#[gpu]` field via `get_mut` alone used to never reach the GPU, for either mirror mode.
 
-For a `DirtyTracked` field, `get_mut` and `insert` behave identically — either one marks the row dirty for the next flush. For a `Once` field they genuinely diverge, and it's deliberate, not an oversight: a routine `insert` (re-inserting the component because some OTHER field changed) leaves a `Once` field's GPU bytes untouched, but an explicit `get_mut` mutation of that SAME field **always re-uploads** — because unlike an incidental re-insert, a `get_mut` write is the caller deliberately changing that exact value, and `Once`'s "never again" guarantee was never meant to survive an intentional edit. See [route 3](#3-per-field-once) in GPU sync & upload modes for the full contract, including the identical rule for a `heavy`-mode field's handle.
+For a `DirtyTracked` field, `get_mut` and `insert` behave identically — either one marks the row dirty for the next flush. For a `Once` field they genuinely diverge, and it's deliberate, not an oversight: a routine `insert` (re-inserting the component because some OTHER field changed) leaves a `Once` field's GPU bytes untouched, but an explicit `get_mut` mutation of that SAME field **always re-uploads** (a `get_mut` guard that is only read is not a mutation and uploads nothing) — because unlike an incidental re-insert, a `get_mut` write is the caller deliberately changing that exact value, and `Once`'s "never again" guarantee was never meant to survive an intentional edit. See [route 3](#3-per-field-once) in GPU sync & upload modes for the full contract, including the identical rule for a `heavy`-mode field's handle.
 
 **Capacity.** `register_gpu_columns(store, capacity, device)` (fixed) is never reallocated, matching `SceneBuffer`'s own contract — `capacity` must cover every `Entity::index()` the world will ever reach, and a write past it panics. For World-mirrored columns, whose eventual entity count is rarely known ahead of time, use `register_gpu_columns_growable(store, initial_capacity, device)` instead (this is what auto-registration calls under the hood, at a small default capacity) — same generated method, growable buffer, same `world.insert()` call site. The buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time an insert's `entity.index()` doesn't fit, entirely inside `World::insert`'s automatic dispatch, with no caller-visible difference from the fixed path except that it never panics on capacity.
 

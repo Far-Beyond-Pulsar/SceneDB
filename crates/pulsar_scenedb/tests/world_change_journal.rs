@@ -77,14 +77,54 @@ fn readers_do_not_consume_each_others_changes() {
 }
 
 #[test]
-fn subscriptions_and_journals_coexist() {
+fn bundle_inserts_and_despawns_record_each_component() {
+    use ComponentChangeKind::*;
+    let mut world = World::new();
+    let mut pos = world.open_change_cursor::<Pos>();
+    let mut health = world.open_change_cursor::<Health>();
+    let e = world.spawn();
+    world.insert_bundle(e, (Pos(1.0, 2.0, 3.0), Health(50)));
+    world.despawn(e);
+    assert_eq!(kinds(&read(&world, &mut pos)), [Inserted, Removed]);
+    assert_eq!(kinds(&read(&world, &mut health)), [Inserted, Removed]);
+}
+
+#[derive(pulsar_scenedb_derive::Replicate, Default)]
+struct Replicated {
+    #[replicate(encoding = Pod, condition = Always)]
+    value: f32,
+}
+
+/// `Delta::apply` writing remote state into an existing component is a real
+/// change, so journal readers see it like a local write.
+#[test]
+fn a_replicated_write_is_recorded() {
+    use pulsar_scenedb::{component_id, ComponentDelta, Delta, Replicable, ReplicationRegistry};
+    let mut registry = ReplicationRegistry::new();
+    Replicated::register_replication(&mut registry);
+
     let mut world = World::new();
     let e = world.spawn();
-    world.subscribe::<Pos>(e).unwrap();
-    let mut cursor = world.open_change_cursor::<Pos>();
-    world.insert(e, Pos(0.0, 0.0, 0.0));
-    assert_eq!(world.take_component_change_events().len(), 1);
-    assert_eq!(read(&world, &mut cursor).len(), 1, "draining subscriptions leaves journals intact");
+    world.insert(e, Replicated::default());
+    let mut cursor = world.open_change_cursor::<Replicated>();
+
+    let mut bytes = Vec::new();
+    5.0f32.replicate_encode(&mut bytes);
+    let delta = Delta {
+        frame: 1,
+        base_frame: 0,
+        spawned: vec![],
+        despawned: vec![],
+        component_deltas: vec![ComponentDelta {
+            entity: e,
+            component_type: component_id::<Replicated>(),
+            field_data: vec![bytes],
+        }],
+        events: vec![],
+    };
+    assert_eq!(delta.apply(&mut world, &registry), Ok(()));
+    assert_eq!(world.get::<Replicated>(e).unwrap().value, 5.0);
+    assert_eq!(kinds(&read(&world, &mut cursor)), [ComponentChangeKind::Mutated]);
 }
 
 #[test]

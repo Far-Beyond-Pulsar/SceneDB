@@ -36,7 +36,6 @@ fn erased_writes_fire_the_same_hooks_as_typed_writes() {
     let mut world = World::new();
     let e = world.spawn();
     world.insert(e, Health(10));
-    world.subscribe::<Health>(e).unwrap();
     let mut journal = world.open_change_cursor::<Health>();
 
     world.get_dyn_mut(e, component_id::<Health>()).unwrap().downcast_mut::<Health>().unwrap().0 = 3;
@@ -44,12 +43,10 @@ fn erased_writes_fire_the_same_hooks_as_typed_writes() {
     let _ = world.get_dyn_mut(e, component_id::<Health>()).unwrap().downcast_ref::<Health>().map(|h| h.0);
 
     assert_eq!(world.get::<Health>(e), Some(&Health(3)));
-    let events = world.take_component_change_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, ComponentChangeKind::Mutated);
     let mut changes = Vec::new();
     assert_eq!(world.read_changes(&mut journal, &mut changes), ChangeRead::Complete);
     assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, ComponentChangeKind::Mutated);
 }
 
 #[test]

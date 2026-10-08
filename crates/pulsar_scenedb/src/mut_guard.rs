@@ -3,8 +3,9 @@
 //! [`crate::World::get_dyn_mut`]).
 //!
 //! Both guards own the same [`MutHooks`]: the GPU-mirror dispatch, the
-//! replication change record, subscription and change-journal events, and
-//! handle-ledger accounting that a component write must trigger. The hooks
+//! replication change record, change-journal entries, object-subscription
+//! deliveries and handle-ledger accounting that a component write must
+//! trigger. The hooks
 //! are resolved once when the guard is created and fired when it drops (or
 //! immediately, from `into_inner`), so erased and typed writes are observed
 //! identically.
@@ -20,13 +21,14 @@ use crate::entity::Entity;
 /// call site (`*guard = value`, `guard.field += 1`, method calls) keeps
 /// working unchanged; the only observable difference from a plain `&mut T`
 /// is that dropping this guard, not the mutation itself, is when the write
-/// reaches the GPU mirror, change tracker, subscriptions, change journals
+/// reaches the GPU mirror, change tracker, change journals
 /// and handle ledger (see [`MutHooks`]).
 pub struct Mut<'a, T> {
     value: &'a mut T,
     /// Set by `DerefMut`: whether the caller actually wrote through the
-    /// guard. Subscription, journal and handle hooks only fire when set; a
-    /// borrow-only `get_mut` is not a mutation.
+    /// guard. Every hook (GPU mirror, change tracker, journal, subscriptions,
+    /// handles) fires only when set; a borrow-only `get_mut` is not a
+    /// mutation.
     mutated_via_deref_mut: bool,
     hooks: MutHooks,
 }
@@ -44,14 +46,14 @@ pub struct MutDyn<'a> {
 
 /// Everything a component write must notify, resolved when a guard is
 /// created. Each hook is `None` when its subsystem is absent (no mirror, no
-/// tracker, no subscriptions, no journals, no handle fields), so an
+/// tracker, no journals, no handle fields), so an
 /// unobserved write costs a few `Option` checks.
 pub(crate) struct MutHooks {
     #[cfg(feature = "gpu")]
     gpu: Option<GpuHook>,
     change: Option<ChangeHook>,
-    subscription: Option<SubscriptionHook>,
     journal: Option<JournalHook>,
+    subscription: Option<SubscriptionHook>,
     /// Captures the OLD handle values at guard creation (afterwards they are
     /// unrecoverable) so a write can be reported as a release/acquire swap.
     handle: Option<HandleHook>,
@@ -63,16 +65,18 @@ pub(crate) struct HookSources<'w> {
     #[cfg(feature = "gpu")]
     pub gpu_mirror: Option<&'w crate::gpu::GpuMirrorHandle>,
     pub change_tracker: Option<&'w crate::replication::SharedChangeTracker>,
-    pub subscriptions: Option<&'w crate::subscriptions::SubscriptionRegistryHandle>,
     pub change_journals: &'w std::sync::OnceLock<crate::change_journal::ChangeJournalHandle>,
     pub handle_counts: &'w std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
+    /// The object the written entity belongs to and its subscribers,
+    /// resolved by the `World` (`None` when nobody watches it).
+    pub subscribers: Option<(Entity, Vec<crate::object_subscriptions::ObjectCallback>)>,
 }
 
 #[cfg(feature = "gpu")]
 struct GpuHook {
     mirror: crate::gpu::GpuMirrorHandle,
     row: u32,
-    dispatch: crate::gpu::world_mirror::DispatchFn,
+    dispatch: &'static [crate::gpu::world_mirror::DispatchFn],
 }
 
 struct ChangeHook {
@@ -82,10 +86,22 @@ struct ChangeHook {
 }
 
 struct SubscriptionHook {
-    registry: crate::subscriptions::SubscriptionRegistryHandle,
+    object: Entity,
+    callbacks: Vec<crate::object_subscriptions::ObjectCallback>,
     entity: Entity,
     component_id: ComponentId,
+    value: ValuePtr,
 }
+
+/// The guarded value, for subscribers. Points at the value the guard
+/// borrows exclusively, so it stays valid, and unaliased by writers, for
+/// the guard's whole life.
+struct ValuePtr(*const dyn Any);
+
+// SAFETY: the pointee is the guard's own `&mut` borrow; the pointer moves
+// with the guard and is read only while the guard is alive.
+unsafe impl Send for ValuePtr {}
+unsafe impl Sync for ValuePtr {}
 
 struct JournalHook {
     journals: crate::change_journal::ChangeJournalHandle,
@@ -103,12 +119,14 @@ struct HandleHook {
 impl MutHooks {
     /// Resolve every hook for a write to component `component_id` of
     /// `entity`, whose current value is at `value` (a pointer to the
-    /// component's own type, used to capture old handle values).
+    /// component's own type, used to capture old handle values; `value_any`
+    /// is the same pointer as `dyn Any`, for subscribers).
     pub(crate) fn new(
         sources: HookSources<'_>,
         entity: Entity,
         component_id: ComponentId,
         value: *const (),
+        value_any: *const dyn Any,
     ) -> Self {
         let handle = crate::handle_ledger::collect_fn_for(component_id).map(|collect| {
             let mut captured = Vec::new();
@@ -133,44 +151,49 @@ impl MutHooks {
                 entity,
                 component_id,
             }),
-            subscription: sources.subscriptions.map(|registry| SubscriptionHook {
-                registry: std::sync::Arc::clone(registry),
-                entity,
-                component_id,
-            }),
             journal: sources.change_journals.get().map(|journals| JournalHook {
                 journals: std::sync::Arc::clone(journals),
                 entity,
                 component_id,
             }),
+            subscription: sources.subscribers.map(|(object, callbacks)| SubscriptionHook {
+                object,
+                callbacks,
+                entity,
+                component_id,
+                value: ValuePtr(value_any),
+            }),
             handle,
         }
     }
 
-    /// Guard drop. The GPU dispatch and change record run on every drop
-    /// (shipped behavior: an explicit `get_mut` re-uploads, including `Once`
-    /// fields); handle, subscription and journal hooks only on a real write.
+    /// Guard drop. Every hook runs only on a real write (`DerefMut`, or a
+    /// successful `MutDyn::downcast_mut`): a borrow-only guard uploads
+    /// nothing, records no change and notifies no one. A write re-uploads
+    /// every `#[gpu]` field of the row, including `Once` fields (an explicit
+    /// `get_mut` write is a deliberate change).
     fn fire_on_drop(&self, value: *const (), mutated: bool) {
-        if mutated {
-            if let Some(hook) = &self.handle {
-                hook.fire(value);
-            }
+        if !mutated {
+            return;
+        }
+        if let Some(hook) = &self.handle {
+            hook.fire(value);
         }
         #[cfg(feature = "gpu")]
         if let Some(hook) = &self.gpu {
-            (hook.dispatch)(&hook.mirror, hook.row, value, true);
+            for dispatch in hook.dispatch {
+                dispatch(&hook.mirror, hook.row, value, true);
+            }
         }
         if let Some(hook) = &self.change {
             hook.tracker
                 .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
-        if mutated {
-            if let Some(hook) = &self.subscription {
-                hook.fire();
-            }
-            if let Some(hook) = &self.journal {
-                hook.fire();
-            }
+        if let Some(hook) = &self.journal {
+            hook.fire();
+        }
+        if let Some(hook) = &self.subscription {
+            hook.fire();
         }
     }
 
@@ -180,7 +203,9 @@ impl MutHooks {
     fn fire_now(&mut self, value: *const ()) {
         #[cfg(feature = "gpu")]
         if let Some(hook) = self.gpu.take() {
-            (hook.dispatch)(&hook.mirror, hook.row, value, true);
+            for dispatch in hook.dispatch {
+                dispatch(&hook.mirror, hook.row, value, true);
+            }
         }
         if let Some(hook) = self.handle.take() {
             hook.fire(value);
@@ -189,10 +214,10 @@ impl MutHooks {
             hook.tracker
                 .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
-        if let Some(hook) = self.subscription.take() {
+        if let Some(hook) = self.journal.take() {
             hook.fire();
         }
-        if let Some(hook) = self.journal.take() {
+        if let Some(hook) = self.subscription.take() {
             hook.fire();
         }
     }
@@ -212,10 +237,17 @@ impl HandleHook {
 
 impl SubscriptionHook {
     fn fire(&self) {
-        crate::subscriptions::lock(&self.registry).record(
-            self.entity,
-            self.component_id,
-            crate::subscriptions::ComponentChangeKind::Mutated,
+        // SAFETY: see `ValuePtr`; the guard firing this hook is alive.
+        let value = unsafe { &*self.value.0 };
+        crate::object_subscriptions::deliver(
+            &self.callbacks,
+            self.object,
+            crate::object_subscriptions::ObjectChange {
+                entity: self.entity,
+                component: self.component_id,
+                kind: crate::change_journal::ComponentChangeKind::Mutated,
+                value: Some(value),
+            },
         );
     }
 }
@@ -225,7 +257,7 @@ impl JournalHook {
         crate::change_journal::lock(&self.journals).record(
             self.entity,
             self.component_id,
-            crate::subscriptions::ComponentChangeKind::Mutated,
+            crate::change_journal::ComponentChangeKind::Mutated,
         );
     }
 }

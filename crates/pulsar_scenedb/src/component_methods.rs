@@ -239,7 +239,7 @@ impl World {
 /// Validate the script-facing arguments before `invoke_component_method`
 /// obtains a `MutDyn` guard. The reflected shim validates these again when
 /// it invokes the method; doing the metadata check here keeps rejected calls
-/// from firing mutable-borrow hooks (subscriptions, journals, or GPU uploads).
+/// from firing mutable-borrow hooks (journals or GPU uploads).
 fn validate_reflected_args(
     method: &ReflectedMethod,
     args: &[Box<dyn Any>],

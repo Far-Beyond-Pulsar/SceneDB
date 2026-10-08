@@ -372,10 +372,12 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
     /// doesn't ALSO need to grow it at that point.
     pub fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
         let mut state = self.state.write().expect("DirtyTrackedSceneBuffer lock poisoned");
-        grow_shadow_to(&mut state, capacity as usize);
+        // The GPU buffer first: it checks the device's ceiling, so a
+        // reservation past it fails before the shadow allocates its rows.
         if state.buf.capacity() < capacity {
             state.buf.reserve(&self.device, queue, capacity)?;
         }
+        grow_shadow_to(&mut state, capacity as usize);
         Ok(())
     }
 

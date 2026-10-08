@@ -73,7 +73,7 @@
 //!   `get_mut` each pay one `HashMap` probe (`collect_fn_for`) that misses —
 //!   no allocation, no counting work. This is the same "absent means
 //!   absent" shape every optional `World` capability already established
-//!   (change tracker, subscriptions, GPU mirror), just without the extra
+//!   (change tracker, change journals, GPU mirror), just without the extra
 //!   `Option` check an attach-based capability would also pay, since
 //!   counting is unconditional now.
 //! - **`T` has handle fields**: each event is O(fields-of-the-type-being-

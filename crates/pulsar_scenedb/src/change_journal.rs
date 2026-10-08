@@ -5,17 +5,15 @@
 //! A system that derives state from a component (a renderer's acceleration
 //! structure, a spatial index, a physics proxy) needs to know which entities
 //! changed since it last looked. Rescanning every row each frame makes that
-//! system O(scene) even when nothing moved. [`crate::subscriptions`] answers
-//! "did this exact `(Entity, T)` change?" but its queue is drained by one
-//! owner ([`crate::World::take_component_change_events`]), so two consumers
-//! cannot share it, and it needs a subscription per entity.
+//! system O(scene) even when nothing moved, and a queue drained by one owner
+//! cannot be shared by two consumers.
 //!
 //! # The model
 //!
 //! A journal records every change to one component type in order: insert
 //! (including an in-place overwrite), a `get_mut` written through
-//! `DerefMut`, remove, and the removal implied by despawn -- the same sites
-//! subscriptions fire at. Any number of readers each hold their own
+//! `DerefMut`, remove, the removal implied by despawn, and a replicated
+//! write applied by `Delta::apply`. Any number of readers each hold their own
 //! [`ChangeCursor`] and read forward from it with
 //! [`crate::World::read_changes`]; reading never consumes anything another
 //! reader will see.
@@ -33,17 +31,57 @@
 //! [`ChangeRead::Overflowed`] instead of a partial list and its cursor jumps
 //! to the newest entry; the reader must rescan. Correctness never depends on
 //! a reader keeping up, only its cost does.
+//!
+//! # Belonging to one world
+//!
+//! Each `World`'s journals carry a process-unique id, and a cursor records
+//! the id it was opened against. Reading with a cursor from another world
+//! (a scene that was replaced while the reader held its cursor), or for a
+//! type whose journal does not exist yet, rebinds the cursor to this
+//! world's newest entry and returns [`ChangeRead::Overflowed`] once: the
+//! reader rescans and continues from there. It never reads another world's
+//! positions as if they were its own.
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
-use crate::subscriptions::ComponentChangeKind;
 use ahash::AHashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Source of journal-set ids; 0 is never handed out.
+static NEXT_JOURNALS_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Ring capacity per component type. At 64k entries a reader may skip over
 /// a thousand frames of a thousand changes each before it must rescan.
 pub const DEFAULT_JOURNAL_CAPACITY: usize = 1 << 16;
+
+/// What kind of write produced a [`ComponentChange`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComponentChangeKind {
+    /// `T` was added to the entity (first insert, re-insert after a remove,
+    /// or an in-place overwrite by `insert`).
+    Inserted,
+    /// `T`'s value was written through `Mut`'s `DerefMut` (or handed out
+    /// mutable via `into_inner`), or replaced by a replicated write. A
+    /// borrow-only `get_mut` records nothing.
+    Mutated,
+    /// `T` was taken off the entity (explicit remove, or the entity
+    /// despawned while holding `T`).
+    Removed,
+}
+
+impl ComponentChangeKind {
+    /// Stable lowercase name (`"inserted"` / `"mutated"` / `"removed"`),
+    /// for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Mutated => "mutated",
+            Self::Removed => "removed",
+        }
+    }
+}
 
 /// One recorded change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +94,8 @@ pub struct ComponentChange {
 /// one keeps nothing alive, and dropping one needs no cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChangeCursor {
+    /// The id of the journal set (one per `World`) this cursor reads.
+    journals: u64,
     component: ComponentId,
     next: u64,
 }
@@ -73,9 +113,10 @@ impl ChangeCursor {
 pub enum ChangeRead {
     /// Every change since the cursor's previous position was appended.
     Complete,
-    /// The journal evicted entries this cursor had not read yet. Nothing was
-    /// appended; the cursor now points at the newest entry, so the reader
-    /// must rebuild from a full scan and continue from there.
+    /// The journal evicted entries this cursor had not read yet, or the
+    /// cursor belonged to another world. Nothing was appended; the cursor
+    /// now points at this world's newest entry, so the reader must rebuild
+    /// from a full scan and continue from there.
     Overflowed,
 }
 
@@ -100,9 +141,19 @@ impl Journal {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct ChangeJournals {
+    /// Process-unique id of this journal set (one per `World`).
+    id: u64,
     journals: AHashMap<ComponentId, Journal>,
+}
+
+impl Default for ChangeJournals {
+    fn default() -> Self {
+        Self {
+            id: NEXT_JOURNALS_ID.fetch_add(1, Ordering::Relaxed),
+            journals: AHashMap::default(),
+        }
+    }
 }
 
 pub(crate) type ChangeJournalHandle = Arc<Mutex<ChangeJournals>>;
@@ -113,12 +164,16 @@ pub(crate) fn lock(handle: &ChangeJournalHandle) -> std::sync::MutexGuard<'_, Ch
 
 impl ChangeJournals {
     pub(crate) fn open(&mut self, component: ComponentId) -> ChangeCursor {
-        let journal = self.journals.entry(component).or_insert_with(|| Journal {
+        let end = self.journal(component).end();
+        ChangeCursor { journals: self.id, component, next: end }
+    }
+
+    fn journal(&mut self, component: ComponentId) -> &mut Journal {
+        self.journals.entry(component).or_insert_with(|| Journal {
             first: 0,
             entries: VecDeque::new(),
             capacity: DEFAULT_JOURNAL_CAPACITY,
-        });
-        ChangeCursor { component, next: journal.end() }
+        })
     }
 
     /// Records `kind` for `(entity, component)` if that type is journaled.
@@ -129,11 +184,15 @@ impl ChangeJournals {
         }
     }
 
-    pub(crate) fn read(&self, cursor: &mut ChangeCursor, out: &mut Vec<ComponentChange>) -> ChangeRead {
-        let Some(journal) = self.journals.get(&cursor.component) else {
-            // Only reachable with a cursor from a different World.
+    pub(crate) fn read(&mut self, cursor: &mut ChangeCursor, out: &mut Vec<ComponentChange>) -> ChangeRead {
+        let id = self.id;
+        let journal = self.journal(cursor.component);
+        if cursor.journals != id {
+            // A cursor from another world: rebind it here and rescan once.
+            cursor.journals = id;
+            cursor.next = journal.end();
             return ChangeRead::Overflowed;
-        };
+        }
         if cursor.next < journal.first || cursor.next > journal.end() {
             cursor.next = journal.end();
             return ChangeRead::Overflowed;
@@ -183,6 +242,39 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(journals.read(&mut cursor, &mut out), ChangeRead::Complete);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_cursor_from_another_world_rescans_once_then_follows_this_one() {
+        let cid = crate::component::component_id::<u32>();
+        let mut old = ChangeJournals::default();
+        let mut cursor = old.open(cid);
+        old.record(entity(1), cid, ComponentChangeKind::Mutated);
+
+        // The scene is replaced: a new journal set at a similar position.
+        let mut new = ChangeJournals::default();
+        let _other_reader = new.open(cid);
+        new.record(entity(7), cid, ComponentChangeKind::Inserted);
+
+        let mut out = Vec::new();
+        assert_eq!(new.read(&mut cursor, &mut out), ChangeRead::Overflowed);
+        assert!(out.is_empty(), "never reads the new world's entries as the old one's");
+        new.record(entity(8), cid, ComponentChangeKind::Mutated);
+        assert_eq!(new.read(&mut cursor, &mut out), ChangeRead::Complete);
+        assert_eq!(out.iter().map(|c| c.entity).collect::<Vec<_>>(), [entity(8)]);
+    }
+
+    #[test]
+    fn a_cursor_for_a_type_without_a_journal_starts_one() {
+        let cid = crate::component::component_id::<u32>();
+        let mut journals = ChangeJournals::default();
+        let mut cursor = journals.open(crate::component::component_id::<u64>());
+        cursor.component = cid;
+        let mut out = Vec::new();
+        assert_eq!(journals.read(&mut cursor, &mut out), ChangeRead::Complete);
+        journals.record(entity(3), cid, ComponentChangeKind::Inserted);
+        assert_eq!(journals.read(&mut cursor, &mut out), ChangeRead::Complete);
+        assert_eq!(out.iter().map(|c| c.entity).collect::<Vec<_>>(), [entity(3)]);
     }
 
     #[test]

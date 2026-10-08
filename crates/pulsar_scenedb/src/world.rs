@@ -105,13 +105,13 @@ pub struct World {
     inspector_request_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>>,
     #[cfg(feature = "telemetry")]
     inspector_response_callback: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-    /// Per-`(Entity, ComponentId)` subscription wiring (see
-    /// [`crate::subscriptions`] -- SceneDB#47), attached the same way as
-    /// `change_tracker` above. `None` (the default) means every mutating
-    /// path costs exactly one `Option::is_none()` check extra -- no registry,
-    /// no allocation, nothing on any drop path. Not feature-gated: live-UI
-    /// consumers are always available (CONTRACTS C0).
-    subscriptions: Option<crate::subscriptions::SubscriptionRegistryHandle>,
+    /// Object subscriptions (see [`crate::object_subscriptions`]): views
+    /// following one object's writes. `None` until the first subscription,
+    /// so an unwatched world pays one `Option` check per write.
+    object_subscriptions: Option<crate::object_subscriptions::ObjectSubscriptionsHandle>,
+    /// Maps an entity to the object its components belong to, for object
+    /// subscriptions ([`Self::set_object_resolver`]).
+    object_resolver: crate::object_subscriptions::ObjectResolver,
     /// Multi-reader change journals (see [`crate::change_journal`]). Created
     /// by the first [`World::open_change_cursor`]; until then every mutating
     /// path pays one atomic load for it. `OnceLock` rather than `Option` so a
@@ -129,9 +129,9 @@ pub struct World {
     /// fields) costs nothing further. `Arc<Mutex<..>>`, not a bare
     /// `HashMap`, purely so [`Mut`]'s drop-time hook can hold an owned
     /// handle independent of `self`'s borrow -- same reason
-    /// `change_tracker`/`subscriptions` above are `Arc`-wrapped, same
+    /// `change_tracker` above is `Arc`-wrapped, same
     /// `std::sync::Mutex` + `.lock().expect(..)` convention as
-    /// `SharedChangeTracker`/`SubscriptionRegistryHandle`. Not
+    /// `SharedChangeTracker`. Not
     /// feature-gated: handles are a domain-neutral concept with no GPU
     /// dependency whatsoever.
     handle_counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
@@ -164,7 +164,8 @@ impl World {
             inspector_request_queue: None,
             #[cfg(feature = "telemetry")]
             inspector_response_callback: None,
-            subscriptions: None,
+            object_subscriptions: None,
+            object_resolver: crate::object_subscriptions::entity_is_its_own_object,
             change_journals: std::sync::OnceLock::new(),
             handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::handle_ledger::HandleCounts::default(),
@@ -368,16 +369,91 @@ impl World {
     /// Append every change recorded for `cursor`'s component type since the
     /// cursor's last read to `out`, in order, and advance the cursor. Other
     /// readers are unaffected. Returns [`crate::change_journal::ChangeRead::Overflowed`]
-    /// (appending nothing) when the journal evicted unread entries; rescan
-    /// in that case.
+    /// (appending nothing) when the journal evicted unread entries, or once
+    /// for a cursor opened on another `World` (rebinding it here); rescan in
+    /// that case.
     pub fn read_changes(
         &self,
         cursor: &mut crate::change_journal::ChangeCursor,
         out: &mut Vec<crate::change_journal::ComponentChange>,
     ) -> crate::change_journal::ChangeRead {
-        match self.change_journals.get() {
-            Some(journals) => crate::change_journal::lock(journals).read(cursor, out),
-            None => crate::change_journal::ChangeRead::Overflowed,
+        let journals = self.change_journals.get_or_init(Default::default);
+        crate::change_journal::lock(journals).read(cursor, out)
+    }
+
+    // ── Object subscriptions ────────────────────────────────────────────────
+
+    /// Set how an entity maps to the object its components belong to (see
+    /// [`crate::object_subscriptions`]). The default maps every entity to
+    /// itself. A host keeping an object's components on their own entities
+    /// maps those to their owner, so an object subscription covers them.
+    pub fn set_object_resolver(&mut self, resolver: crate::object_subscriptions::ObjectResolver) {
+        self.object_resolver = resolver;
+    }
+
+    /// The object `entity` belongs to, by this world's resolver.
+    pub fn object_of(&self, entity: Entity) -> Entity {
+        (self.object_resolver)(self, entity)
+    }
+
+    /// Call `callback` inside every write to a component of `object` (the
+    /// object entity and, through the resolver, its component entities),
+    /// with the component's new value; and once with
+    /// [`ObjectEvent::Despawned`](crate::object_subscriptions::ObjectEvent::Despawned)
+    /// when the object despawns, which ends the subscription. `None` for a
+    /// dead `object`. See [`crate::object_subscriptions`] for the contract:
+    /// the callback must not reach for the `World`.
+    pub fn subscribe_object(
+        &mut self,
+        object: Entity,
+        callback: impl Fn(Entity, &crate::object_subscriptions::ObjectEvent<'_>) + Send + Sync + 'static,
+    ) -> Option<crate::object_subscriptions::SubscriptionId> {
+        if !self.is_alive(object) {
+            return None;
+        }
+        let handle = self.object_subscriptions.get_or_insert_with(Default::default);
+        Some(crate::object_subscriptions::lock(handle).subscribe(object, std::sync::Arc::new(callback)))
+    }
+
+    /// End a subscription. `false` if it already ended (unsubscribed, or its
+    /// object despawned).
+    pub fn unsubscribe_object(&mut self, id: crate::object_subscriptions::SubscriptionId) -> bool {
+        match &self.object_subscriptions {
+            Some(handle) => crate::object_subscriptions::lock(handle).unsubscribe(id),
+            None => false,
+        }
+    }
+
+    /// The object `entity` belongs to and the callbacks watching it, or
+    /// `None` when nobody watches it (always, in a world without
+    /// subscriptions).
+    fn object_subscribers(
+        &self,
+        entity: Entity,
+    ) -> Option<(Entity, Vec<crate::object_subscriptions::ObjectCallback>)> {
+        let handle = self.object_subscriptions.as_ref()?;
+        if crate::object_subscriptions::lock(handle).is_empty() {
+            return None;
+        }
+        let object = (self.object_resolver)(self, entity);
+        let callbacks = crate::object_subscriptions::lock(handle).callbacks(object);
+        (!callbacks.is_empty()).then_some((object, callbacks))
+    }
+
+    /// Tell `entity`'s object subscribers that `component` changed; the
+    /// value delivered is the stored one.
+    fn notify_object_write(&self, entity: Entity, component: ComponentId, kind: crate::change_journal::ComponentChangeKind) {
+        if let Some((object, callbacks)) = self.object_subscribers(entity) {
+            crate::object_subscriptions::deliver(
+                &callbacks,
+                object,
+                crate::object_subscriptions::ObjectChange {
+                    entity,
+                    component,
+                    kind,
+                    value: self.get_dyn(entity, component),
+                },
+            );
         }
     }
 
@@ -386,134 +462,10 @@ impl World {
         &self,
         entity: Entity,
         component: ComponentId,
-        kind: crate::subscriptions::ComponentChangeKind,
+        kind: crate::change_journal::ComponentChangeKind,
     ) {
         if let Some(journals) = self.change_journals.get() {
             crate::change_journal::lock(journals).record(entity, component, kind);
-        }
-    }
-
-    // ── Component subscriptions (SceneDB#47) ────────────────────────────────
-
-    /// Subscribe to changes of component `T` on `entity`: every subsequent
-    /// real write to that exact key -- `insert` (including re-insert after a
-    /// remove), an in-place overwrite, a `get_mut` written through
-    /// `DerefMut`, and `remove`/`despawn` taking the component away --
-    /// delivers one [`crate::subscriptions::ComponentChangeEvent`] to this
-    /// subscription.
-    ///
-    /// Events are **batched**, not callbacks: they accumulate in a bounded
-    /// pending queue and are handed over when you call
-    /// [`Self::take_component_change_events`] (once per frame/tick, wherever
-    /// your frame boundary lives). See [`crate::subscriptions`]'s module doc
-    /// for why callback-in-Drop was rejected (reentrancy) and what the full
-    /// delivery contract is.
-    ///
-    /// Subscribing to a `(entity, T)` pair whose component isn't currently
-    /// present is allowed and useful: the subscription arms silently and its
-    /// first event is the future insert. Subscribing to a dead entity
-    /// returns `None`.
-    ///
-    /// The subscription stays armed until [`Self::unsubscribe`], until the
-    /// entity despawns (which auto-cleans it after delivering final
-    /// `Removed` events), or until the `World` is dropped. Forgetting to
-    /// unsubscribe a live entity is the same class of leak as forgetting to
-    /// drop an entity handle: bounded by one map entry per subscription,
-    /// nothing per-frame.
-    ///
-    /// Zero-subscriber cost elsewhere in the `World`: before this call the
-    /// only thing any mutating path pays for subscriptions is one
-    /// `Option::is_none()` check; after it, only keys with at least one
-    /// watcher pay a hash probe + queue append.
-    pub fn subscribe<T: Component>(
-        &mut self,
-        entity: Entity,
-    ) -> Option<crate::subscriptions::SubscriptionId> {
-        self.subscribe_id(entity, crate::component::component_id::<T>())
-    }
-
-    /// Type-erased form of [`Self::subscribe`]: same contract, keyed by
-    /// [`ComponentId`] instead of `T`. For callers that bridge through their
-    /// own registry (Pulsar-Native's reflection-to-`World` shim resolves
-    /// editor class names to component ids at runtime and cannot name `T`
-    /// statically). Returns `None` for a dead entity, same as
-    /// [`Self::subscribe`].
-    pub fn subscribe_id(
-        &mut self,
-        entity: Entity,
-        cid: ComponentId,
-    ) -> Option<crate::subscriptions::SubscriptionId> {
-        if !self.is_alive(entity) {
-            return None;
-        }
-        let registry = self.subscriptions.get_or_insert_with(Default::default);
-        Some(crate::subscriptions::lock(registry).subscribe(entity, cid))
-    }
-
-    /// Disarm a subscription. Idempotent: returns `false` if `id` was never
-    /// armed or has already been unsubscribed/despawn-cleaned. Pending
-    /// events already queued for `id` are delivered as-is on the next drain
-    /// -- unsubscribing stops FUTURE events, it doesn't retract past ones.
-    pub fn unsubscribe(&mut self, id: crate::subscriptions::SubscriptionId) -> bool {
-        let Some(registry) = &self.subscriptions else {
-            return false;
-        };
-        crate::subscriptions::lock(registry).unsubscribe(id)
-    }
-
-    /// Disarm every subscription on `entity`, any component type. Returns
-    /// how many were removed. Convenience for a consumer tearing down a
-    /// whole card/panel at once (e.g. the properties panel unmounting all of
-    /// one object's component cards).
-    pub fn unsubscribe_for_entity(&mut self, entity: Entity) -> usize {
-        let Some(registry) = &self.subscriptions else {
-            return 0;
-        };
-        crate::subscriptions::lock(registry).unsubscribe_entity(entity)
-    }
-
-    /// Drain every pending [`ComponentChangeEvent`], oldest first, emptying
-    /// the queue. Call once per frame/tick from your frame boundary --
-    /// between drains events accumulate (bounded by
-    /// [`crate::subscriptions::MAX_PENDING_EVENTS`]; beyond the cap the
-    /// oldest are dropped and counted, see
-    /// [`Self::dropped_component_change_events`]).
-    ///
-    /// Delivery is at-least-once per real mutation, in mutation order, NOT
-    /// coalesced -- treat the result as a dirty set keyed by
-    /// `(entity, component)` unless you genuinely need per-write fidelity.
-    pub fn take_component_change_events(
-        &mut self,
-    ) -> Vec<crate::subscriptions::ComponentChangeEvent> {
-        let Some(registry) = &self.subscriptions else {
-            return Vec::new();
-        };
-        crate::subscriptions::lock(registry).take()
-    }
-
-    /// How many events are waiting for the next
-    /// [`Self::take_component_change_events`] (diagnostics/backpressure).
-    pub fn pending_component_change_events(&self) -> usize {
-        match &self.subscriptions {
-            None => 0,
-            Some(registry) => {
-                // `try_lock` instead of blocking: this is a diagnostic read,
-                // and a concurrent mutation path holding the lock means the
-                // answer is stale the moment it's taken anyway.
-                registry.try_lock().map(|r| r.pending_len()).unwrap_or(0)
-            }
-        }
-    }
-
-    /// How many events have been dropped to enforce the pending cap since
-    /// the registry was created (see
-    /// [`Self::take_component_change_events`]). Nonzero means a consumer
-    /// went long enough without draining to overflow
-    /// [`crate::subscriptions::MAX_PENDING_EVENTS`] and lost events.
-    pub fn dropped_component_change_events(&self) -> u64 {
-        match &self.subscriptions {
-            None => 0,
-            Some(registry) => registry.try_lock().map(|r| r.dropped_count()).unwrap_or(0),
         }
     }
 
@@ -578,26 +530,68 @@ impl World {
         out
     }
 
-    /// Attach a [`crate::gpu::GpuMirrorHandle`] so that every future
-    /// `insert`/`insert_tracked` call automatically mirrors any `#[gpu]`
-    /// fields of the inserted component to their registered GPU buffer, at
-    /// row = `entity.index()` — no per-call opt-in needed once this is set.
+    /// Attach a [`crate::gpu::GpuMirrorHandle`] so that every
+    /// `insert`/`insert_dyn`/`get_mut`/`remove`/`despawn` automatically
+    /// mirrors any `#[gpu]` fields of the affected component to its GPU
+    /// buffer, at row = `entity.index()` -- no per-call opt-in needed.
     ///
-    /// Call this once during setup, after registering every GPU-mirrored
-    /// component type's buffers (`T::register_gpu_columns(&store, capacity,
-    /// device)`, generated by `#[derive(SceneStore)]`). Components inserted
-    /// before their buffer is registered are not an error — the write is
-    /// silently skipped (see [`crate::gpu::SceneGpuStore::write_row_bytes`])
-    /// — but they also won't retroactively appear on the GPU once the
-    /// buffer *is* registered; insert (or re-insert) them again afterward.
+    /// Attaching also initializes the mirror from the world's current
+    /// contents: every component already present whose type has `#[gpu]`
+    /// fields is written as a first insert (so `Once`-mode fields and the
+    /// liveness mirror are populated too), auto-registering its buffers if
+    /// nothing registered them. A world may therefore be populated before,
+    /// after, or across a mirror attach with the same GPU result; no caller
+    /// re-inserts anything to make existing data visible.
     ///
-    /// Idempotent: calling this again replaces the previous handle, it does
-    /// not stack. Passing a handle backed by a different, smaller-capacity
-    /// `SceneGpuStore` than a previous one is the caller's responsibility to
-    /// avoid — this method does no capacity reconciliation of its own.
+    /// Re-attaching a handle that shares state with the attached one (a
+    /// clone of it) changes nothing and replays nothing. Attaching a
+    /// different handle -- a new store, or a recreated device -- replaces
+    /// the previous one and replays into the new one. Passing a handle backed
+    /// by a smaller-capacity `SceneGpuStore` than a previous one is the
+    /// caller's responsibility to avoid -- this method does no capacity
+    /// reconciliation of its own.
     #[cfg(feature = "gpu")]
     pub fn attach_gpu_mirror(&mut self, mirror: crate::gpu::GpuMirrorHandle) {
+        profiling::profile_scope_loc!("World::attach_gpu_mirror");
+        let unchanged = self
+            .gpu_mirror
+            .as_ref()
+            .is_some_and(|current| current.shares_state_with(&mirror));
         self.gpu_mirror = Some(mirror);
+        if !unchanged {
+            self.replay_gpu_mirror();
+        }
+    }
+
+    /// Write every existing `#[gpu]`-bearing component to the attached
+    /// mirror as a first insert. Generic over every registered GPU schema:
+    /// it walks the world's columns and uses the same link-time dispatch an
+    /// insert uses, so no list of types is involved.
+    #[cfg(feature = "gpu")]
+    fn replay_gpu_mirror(&self) {
+        let Some(mirror) = &self.gpu_mirror else { return };
+        for arch in &self.archetypes {
+            if arch.entities.is_empty() {
+                continue;
+            }
+            for &cid in &arch.active_cids {
+                let Some(dispatches) = crate::gpu::world_mirror::dispatch_for(cid) else {
+                    continue;
+                };
+                let Some(col) = Self::get_erased(arch, cid) else { continue };
+                for (row, &entity) in arch.entities.iter().enumerate() {
+                    mirror
+                        .generations()
+                        .note_gpu_bearing_insert(entity.index(), entity.generation());
+                    // SAFETY: `row` < `arch.entities.len()` == `col.len()`,
+                    // and each dispatch was registered under this column's
+                    // own `ComponentId`.
+                    for dispatch in dispatches {
+                        dispatch(mirror, entity.index(), unsafe { col.get_raw(row) }, true);
+                    }
+                }
+            }
+        }
     }
 
     /// Detach the GPU mirror, if any — subsequent inserts stop writing to
@@ -904,6 +898,14 @@ impl World {
         if !self.is_alive(entity) {
             return false;
         }
+        // Object subscriptions, resolved while `entity` still places itself
+        // in its object: its components' subscribers are told each removal,
+        // and an object's own subscriptions end with it.
+        let subscribers = self.object_subscribers(entity);
+        let ended = match &self.object_subscriptions {
+            Some(handle) => crate::object_subscriptions::lock(handle).end(entity),
+            None => Vec::new(),
+        };
         let (arch_id, row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
@@ -928,16 +930,13 @@ impl World {
             let arch = &self.archetypes[arch_id.0 as usize];
             for (i, col) in arch.columns.iter().enumerate() {
                 if col.is_some() {
-                    if let Some(release) =
-                        crate::gpu::world_mirror::release_dispatch_for(ComponentId(i as u32))
-                    {
+                    let cid = ComponentId(i as u32);
+                    for release in crate::gpu::world_mirror::release_dispatch_for(cid).unwrap_or_default() {
                         release(mirror, entity.index());
                     }
-                    // Zero the departed component's GPU row: consumers
+                    // Zero the departed component's GPU rows: consumers
                     // reading these buffers by row must not keep seeing it.
-                    if let Some(clear) =
-                        crate::gpu::world_mirror::clear_dispatch_for(ComponentId(i as u32))
-                    {
+                    for clear in crate::gpu::world_mirror::clear_dispatch_for(cid).unwrap_or_default() {
                         clear(mirror, entity.index());
                     }
                 }
@@ -1038,29 +1037,31 @@ impl World {
             t.record_despawn(entity);
         }
 
-        // Subscription delivery + cleanup (SceneDB#47): one final `Removed`
-        // per component the entity actually had (same `active_cids` read as
-        // the tracker block above), then every remaining subscription on
-        // this entity is disarmed -- its generation is bumped past any live
-        // handle, so a surviving subscription could never fire again and is
-        // pure bookkeeping weight. This is the ONLY implicit unsubscribe:
-        // live-entity subscriptions stay armed until explicitly dropped.
+        // Change journals: one final `Removed` per component the entity
+        // actually had (same `active_cids` read as the tracker block above).
         if let Some(journals) = self.change_journals.get() {
             let mut journals = crate::change_journal::lock(journals);
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
-                journals.record(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
+                journals.record(entity, cid, crate::change_journal::ComponentChangeKind::Removed);
             }
         }
-        if let Some(registry) = &self.subscriptions {
-            let mut guard = crate::subscriptions::lock(registry);
+
+        if let Some((object, callbacks)) = subscribers {
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
-                guard.record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Removed,
+                crate::object_subscriptions::deliver(
+                    &callbacks,
+                    object,
+                    crate::object_subscriptions::ObjectChange {
+                        entity,
+                        component: cid,
+                        kind: crate::change_journal::ComponentChangeKind::Removed,
+                        value: None,
+                    },
                 );
             }
-            guard.unsubscribe_entity(entity);
+        }
+        for callback in ended {
+            callback(entity, &crate::object_subscriptions::ObjectEvent::Despawned);
         }
 
         true
@@ -1181,69 +1182,84 @@ impl World {
         &mut self,
         entity: Entity,
         value: T,
+        tracker: Option<&mut ChangeTracker>,
+    ) {
+        assert!(self.is_alive(entity), "insert on dead entity {entity}");
+        self.insert_core(entity, TypedInsert(value), tracker);
+    }
+
+    /// Insert a component value whose type is known only at run time.
+    ///
+    /// The value goes through the same insert path as [`Self::insert`]:
+    /// GPU-mirror dispatch (including `#[gpu]` auto-registration), the
+    /// handle ledger, the change tracker and change journals
+    /// all observe it exactly as they would a typed insert of the same value.
+    /// An existing value of the same type on `entity` is replaced in place.
+    ///
+    /// The value's concrete type must have been registered with
+    /// [`crate::component::register_component`]; that is where the column
+    /// constructor for a first value of the type comes from.
+    ///
+    /// Returns the inserted component's [`ComponentId`]. On failure the
+    /// value is handed back inside the error, untouched.
+    pub fn insert_dyn(
+        &mut self,
+        entity: Entity,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<ComponentId, InsertDynError> {
+        profiling::profile_scope_loc!("World::insert_dyn");
+        if !self.is_alive(entity) {
+            return Err(InsertDynError::DeadEntity { entity, value });
+        }
+        let Some(info) = crate::component::erased_info((*value).type_id()) else {
+            return Err(InsertDynError::Unregistered { value });
+        };
+        let cid = info.id;
+        let source = ErasedInsert { info, value };
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.insert_core(entity, source, Some(&mut guard));
+        } else {
+            self.insert_core(entity, source, None);
+        }
+        Ok(cid)
+    }
+
+    /// The one insert path: typed [`Self::insert`] and erased
+    /// [`Self::insert_dyn`] both land here, so they cannot drift apart in
+    /// which write hooks run. `source` supplies only what genuinely differs
+    /// between them -- how the value reaches its column. `entity` must be
+    /// alive.
+    fn insert_core<S: InsertSource>(
+        &mut self,
+        entity: Entity,
+        source: S,
         mut tracker: Option<&mut ChangeTracker>,
     ) {
-        let cid = crate::component::component_id::<T>();
-        assert!(self.is_alive(entity), "insert on dead entity {entity}");
-
-        // NOT cloned unconditionally here (unlike the change-tracker guard
-        // below) -- `collect_fn_for(cid)` is checked FIRST at each of the
-        // two reporting sites, and the `Arc::clone` + lock only happen on a
-        // hit, so a component type with no handle/content-id-linked fields
-        // (the overwhelming majority) pays exactly the one `HashMap` miss
-        // the module doc's cost model promises, nothing more.
-
+        let cid = source.component_id();
         let (old_arch_id, old_row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
         };
         let is_new_insert = !Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid);
 
-        // GPU mirror: automatic, via a link-time dispatch registry keyed by
-        // `cid` (see `crate::gpu::world_mirror`'s module docs for why this
-        // is a registry lookup and not compile-time specialization — the
-        // short version: `insert_inner` is itself generic, and Rust cannot
-        // specialize a method call inside an unconstrained generic body on
-        // the caller's substituted type). Reuses `cid`, already computed
-        // above for archetype indexing — no extra `TypeId` resolution.
-        // Must run before `value` is moved into a column below (both
-        // branches move it), and covers BOTH the in-place-update and the
-        // new-archetype-migration paths with one call, since either way
-        // this is the new authoritative value for `entity`'s `T`. Passes
-        // `is_new_insert` through so `Once`-mode `#[gpu]` fields know
-        // whether this is the one time they should actually write. A no-op
-        // (one `Option::is_none()` check, then at most one `HashMap` lookup
-        // that misses for any type `#[derive(SceneStore)]` never touched)
-        // when no mirror is attached or `T` has no `#[gpu]` fields.
-        #[cfg(feature = "gpu")]
-        if let Some(mirror) = &self.gpu_mirror {
-            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
-                // First time this entity gets ANY `#[gpu]`-bearing component
-                // (checked via `is_new_insert`, not re-derived here): tell
-                // the liveness mirror there is now something on the GPU at
-                // this row that needs a generation entry -- and, eventually,
-                // invalidating on despawn. See
-                // `GenerationMirror::note_gpu_bearing_insert`'s doc; this is
-                // the other half of SceneDB#39's "non-GPU entities pay
-                // nothing" fix (the first half is that `spawn_inner` no
-                // longer touches the liveness mirror at all).
-                if is_new_insert {
-                    mirror
-                        .generations()
-                        .note_gpu_bearing_insert(entity.index(), entity.generation());
-                }
-                dispatch(
-                    mirror,
-                    entity.index(),
-                    &value as *const T as *const (),
-                    is_new_insert,
-                );
-            }
-        }
-
-        // In-place update: entity already has this component in this archetype.
         if !is_new_insert {
-            let col = self.archetypes[old_arch_id.0 as usize].column_mut::<T>();
+            // In-place update: the entity already has this component.
+            //
+            // GPU mirror: automatic, via a link-time dispatch registry keyed
+            // by `cid` (see `crate::gpu::world_mirror`'s module docs for why
+            // this is a registry lookup and not compile-time specialization).
+            // Runs before the value moves into its column. `is_new_insert`
+            // is false, so `Once`-mode `#[gpu]` fields skip this write.
+            #[cfg(feature = "gpu")]
+            if let Some(mirror) = &self.gpu_mirror {
+                for dispatch in crate::gpu::world_mirror::dispatch_for(cid).unwrap_or_default() {
+                    dispatch(mirror, entity.index(), source.value_ptr(), false);
+                }
+            }
+
+            let col = Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                .expect("an in-place insert's column exists");
 
             // Handle-ledger swap detection (rehydrate-replace included --
             // this branch IS the replace): read the OUTGOING value BEFORE
@@ -1251,130 +1267,133 @@ impl World {
             // Equal ids ⇒ nothing (a routine re-insert of the same asset
             // must not churn counts); different ⇒ release old unless zero,
             // acquire new unless zero. See `handle_ledger::report_value_swap`
-            // for why the rule lives in exactly one shared place. Runs only
-            // when `T` actually has handle/content-id-linked fields (one
-            // `HashMap` miss otherwise).
+            // for why the rule lives in exactly one shared place.
             if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
-                let old_ptr = &col.data[old_row] as *const T as *const ();
-                let new_ptr = &value as *const T as *const ();
+                // SAFETY: `old_row` is this live entity's row in this column.
+                let old_ptr = unsafe { col.get_raw(old_row) };
                 let mut counts = self
                     .handle_counts
                     .lock()
                     .expect("World handle_counts: mutex poisoned");
-                crate::handle_ledger::report_value_swap(&mut counts, collect, old_ptr, new_ptr);
+                crate::handle_ledger::report_value_swap(
+                    &mut counts,
+                    collect,
+                    old_ptr,
+                    source.value_ptr(),
+                );
             }
 
             if let Some(t) = tracker.as_deref_mut() {
                 // Capture bytes before the value is moved into the column.
-                let len = std::mem::size_of::<T>();
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
+                // SAFETY: `value_ptr` points at a live value of `value_size`
+                // bytes, owned by `source` until `overwrite` below.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(source.value_ptr() as *const u8, source.value_size())
+                };
                 t.record_component_change(entity, cid, 0, bytes.to_vec());
             }
-            col.data[old_row] = value;
-            self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
-            // Subscription delivery (SceneDB#47): an in-place overwrite IS a
-            // real change to `(entity, T)`. Reported as `Inserted` -- from a
-            // subscriber's perspective this call made `T` present with a new
-            // value, exactly what the archetype-migration insert path below
-            // reports. One lock acquisition + one hash probe when anything
-            // watches the key; one `Option` check when nothing does.
-            if let Some(registry) = &self.subscriptions {
-                crate::subscriptions::lock(registry).record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Inserted,
-                );
-            }
+            source.overwrite(col.as_mut(), old_row);
+            self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
+            self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
             return;
         }
 
         // Archetype-graph edge cache (see `Archetype::add_edges`'s doc): a
         // transition already taken before is two Vec index reads, zero
-        // allocation, zero hashing -- the common case for any entity that
-        // repeatedly gains/loses the same component shape (tag toggling,
-        // pooled respawn, etc). Only a never-before-seen (old_arch_id, cid)
-        // pair pays for rebuilding the key and hashing it into
-        // `archetype_index`, and that cost is paid exactly once per pair,
-        // ever.
+        // allocation, zero hashing. Only a never-before-seen
+        // (old_arch_id, cid) pair pays for rebuilding the key and hashing it
+        // into `archetype_index`, once per pair, ever.
         let new_arch_id = match self.archetypes[old_arch_id.0 as usize].add_edge(cid) {
             Some(cached) => cached,
             None => {
-                let new_key = self.archetypes[old_arch_id.0 as usize].key.with::<T>();
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.with_id(cid);
                 let id = self.get_or_create_archetype(new_key);
                 self.archetypes[old_arch_id.0 as usize].set_add_edge(cid, id);
                 id
             }
         };
 
-        // Ensure Column<T> exists in the destination (may be empty).
-        let new_arch = &mut self.archetypes[new_arch_id.0 as usize];
-        let idx = cid.0 as usize;
-        if let Some(existing) = new_arch.columns.get(idx).and_then(|c| c.as_ref()) {
+        // Ensure the column exists in the destination (may be empty) before
+        // migrating, so every column length stays in sync.
+        Self::ensure_column(&mut self.archetypes[new_arch_id.0 as usize], &source);
+
+        // Push the entity + migrate all existing components, then push the
+        // new value; the destination entity vec has already grown by one.
+        self.migrate_row(entity, old_arch_id, old_row, new_arch_id);
+        self.push_new_value(new_arch_id, entity, source, &mut tracker);
+    }
+
+    /// Create `source`'s column in `arch` if it is missing.
+    fn ensure_column<S: InsertSource>(arch: &mut Archetype, source: &S) {
+        let cid = source.component_id();
+        if let Some(existing) = Self::get_erased(arch, cid) {
             debug_assert_eq!(
                 ErasedColumn::type_id(existing.as_ref()),
-                std::any::TypeId::of::<T>(),
-                "insert column type collision at {:?}",
-                cid,
+                source.value_type_id(),
+                "insert column type collision at {cid:?}",
             );
         } else {
-            Self::set_column(new_arch, cid, Box::new(Column::<T>::new()));
+            Self::set_column(arch, cid, source.new_column());
         }
+    }
 
-        // Phase 1: push entity + migrate all existing components.
-        // migrate_row pushes the entity to the destination first, then
-        // transfers every column from the source, then updates all slots.
-        self.migrate_row(entity, old_arch_id, old_row, new_arch_id);
+    /// Push the FIRST value of `source`'s component for `entity`, whose
+    /// entity row is already the last row of `arch_id`, and run every
+    /// first-insert write hook. Shared by [`Self::insert_core`]'s migration
+    /// path and bundle spawning ([`Self::push_new_component`]).
+    fn push_new_value<S: InsertSource>(
+        &mut self,
+        arch_id: ArchetypeId,
+        entity: Entity,
+        source: S,
+        tracker: &mut Option<&mut ChangeTracker>,
+    ) {
+        let cid = source.component_id();
 
-        // Phase 2: push the new value.  The destination entity vec has
-        // already grown by one, so this keeps all column lengths in sync.
-        let new_arch = &mut self.archetypes[new_arch_id.0 as usize];
-        {
-            let col_data = &mut new_arch.columns[idx]
-                .as_mut()
-                .unwrap()
-                .as_any_mut()
-                .downcast_mut::<Column<T>>()
-                .unwrap()
-                .data;
-            col_data.push(value);
-
-            // Handle-ledger acquisition (FIRST insert of `T` onto this
-            // entity): acquire every nonzero handle the freshly-pushed
-            // value carries. No swap comparison here by definition -- there
-            // is no old value of THIS component type to release (other
-            // components migrating alongside move verbatim and change no
-            // counts; handles are keyed by content, not row position).
-            // Reported from the pushed element (not the moved-out `value`,
-            // which is gone) so the event reflects committed state.
-            if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
-                let new_ptr = col_data.last().expect("just pushed above") as *const T as *const ();
-                let mut counts = self
-                    .handle_counts
-                    .lock()
-                    .expect("World handle_counts: mutex poisoned");
-                crate::handle_ledger::report_value_acquire(&mut counts, collect, new_ptr);
+        // GPU mirror (see `insert_core`'s in-place branch). First time this
+        // entity gets ANY `#[gpu]`-bearing component: tell the liveness
+        // mirror there is now something on the GPU at this row that needs a
+        // generation entry -- see `GenerationMirror::note_gpu_bearing_insert`.
+        // `is_new_insert` is true, so `Once`-mode fields write here.
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            if let Some(dispatches) = crate::gpu::world_mirror::dispatch_for(cid) {
+                mirror
+                    .generations()
+                    .note_gpu_bearing_insert(entity.index(), entity.generation());
+                for dispatch in dispatches {
+                    dispatch(mirror, entity.index(), source.value_ptr(), true);
+                }
             }
         }
 
-        if let Some(t) = tracker {
-            // The value was moved into the column, so we can't read it anymore.
-            // Record the change without field data — R2 schema encoding will handle it.
+        let arch = &mut self.archetypes[arch_id.0 as usize];
+        Self::ensure_column(arch, &source);
+        let col = Self::get_erased_mut(arch, cid).expect("column ensured above");
+        source.push(col.as_mut());
+
+        // Handle-ledger acquisition: acquire every nonzero handle the
+        // freshly-pushed value carries. No swap comparison by definition --
+        // there is no old value of this component on this entity. Reported
+        // from the pushed element so the event reflects committed state.
+        if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
+            // SAFETY: the column is non-empty; its last row was just pushed.
+            let new_ptr = unsafe { col.get_raw(col.len() - 1) };
+            let mut counts = self
+                .handle_counts
+                .lock()
+                .expect("World handle_counts: mutex poisoned");
+            crate::handle_ledger::report_value_acquire(&mut counts, collect, new_ptr);
+        }
+
+        if let Some(t) = tracker.as_deref_mut() {
+            // The value was moved into the column; record the change without
+            // field data -- R2 schema encoding handles it.
             t.record_component_change(entity, cid, 0, Vec::new());
         }
 
-        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
-
-        // Subscription delivery (SceneDB#47): same contract as the in-place
-        // insert path above -- `T` is now present on `entity` with a new
-        // value. See `insert_inner`'s other delivery site for the cost shape.
-        if let Some(registry) = &self.subscriptions {
-            crate::subscriptions::lock(registry).record(
-                entity,
-                cid,
-                crate::subscriptions::ComponentChangeKind::Inserted,
-            );
-        }
+        self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
+        self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
     }
 
     /// Remove a component from an entity, returning its value.
@@ -1418,70 +1437,119 @@ impl World {
         entity: Entity,
         tracker: Option<&mut ChangeTracker>,
     ) -> Option<T> {
+        // `remove_inner<T>` knows the concrete type, so the value comes out
+        // of its `Column<T>` by a direct typed `swap_remove` -- no `Box`
+        // round trip.
+        self.remove_core(
+            entity,
+            crate::component::component_id::<T>(),
+            tracker,
+            |col, row| {
+                col.as_any_mut()
+                    .downcast_mut::<Column<T>>()
+                    .expect("column type matches its ComponentId")
+                    .data
+                    .swap_remove(row)
+            },
+            |value| value as *const T as *const (),
+            |value: &T| -> &dyn Any { value },
+        )
+    }
+
+    /// Remove `component` from `entity` without knowing its type, returning
+    /// the owned value boxed.
+    ///
+    /// Runs the same removal path as [`Self::remove`]: the GPU row is
+    /// cleared and var-len allocations released, the handle ledger releases
+    /// the value's handles, and the change tracker and change journals
+    /// record the removal. `None` if `entity` is dead or
+    /// does not have `component`.
+    pub fn remove_dyn(
+        &mut self,
+        entity: Entity,
+        component: ComponentId,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        profiling::profile_scope_loc!("World::remove_dyn");
+        let take = |col: &mut dyn ErasedColumn, row: usize| col.swap_remove_boxed(row);
+        let ptr = |value: &Box<dyn Any + Send + Sync>| &**value as *const dyn Any as *const ();
+        fn any(value: &Box<dyn Any + Send + Sync>) -> &dyn Any {
+            &**value
+        }
+        if let Some(shared) = self.change_tracker.clone() {
+            let mut guard = shared.lock();
+            self.remove_core(entity, component, Some(&mut guard), take, ptr, any)
+        } else {
+            self.remove_core(entity, component, None, take, ptr, any)
+        }
+    }
+
+    /// The one removal path, shared by [`Self::remove`] and
+    /// [`Self::remove_dyn`]. `take` moves the value out of its column;
+    /// `value_ptr` points at the moved-out value for the handle ledger;
+    /// `value_any` lends it to object subscribers.
+    fn remove_core<R>(
+        &mut self,
+        entity: Entity,
+        cid: ComponentId,
+        tracker: Option<&mut ChangeTracker>,
+        take: impl FnOnce(&mut dyn ErasedColumn, usize) -> R,
+        value_ptr: impl FnOnce(&R) -> *const (),
+        value_any: impl FnOnce(&R) -> &dyn Any,
+    ) -> Option<R> {
         if !self.is_alive(entity) {
             return None;
         }
+        // Resolved before the removal: the component being removed may be
+        // what places `entity` in its object.
+        let subscribers = self.object_subscribers(entity);
         let (old_arch_id, old_row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
         };
-        let cid = crate::component::component_id::<T>();
         if !Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid) {
             return None;
         }
 
-        // Var-len GPU-pool release for the ONE component type being
-        // removed (SceneDB#57) -- `T`'s lifetime on this entity is ending,
-        // same trigger as the despawn-wide version above, scoped to just
-        // this component. Keyed by `entity.index()`, same reasoning.
+        // Var-len GPU-pool release and GPU row clear for the ONE component
+        // type being removed (SceneDB#57) -- its lifetime on this entity is
+        // ending, same trigger as the despawn-wide version, scoped to just
+        // this component. Keyed by `entity.index()`.
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            if let Some(release) = crate::gpu::world_mirror::release_dispatch_for(cid) {
+            for release in crate::gpu::world_mirror::release_dispatch_for(cid).unwrap_or_default() {
                 release(mirror, entity.index());
             }
-            if let Some(clear) = crate::gpu::world_mirror::clear_dispatch_for(cid) {
+            for clear in crate::gpu::world_mirror::clear_dispatch_for(cid).unwrap_or_default() {
                 clear(mirror, entity.index());
             }
         }
 
-        // Pull the value out of the column. `remove_inner<T>` already knows
-        // the concrete type -- unlike `migrate_row`'s type-erased column
-        // carry-over (which genuinely doesn't know the OTHER components'
-        // types at compile time), there is no reason to route the value
-        // being returned through the erased `swap_remove_erased`/
-        // `Box::from_raw` path at all. That path heap-allocates a `Box`
-        // just to hand back a type-erased pointer this call immediately
-        // downcasts and moves out of anyway -- a wasted allocator round
-        // trip for every single `World::remove` call. A direct, safe,
-        // typed `Vec::swap_remove` on the concrete `Column<T>` is both
-        // simpler and allocation-free.
-        let removed_val = self.archetypes[old_arch_id.0 as usize]
-            .column_mut::<T>()
-            .data
-            .swap_remove(old_row);
+        let removed_val = {
+            let col = Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                .expect("column presence checked above");
+            take(col.as_mut(), old_row)
+        };
 
-        // Handle-ledger release: `T`'s lifetime on this entity just ended,
-        // so every nonzero handle it carried loses one reference -- the
-        // exact inverse of insert_inner's first-insert acquisition. Fires
-        // before the migration below (which only moves OTHER components'
-        // values verbatim and is irrelevant to counts), from the extracted
-        // value itself.
+        // Handle-ledger release: the component's lifetime on this entity just
+        // ended, so every nonzero handle it carried loses one reference --
+        // the exact inverse of the first-insert acquisition. Fires before the
+        // migration below (which only moves OTHER components' values
+        // verbatim), from the extracted value itself.
         if let Some(collect) = crate::handle_ledger::collect_fn_for(cid) {
-            let value_ptr = &removed_val as *const T as *const ();
+            let ptr = value_ptr(&removed_val);
             let mut counts = self
                 .handle_counts
                 .lock()
                 .expect("World handle_counts: mutex poisoned");
-            crate::handle_ledger::report_value_release(&mut counts, collect, value_ptr);
+            crate::handle_ledger::report_value_release(&mut counts, collect, ptr);
         }
 
-        // Archetype-graph edge cache -- see `insert_inner`'s identical use
-        // of `add_edge`/`Archetype::add_edges`'s doc for the shared
-        // rationale.
+        // Archetype-graph edge cache -- see `insert_core`'s identical use of
+        // `add_edge`.
         let new_arch_id = match self.archetypes[old_arch_id.0 as usize].remove_edge(cid) {
             Some(cached) => cached,
             None => {
-                let new_key = self.archetypes[old_arch_id.0 as usize].key.without::<T>();
+                let new_key = self.archetypes[old_arch_id.0 as usize].key.without_id(cid);
                 let id = self.get_or_create_archetype(new_key);
                 self.archetypes[old_arch_id.0 as usize].set_remove_edge(cid, id);
                 id
@@ -1489,33 +1557,26 @@ impl World {
         };
 
         // Migrate everything except the removed component.
-        // migrate_row_skip pushes the entity first, migrates all columns
-        // except the skipped one, then updates all slots.
         self.migrate_row_skip(entity, old_arch_id, old_row, new_arch_id, cid);
 
         if let Some(t) = tracker {
             t.record_component_change(entity, cid, 0, Vec::new());
             // Unambiguous counterpart to the `record_component_change` call
-            // above -- see `ChangeTracker::component_removals`'s doc for why
-            // a consumer that specifically needs "did T's lifetime end here"
-            // (not just "something about (entity, T) changed") drains this
-            // list instead.
+            // above -- see `ChangeTracker::component_removals`'s doc.
             t.record_component_removal(entity, cid);
         }
 
-        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
-
-        // Subscription delivery (SceneDB#47): the component's lifetime on
-        // this entity ended -- subscribers must see it so a cache-until-
-        // signaled consumer can drop its stale snapshot. The subscription
-        // itself stays armed: if `T` is inserted again later, that insert
-        // fires and the subscriber learns of the resurrection without
-        // resubscribing.
-        if let Some(registry) = &self.subscriptions {
-            crate::subscriptions::lock(registry).record(
-                entity,
-                cid,
-                crate::subscriptions::ComponentChangeKind::Removed,
+        self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Removed);
+        if let Some((object, callbacks)) = subscribers {
+            crate::object_subscriptions::deliver(
+                &callbacks,
+                object,
+                crate::object_subscriptions::ObjectChange {
+                    entity,
+                    component: cid,
+                    kind: crate::change_journal::ComponentChangeKind::Removed,
+                    value: Some(value_any(&removed_val)),
+                },
             );
         }
 
@@ -1558,6 +1619,7 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
+        let subscribers = self.object_subscribers(entity);
         let value =
             Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
                 c.as_any_mut()
@@ -1569,13 +1631,14 @@ impl World {
                 #[cfg(feature = "gpu")]
                 gpu_mirror: self.gpu_mirror.as_ref(),
                 change_tracker: self.change_tracker.as_ref(),
-                subscriptions: self.subscriptions.as_ref(),
-                change_journals: &self.change_journals,
+                                change_journals: &self.change_journals,
                 handle_counts: &self.handle_counts,
+                subscribers,
             },
             entity,
             cid,
             &*value as *const T as *const (),
+            &*value as &dyn Any as *const dyn Any,
         );
         Some(Mut::new(value, hooks))
     }
@@ -1607,11 +1670,12 @@ impl World {
     }
 
     /// Mutable, type-erased access to `entity`'s `component`. The returned
-    /// [`MutDyn`] fires write hooks (GPU mirror, change tracker, subscriptions,
+    /// [`MutDyn`] fires write hooks (GPU mirror, change tracker,
     /// change journals, handle ledger) when mutable access is requested. Use
     /// `downcast_ref` for reads that should not report a mutation.
     pub fn get_dyn_mut(&mut self, entity: Entity, component: ComponentId) -> Option<MutDyn<'_>> {
         let (arch, row) = self.locate(entity)?;
+        let subscribers = self.object_subscribers(entity);
         let value = Self::get_erased_mut(&mut self.archetypes[arch.0 as usize], component)
             .map(|col| col.get_any_mut(row))?;
         let value_ptr: *const dyn Any = &*value;
@@ -1620,13 +1684,14 @@ impl World {
                 #[cfg(feature = "gpu")]
                 gpu_mirror: self.gpu_mirror.as_ref(),
                 change_tracker: self.change_tracker.as_ref(),
-                subscriptions: self.subscriptions.as_ref(),
-                change_journals: &self.change_journals,
+                                change_journals: &self.change_journals,
                 handle_counts: &self.handle_counts,
+                subscribers,
             },
             entity,
             component,
             value_ptr as *const (),
+            value_ptr,
         );
         Some(MutDyn::new(value, hooks))
     }
@@ -1778,19 +1843,13 @@ impl World {
             return Ok(());
         };
         let result = decode_into(col.as_mut(), row, bytes);
-        // Subscription delivery (SceneDB#47): `Delta::apply` writing remote
-        // state into this World is a real mutation -- local subscribers
-        // (live editor UI reading the same replicated World) must see it.
-        // Only a successful decode wrote anything; a malformed-bytes `Err`
-        // changed nothing.
+        // `Delta::apply` writing remote state into this World is a real
+        // mutation: change-journal readers (live editor UI reading the same
+        // replicated World) must see it. A malformed-bytes `Err` wrote
+        // nothing.
         if result.is_ok() {
-            if let Some(registry) = &self.subscriptions {
-                crate::subscriptions::lock(registry).record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Mutated,
-                );
-            }
+            self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Mutated);
+            self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Mutated);
         }
         result
     }
@@ -1835,13 +1894,11 @@ impl World {
     /// "phase 1 migrate, phase 2 push new value" ordering does for a single
     /// component).
     ///
-    /// Ensures the destination column exists (creating an empty one on first
-    /// use, same as `insert_inner`), runs the identical GPU-mirror dispatch
-    /// and liveness-mirror bookkeeping `insert_inner` runs for a
-    /// new-component insert (`is_new_insert = true` unconditionally --
-    /// every component in a bundle handed to a freshly spawned entity is,
-    /// by construction, new to it), then records the change in `tracker`
-    /// if present.
+    /// Runs through [`Self::push_new_value`], the same first-insert path
+    /// `insert`'s migration branch uses, so a bundle component gets every
+    /// first-insert hook a single insert gets (GPU mirror with
+    /// `is_new_insert = true`, liveness, handle-ledger acquisition, change
+    /// tracker and journals).
     pub(crate) fn push_new_component<T: Component>(
         &mut self,
         arch_id: ArchetypeId,
@@ -1849,63 +1906,9 @@ impl World {
         value: T,
         tracker: &mut Option<&mut ChangeTracker>,
     ) {
-        let cid = crate::component::component_id::<T>();
-
-        #[cfg(feature = "gpu")]
-        if let Some(mirror) = &self.gpu_mirror {
-            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
-                mirror
-                    .generations()
-                    .note_gpu_bearing_insert(entity.index(), entity.generation());
-                dispatch(
-                    mirror,
-                    entity.index(),
-                    &value as *const T as *const (),
-                    true,
-                );
-            }
-        }
-
-        let arch = &mut self.archetypes[arch_id.0 as usize];
-        let idx = cid.0 as usize;
-        if arch.columns.get(idx).and_then(|c| c.as_ref()).is_none() {
-            Self::set_column(arch, cid, Box::new(Column::<T>::new()));
-        }
-        self.archetypes[arch_id.0 as usize].columns[idx]
-            .as_mut()
-            .unwrap()
-            .as_any_mut()
-            .downcast_mut::<Column<T>>()
-            .unwrap()
-            .data
-            .push(value);
-
-        if let Some(t) = tracker.as_deref_mut() {
-            t.record_component_change(entity, cid, 0, Vec::new());
-        }
-
-        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
-
-        // Subscription delivery (SceneDB#47): a bundle component pushed
-        // onto a freshly spawned entity is an insert like any other -- same
-        // contract and cost shape as `insert_inner`'s two delivery sites.
-        if let Some(registry) = &self.subscriptions {
-            crate::subscriptions::lock(registry).record(
-                entity,
-                cid,
-                crate::subscriptions::ComponentChangeKind::Inserted,
-            );
-        }
+        self.push_new_value(arch_id, entity, TypedInsert(value), tracker);
     }
 
-    /// Reserve capacity for `additional` more `T` values in `arch_id`'s
-    /// column, creating the (empty) column first if this archetype doesn't
-    /// have one yet. Used by [`crate::bundle::Bundle::reserve_columns`]
-    /// (via [`World::reserve_bundle`]) so a tight `spawn_bundle` loop over a
-    /// known entity count doesn't pay for repeated `Vec` capacity-doubling
-    /// on every column the bundle touches -- the same reason
-    /// [`World::reserve_entities`] exists for the empty archetype's own
-    /// entity list.
     pub(crate) fn reserve_component_column<T: Component>(
         &mut self,
         arch_id: ArchetypeId,
@@ -2130,5 +2133,126 @@ impl World {
 impl Default for World {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Why [`World::insert_dyn`] refused a value. Each variant hands the value
+/// back untouched.
+#[derive(Debug)]
+pub enum InsertDynError {
+    /// The target entity is not alive.
+    DeadEntity {
+        entity: Entity,
+        value: Box<dyn Any + Send + Sync>,
+    },
+    /// The value's concrete type was never registered with
+    /// [`crate::component::register_component`].
+    Unregistered { value: Box<dyn Any + Send + Sync> },
+}
+
+impl InsertDynError {
+    /// The value that was not inserted.
+    pub fn into_value(self) -> Box<dyn Any + Send + Sync> {
+        match self {
+            Self::DeadEntity { value, .. } | Self::Unregistered { value } => value,
+        }
+    }
+}
+
+impl std::fmt::Display for InsertDynError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadEntity { entity, .. } => write!(f, "insert_dyn on dead entity {entity}"),
+            Self::Unregistered { .. } => f.write_str(
+                "insert_dyn of a type never registered with pulsar_scenedb::component::register_component",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InsertDynError {}
+
+/// The parts of an insert that differ between a typed value and an erased
+/// boxed one. Everything else -- every write hook -- lives once, in
+/// [`World::insert_core`] and [`World::push_new_value`].
+trait InsertSource {
+    fn component_id(&self) -> ComponentId;
+    fn value_type_id(&self) -> std::any::TypeId;
+    /// Points at the value while `self` still owns it.
+    fn value_ptr(&self) -> *const ();
+    fn value_size(&self) -> usize;
+    fn new_column(&self) -> Box<dyn ErasedColumn>;
+    /// Replace the value at `row` of `col`, dropping the old one.
+    fn overwrite(self, col: &mut dyn ErasedColumn, row: usize);
+    fn push(self, col: &mut dyn ErasedColumn);
+}
+
+struct TypedInsert<T>(T);
+
+impl<T: Component> InsertSource for TypedInsert<T> {
+    #[inline]
+    fn component_id(&self) -> ComponentId {
+        crate::component::component_id::<T>()
+    }
+    fn value_type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<T>()
+    }
+    #[inline]
+    fn value_ptr(&self) -> *const () {
+        &self.0 as *const T as *const ()
+    }
+    fn value_size(&self) -> usize {
+        std::mem::size_of::<T>()
+    }
+    fn new_column(&self) -> Box<dyn ErasedColumn> {
+        Box::new(Column::<T>::new())
+    }
+    #[inline]
+    fn overwrite(self, col: &mut dyn ErasedColumn, row: usize) {
+        col.as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .expect("column type matches its ComponentId")
+            .data[row] = self.0;
+    }
+    #[inline]
+    fn push(self, col: &mut dyn ErasedColumn) {
+        col.as_any_mut()
+            .downcast_mut::<Column<T>>()
+            .expect("column type matches its ComponentId")
+            .data
+            .push(self.0);
+    }
+}
+
+struct ErasedInsert {
+    info: crate::component::ErasedComponentInfo,
+    value: Box<dyn Any + Send + Sync>,
+}
+
+impl InsertSource for ErasedInsert {
+    fn component_id(&self) -> ComponentId {
+        self.info.id
+    }
+    fn value_type_id(&self) -> std::any::TypeId {
+        (*self.value).type_id()
+    }
+    fn value_ptr(&self) -> *const () {
+        &*self.value as *const (dyn Any + Send + Sync) as *const ()
+    }
+    fn value_size(&self) -> usize {
+        std::mem::size_of_val(&*self.value)
+    }
+    fn new_column(&self) -> Box<dyn ErasedColumn> {
+        (self.info.new_column)()
+    }
+    fn overwrite(self, col: &mut dyn ErasedColumn, row: usize) {
+        let old = col
+            .replace_boxed(row, self.value)
+            .unwrap_or_else(|_| unreachable!("the ComponentId was resolved from this value's TypeId"));
+        drop(old);
+    }
+    fn push(self, col: &mut dyn ErasedColumn) {
+        col.push_boxed(self.value)
+            .unwrap_or_else(|_| unreachable!("the ComponentId was resolved from this value's TypeId"));
     }
 }
