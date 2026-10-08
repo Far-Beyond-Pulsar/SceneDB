@@ -368,17 +368,16 @@ impl World {
     /// Append every change recorded for `cursor`'s component type since the
     /// cursor's last read to `out`, in order, and advance the cursor. Other
     /// readers are unaffected. Returns [`crate::change_journal::ChangeRead::Overflowed`]
-    /// (appending nothing) when the journal evicted unread entries; rescan
-    /// in that case.
+    /// (appending nothing) when the journal evicted unread entries, or once
+    /// for a cursor opened on another `World` (rebinding it here); rescan in
+    /// that case.
     pub fn read_changes(
         &self,
         cursor: &mut crate::change_journal::ChangeCursor,
         out: &mut Vec<crate::change_journal::ComponentChange>,
     ) -> crate::change_journal::ChangeRead {
-        match self.change_journals.get() {
-            Some(journals) => crate::change_journal::lock(journals).read(cursor, out),
-            None => crate::change_journal::ChangeRead::Overflowed,
-        }
+        let journals = self.change_journals.get_or_init(Default::default);
+        crate::change_journal::lock(journals).read(cursor, out)
     }
 
     #[inline]
