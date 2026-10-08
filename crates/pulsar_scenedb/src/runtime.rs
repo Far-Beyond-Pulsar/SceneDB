@@ -273,6 +273,60 @@ impl<F: Copy + 'static> AppendTable<F> {
     }
 }
 
+/// A list of `'static` registrations: one copy's `inventory` collection,
+/// extended by attached copies' (see the module doc). For the world crates
+/// above SceneDB, whose runtimes keep their registries this way. Readers
+/// load one pointer; extending replaces the list and leaks the old one
+/// (once per plugin load, so bounded).
+pub struct AppendList<T: 'static> {
+    list: AtomicPtr<Vec<&'static T>>,
+    write: Mutex<()>,
+    build: fn() -> Vec<&'static T>,
+}
+
+impl<T: 'static> AppendList<T> {
+    /// A list that starts as `build()` (typically `inventory::iter` of this
+    /// copy) on first use.
+    pub const fn new(build: fn() -> Vec<&'static T>) -> Self {
+        Self {
+            list: AtomicPtr::new(std::ptr::null_mut()),
+            write: Mutex::new(()),
+            build,
+        }
+    }
+
+    fn get_locked(&'static self) -> &'static [&'static T] {
+        let list = self.list.load(Ordering::Acquire);
+        if !list.is_null() {
+            // SAFETY: lists are leaked, never freed.
+            return unsafe { &*list };
+        }
+        let built = Box::leak(Box::new((self.build)()));
+        self.list.store(built, Ordering::Release);
+        built
+    }
+
+    /// Every registration, in link order, then in the order copies attached.
+    pub fn get(&'static self) -> &'static [&'static T] {
+        let list = self.list.load(Ordering::Acquire);
+        if !list.is_null() {
+            // SAFETY: lists are leaked, never freed.
+            return unsafe { &*list };
+        }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        self.get_locked()
+    }
+
+    /// Append `entries` after the existing ones.
+    pub fn extend(&'static self, entries: &[&'static T]) {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = self.get_locked().to_vec();
+        next.extend_from_slice(entries);
+        self.list
+            .store(Box::leak(Box::new(next)), Ordering::Release);
+    }
+}
+
 /// The state this copy owns, and the functions its [`Runtime`] carries.
 /// Only reached through [`runtime`].
 mod own {
