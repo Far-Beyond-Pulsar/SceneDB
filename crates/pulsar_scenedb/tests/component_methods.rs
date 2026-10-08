@@ -141,20 +141,18 @@ fn reports_errors() {
 fn mutating_methods_are_observed_and_reads_are_not() {
     let mut world = World::new();
     let e = spawn(&mut world, 10.0);
-    world.subscribe::<Health>(e).unwrap();
     let mut journal = world.open_change_cursor::<Health>();
     let health = component_id::<Health>();
+    let mut changes = Vec::new();
 
     world.call_component_method(e, health, "current", &mut []).unwrap();
-    assert!(world.take_component_change_events().is_empty());
+    assert_eq!(world.read_changes(&mut journal, &mut changes), ChangeRead::Complete);
+    assert!(changes.is_empty());
 
     world.call_component_method(e, health, "damage", &mut [Box::new(1.0f32)]).unwrap();
-    let events = world.take_component_change_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, ComponentChangeKind::Mutated);
-    let mut changes = Vec::new();
     assert_eq!(world.read_changes(&mut journal, &mut changes), ChangeRead::Complete);
     assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, ComponentChangeKind::Mutated);
 }
 
 /// #843: a call the argument check rejects must not look like a write.
@@ -162,7 +160,6 @@ fn mutating_methods_are_observed_and_reads_are_not() {
 fn rejected_calls_report_no_mutation() {
     let mut world = World::new();
     let e = spawn(&mut world, 10.0);
-    world.subscribe::<Health>(e).unwrap();
     let mut journal = world.open_change_cursor::<Health>();
     let health = component_id::<Health>();
 
@@ -171,10 +168,9 @@ fn rejected_calls_report_no_mutation() {
     let wrong_count = world.call_component_method(e, health, "damage", &mut []).unwrap_err();
     assert!(matches!(wrong_count, ComponentCallError::Call(CallError::ArgCount { expected: 1, found: 0 })));
 
-    assert!(world.take_component_change_events().is_empty(), "rejected calls fire no subscription event");
     let mut changes = Vec::new();
     assert_eq!(world.read_changes(&mut journal, &mut changes), ChangeRead::Complete);
-    assert!(changes.is_empty(), "nor a journal entry");
+    assert!(changes.is_empty(), "rejected calls record no journal entry");
     assert_eq!(world.get::<Health>(e).unwrap().value, 10.0);
 }
 
@@ -183,26 +179,31 @@ fn rejected_calls_report_no_mutation() {
 fn mut_dyn_reports_only_what_was_written() {
     let mut world = World::new();
     let e = spawn(&mut world, 10.0);
-    world.subscribe::<Health>(e).unwrap();
+    let mut journal = world.open_change_cursor::<Health>();
     let health = component_id::<Health>();
+    let mut written = |world: &World| {
+        let mut changes = Vec::new();
+        assert_eq!(world.read_changes(&mut journal, &mut changes), ChangeRead::Complete);
+        changes.len()
+    };
 
     {
         let guard = world.get_dyn_mut(e, health).unwrap();
         assert_eq!(guard.downcast_ref::<Health>().unwrap().value, 10.0);
         assert!(guard.downcast_ref::<Unscripted>().is_none());
     }
-    assert!(world.take_component_change_events().is_empty(), "downcast_ref is a read");
+    assert_eq!(written(&world), 0, "downcast_ref is a read");
 
     {
         let mut guard = world.get_dyn_mut(e, health).unwrap();
         assert!(guard.downcast_mut::<Unscripted>().is_none());
     }
-    assert!(world.take_component_change_events().is_empty(), "a failed downcast is not a write");
+    assert_eq!(written(&world), 0, "a failed downcast is not a write");
 
     {
         let mut guard = world.get_dyn_mut(e, health).unwrap();
         guard.downcast_mut::<Health>().unwrap().value = 1.0;
     }
-    assert_eq!(world.take_component_change_events().len(), 1);
+    assert_eq!(written(&world), 1);
     assert_eq!(world.get::<Health>(e).unwrap().value, 1.0);
 }

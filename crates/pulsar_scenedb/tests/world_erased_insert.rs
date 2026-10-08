@@ -1,7 +1,7 @@
 //! Type-erased insertion and removal (`World::insert_dyn`,
 //! `World::remove_dyn`) run the same write path as typed `insert`/`remove`:
-//! the same stored value, archetype, handle-ledger counts, change-journal
-//! entries and subscription events.
+//! the same stored value, archetype, handle-ledger counts and change-journal
+//! entries.
 
 use pulsar_scenedb::handle_ledger::HandleId;
 use pulsar_scenedb::{
@@ -33,7 +33,6 @@ struct Observed {
     label: Option<String>,
     asset_refs: i64,
     journal: Vec<(ComponentChangeKind,)>,
-    events: Vec<ComponentChangeKind>,
 }
 
 fn observe(world: &mut World, e: pulsar_scenedb::Entity, cursor: &mut pulsar_scenedb::ChangeCursor) -> Observed {
@@ -44,7 +43,6 @@ fn observe(world: &mut World, e: pulsar_scenedb::Entity, cursor: &mut pulsar_sce
         label: world.get::<Label>(e).map(|l| l.0.clone()),
         asset_refs: world.handle_ref_count(HandleId(7)) + world.handle_ref_count(HandleId(8)) * 100,
         journal: changes.iter().map(|c| (c.kind,)).collect(),
-        events: world.take_component_change_events().into_iter().map(|e| e.kind).collect(),
     }
 }
 
@@ -59,8 +57,6 @@ fn erased_insert_replace_and_remove_match_typed_writes() {
     let ee = erased.spawn();
     // Same entity index in both worlds, so the observations are comparable.
     assert_eq!(te, ee);
-    typed.subscribe::<Mesh>(te).unwrap();
-    erased.subscribe::<Mesh>(ee).unwrap();
     let mut tc = typed.open_change_cursor::<Mesh>();
     let mut ec = erased.open_change_cursor::<Mesh>();
 

@@ -69,6 +69,7 @@ pub mod bundle;
 pub mod cell;
 pub mod cell_type;
 pub mod change_journal;
+pub mod object_subscriptions;
 pub mod component_methods;
 pub mod component_ref;
 pub mod mut_guard;
@@ -88,7 +89,6 @@ pub mod schedule;
 pub mod simd;
 pub mod snapshot;
 pub mod spatial;
-pub mod subscriptions;
 pub mod time;
 pub mod token;
 pub mod world;
@@ -113,7 +113,8 @@ pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use bundle::Bundle;
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
-pub use change_journal::{ChangeCursor, ChangeRead, ComponentChange};
+pub use change_journal::{ChangeCursor, ChangeRead, ComponentChange, ComponentChangeKind};
+pub use object_subscriptions::{ObjectChange, ObjectEvent, SubscriptionId};
 pub use component::{component_id, register_component, Component, ComponentId};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
@@ -170,7 +171,6 @@ pub use registry::{HandleRegistry, NULL_ROW};
 pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
 pub use schedule::Schedule;
 pub use snapshot::{LivenessSnapshot, RevocationFlag};
-pub use subscriptions::{ComponentChangeEvent, ComponentChangeKind, SubscriptionId};
 pub use spatial::{
     Aabb, Frustum, InstanceInfo, SpatialCell, INSTANCE_INFO_COLUMN, SPATIAL_COLUMNS,
     TRANSFORM_COLUMN,

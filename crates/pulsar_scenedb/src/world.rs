@@ -105,13 +105,13 @@ pub struct World {
     inspector_request_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>>,
     #[cfg(feature = "telemetry")]
     inspector_response_callback: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-    /// Per-`(Entity, ComponentId)` subscription wiring (see
-    /// [`crate::subscriptions`] -- SceneDB#47), attached the same way as
-    /// `change_tracker` above. `None` (the default) means every mutating
-    /// path costs exactly one `Option::is_none()` check extra -- no registry,
-    /// no allocation, nothing on any drop path. Not feature-gated: live-UI
-    /// consumers are always available (CONTRACTS C0).
-    subscriptions: Option<crate::subscriptions::SubscriptionRegistryHandle>,
+    /// Object subscriptions (see [`crate::object_subscriptions`]): views
+    /// following one object's writes. `None` until the first subscription,
+    /// so an unwatched world pays one `Option` check per write.
+    object_subscriptions: Option<crate::object_subscriptions::ObjectSubscriptionsHandle>,
+    /// Maps an entity to the object its components belong to, for object
+    /// subscriptions ([`Self::set_object_resolver`]).
+    object_resolver: crate::object_subscriptions::ObjectResolver,
     /// Multi-reader change journals (see [`crate::change_journal`]). Created
     /// by the first [`World::open_change_cursor`]; until then every mutating
     /// path pays one atomic load for it. `OnceLock` rather than `Option` so a
@@ -129,9 +129,9 @@ pub struct World {
     /// fields) costs nothing further. `Arc<Mutex<..>>`, not a bare
     /// `HashMap`, purely so [`Mut`]'s drop-time hook can hold an owned
     /// handle independent of `self`'s borrow -- same reason
-    /// `change_tracker`/`subscriptions` above are `Arc`-wrapped, same
+    /// `change_tracker` above is `Arc`-wrapped, same
     /// `std::sync::Mutex` + `.lock().expect(..)` convention as
-    /// `SharedChangeTracker`/`SubscriptionRegistryHandle`. Not
+    /// `SharedChangeTracker`. Not
     /// feature-gated: handles are a domain-neutral concept with no GPU
     /// dependency whatsoever.
     handle_counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
@@ -164,7 +164,8 @@ impl World {
             inspector_request_queue: None,
             #[cfg(feature = "telemetry")]
             inspector_response_callback: None,
-            subscriptions: None,
+            object_subscriptions: None,
+            object_resolver: crate::object_subscriptions::entity_is_its_own_object,
             change_journals: std::sync::OnceLock::new(),
             handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::handle_ledger::HandleCounts::default(),
@@ -380,139 +381,91 @@ impl World {
         crate::change_journal::lock(journals).read(cursor, out)
     }
 
+    // ── Object subscriptions ────────────────────────────────────────────────
+
+    /// Set how an entity maps to the object its components belong to (see
+    /// [`crate::object_subscriptions`]). The default maps every entity to
+    /// itself. A host keeping an object's components on their own entities
+    /// maps those to their owner, so an object subscription covers them.
+    pub fn set_object_resolver(&mut self, resolver: crate::object_subscriptions::ObjectResolver) {
+        self.object_resolver = resolver;
+    }
+
+    /// The object `entity` belongs to, by this world's resolver.
+    pub fn object_of(&self, entity: Entity) -> Entity {
+        (self.object_resolver)(self, entity)
+    }
+
+    /// Call `callback` inside every write to a component of `object` (the
+    /// object entity and, through the resolver, its component entities),
+    /// with the component's new value; and once with
+    /// [`ObjectEvent::Despawned`](crate::object_subscriptions::ObjectEvent::Despawned)
+    /// when the object despawns, which ends the subscription. `None` for a
+    /// dead `object`. See [`crate::object_subscriptions`] for the contract:
+    /// the callback must not reach for the `World`.
+    pub fn subscribe_object(
+        &mut self,
+        object: Entity,
+        callback: impl Fn(Entity, &crate::object_subscriptions::ObjectEvent<'_>) + Send + Sync + 'static,
+    ) -> Option<crate::object_subscriptions::SubscriptionId> {
+        if !self.is_alive(object) {
+            return None;
+        }
+        let handle = self.object_subscriptions.get_or_insert_with(Default::default);
+        Some(crate::object_subscriptions::lock(handle).subscribe(object, std::sync::Arc::new(callback)))
+    }
+
+    /// End a subscription. `false` if it already ended (unsubscribed, or its
+    /// object despawned).
+    pub fn unsubscribe_object(&mut self, id: crate::object_subscriptions::SubscriptionId) -> bool {
+        match &self.object_subscriptions {
+            Some(handle) => crate::object_subscriptions::lock(handle).unsubscribe(id),
+            None => false,
+        }
+    }
+
+    /// The object `entity` belongs to and the callbacks watching it, or
+    /// `None` when nobody watches it (always, in a world without
+    /// subscriptions).
+    fn object_subscribers(
+        &self,
+        entity: Entity,
+    ) -> Option<(Entity, Vec<crate::object_subscriptions::ObjectCallback>)> {
+        let handle = self.object_subscriptions.as_ref()?;
+        if crate::object_subscriptions::lock(handle).is_empty() {
+            return None;
+        }
+        let object = (self.object_resolver)(self, entity);
+        let callbacks = crate::object_subscriptions::lock(handle).callbacks(object);
+        (!callbacks.is_empty()).then_some((object, callbacks))
+    }
+
+    /// Tell `entity`'s object subscribers that `component` changed; the
+    /// value delivered is the stored one.
+    fn notify_object_write(&self, entity: Entity, component: ComponentId, kind: crate::change_journal::ComponentChangeKind) {
+        if let Some((object, callbacks)) = self.object_subscribers(entity) {
+            crate::object_subscriptions::deliver(
+                &callbacks,
+                object,
+                crate::object_subscriptions::ObjectChange {
+                    entity,
+                    component,
+                    kind,
+                    value: self.get_dyn(entity, component),
+                },
+            );
+        }
+    }
+
     #[inline]
     fn record_journal(
         &self,
         entity: Entity,
         component: ComponentId,
-        kind: crate::subscriptions::ComponentChangeKind,
+        kind: crate::change_journal::ComponentChangeKind,
     ) {
         if let Some(journals) = self.change_journals.get() {
             crate::change_journal::lock(journals).record(entity, component, kind);
-        }
-    }
-
-    // ── Component subscriptions (SceneDB#47) ────────────────────────────────
-
-    /// Subscribe to changes of component `T` on `entity`: every subsequent
-    /// real write to that exact key -- `insert` (including re-insert after a
-    /// remove), an in-place overwrite, a `get_mut` written through
-    /// `DerefMut`, and `remove`/`despawn` taking the component away --
-    /// delivers one [`crate::subscriptions::ComponentChangeEvent`] to this
-    /// subscription.
-    ///
-    /// Events are **batched**, not callbacks: they accumulate in a bounded
-    /// pending queue and are handed over when you call
-    /// [`Self::take_component_change_events`] (once per frame/tick, wherever
-    /// your frame boundary lives). See [`crate::subscriptions`]'s module doc
-    /// for why callback-in-Drop was rejected (reentrancy) and what the full
-    /// delivery contract is.
-    ///
-    /// Subscribing to a `(entity, T)` pair whose component isn't currently
-    /// present is allowed and useful: the subscription arms silently and its
-    /// first event is the future insert. Subscribing to a dead entity
-    /// returns `None`.
-    ///
-    /// The subscription stays armed until [`Self::unsubscribe`], until the
-    /// entity despawns (which auto-cleans it after delivering final
-    /// `Removed` events), or until the `World` is dropped. Forgetting to
-    /// unsubscribe a live entity is the same class of leak as forgetting to
-    /// drop an entity handle: bounded by one map entry per subscription,
-    /// nothing per-frame.
-    ///
-    /// Zero-subscriber cost elsewhere in the `World`: before this call the
-    /// only thing any mutating path pays for subscriptions is one
-    /// `Option::is_none()` check; after it, only keys with at least one
-    /// watcher pay a hash probe + queue append.
-    pub fn subscribe<T: Component>(
-        &mut self,
-        entity: Entity,
-    ) -> Option<crate::subscriptions::SubscriptionId> {
-        self.subscribe_id(entity, crate::component::component_id::<T>())
-    }
-
-    /// Type-erased form of [`Self::subscribe`]: same contract, keyed by
-    /// [`ComponentId`] instead of `T`. For callers that bridge through their
-    /// own registry (Pulsar-Native's reflection-to-`World` shim resolves
-    /// editor class names to component ids at runtime and cannot name `T`
-    /// statically). Returns `None` for a dead entity, same as
-    /// [`Self::subscribe`].
-    pub fn subscribe_id(
-        &mut self,
-        entity: Entity,
-        cid: ComponentId,
-    ) -> Option<crate::subscriptions::SubscriptionId> {
-        if !self.is_alive(entity) {
-            return None;
-        }
-        let registry = self.subscriptions.get_or_insert_with(Default::default);
-        Some(crate::subscriptions::lock(registry).subscribe(entity, cid))
-    }
-
-    /// Disarm a subscription. Idempotent: returns `false` if `id` was never
-    /// armed or has already been unsubscribed/despawn-cleaned. Pending
-    /// events already queued for `id` are delivered as-is on the next drain
-    /// -- unsubscribing stops FUTURE events, it doesn't retract past ones.
-    pub fn unsubscribe(&mut self, id: crate::subscriptions::SubscriptionId) -> bool {
-        let Some(registry) = &self.subscriptions else {
-            return false;
-        };
-        crate::subscriptions::lock(registry).unsubscribe(id)
-    }
-
-    /// Disarm every subscription on `entity`, any component type. Returns
-    /// how many were removed. Convenience for a consumer tearing down a
-    /// whole card/panel at once (e.g. the properties panel unmounting all of
-    /// one object's component cards).
-    pub fn unsubscribe_for_entity(&mut self, entity: Entity) -> usize {
-        let Some(registry) = &self.subscriptions else {
-            return 0;
-        };
-        crate::subscriptions::lock(registry).unsubscribe_entity(entity)
-    }
-
-    /// Drain every pending [`ComponentChangeEvent`], oldest first, emptying
-    /// the queue. Call once per frame/tick from your frame boundary --
-    /// between drains events accumulate (bounded by
-    /// [`crate::subscriptions::MAX_PENDING_EVENTS`]; beyond the cap the
-    /// oldest are dropped and counted, see
-    /// [`Self::dropped_component_change_events`]).
-    ///
-    /// Delivery is at-least-once per real mutation, in mutation order, NOT
-    /// coalesced -- treat the result as a dirty set keyed by
-    /// `(entity, component)` unless you genuinely need per-write fidelity.
-    pub fn take_component_change_events(
-        &mut self,
-    ) -> Vec<crate::subscriptions::ComponentChangeEvent> {
-        let Some(registry) = &self.subscriptions else {
-            return Vec::new();
-        };
-        crate::subscriptions::lock(registry).take()
-    }
-
-    /// How many events are waiting for the next
-    /// [`Self::take_component_change_events`] (diagnostics/backpressure).
-    pub fn pending_component_change_events(&self) -> usize {
-        match &self.subscriptions {
-            None => 0,
-            Some(registry) => {
-                // `try_lock` instead of blocking: this is a diagnostic read,
-                // and a concurrent mutation path holding the lock means the
-                // answer is stale the moment it's taken anyway.
-                registry.try_lock().map(|r| r.pending_len()).unwrap_or(0)
-            }
-        }
-    }
-
-    /// How many events have been dropped to enforce the pending cap since
-    /// the registry was created (see
-    /// [`Self::take_component_change_events`]). Nonzero means a consumer
-    /// went long enough without draining to overflow
-    /// [`crate::subscriptions::MAX_PENDING_EVENTS`] and lost events.
-    pub fn dropped_component_change_events(&self) -> u64 {
-        match &self.subscriptions {
-            None => 0,
-            Some(registry) => registry.try_lock().map(|r| r.dropped_count()).unwrap_or(0),
         }
     }
 
@@ -945,6 +898,14 @@ impl World {
         if !self.is_alive(entity) {
             return false;
         }
+        // Object subscriptions, resolved while `entity` still places itself
+        // in its object: its components' subscribers are told each removal,
+        // and an object's own subscriptions end with it.
+        let subscribers = self.object_subscribers(entity);
+        let ended = match &self.object_subscriptions {
+            Some(handle) => crate::object_subscriptions::lock(handle).end(entity),
+            None => Vec::new(),
+        };
         let (arch_id, row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
@@ -1076,29 +1037,31 @@ impl World {
             t.record_despawn(entity);
         }
 
-        // Subscription delivery + cleanup (SceneDB#47): one final `Removed`
-        // per component the entity actually had (same `active_cids` read as
-        // the tracker block above), then every remaining subscription on
-        // this entity is disarmed -- its generation is bumped past any live
-        // handle, so a surviving subscription could never fire again and is
-        // pure bookkeeping weight. This is the ONLY implicit unsubscribe:
-        // live-entity subscriptions stay armed until explicitly dropped.
+        // Change journals: one final `Removed` per component the entity
+        // actually had (same `active_cids` read as the tracker block above).
         if let Some(journals) = self.change_journals.get() {
             let mut journals = crate::change_journal::lock(journals);
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
-                journals.record(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
+                journals.record(entity, cid, crate::change_journal::ComponentChangeKind::Removed);
             }
         }
-        if let Some(registry) = &self.subscriptions {
-            let mut guard = crate::subscriptions::lock(registry);
+
+        if let Some((object, callbacks)) = subscribers {
             for &cid in &self.archetypes[arch_id.0 as usize].active_cids {
-                guard.record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Removed,
+                crate::object_subscriptions::deliver(
+                    &callbacks,
+                    object,
+                    crate::object_subscriptions::ObjectChange {
+                        entity,
+                        component: cid,
+                        kind: crate::change_journal::ComponentChangeKind::Removed,
+                        value: None,
+                    },
                 );
             }
-            guard.unsubscribe_entity(entity);
+        }
+        for callback in ended {
+            callback(entity, &crate::object_subscriptions::ObjectEvent::Despawned);
         }
 
         true
@@ -1229,7 +1192,7 @@ impl World {
     ///
     /// The value goes through the same insert path as [`Self::insert`]:
     /// GPU-mirror dispatch (including `#[gpu]` auto-registration), the
-    /// handle ledger, the change tracker, change journals and subscriptions
+    /// handle ledger, the change tracker and change journals
     /// all observe it exactly as they would a typed insert of the same value.
     /// An existing value of the same type on `entity` is replaced in place.
     ///
@@ -1330,18 +1293,8 @@ impl World {
                 t.record_component_change(entity, cid, 0, bytes.to_vec());
             }
             source.overwrite(col.as_mut(), old_row);
-            self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
-            // Subscription delivery (SceneDB#47): an in-place overwrite IS a
-            // real change to `(entity, T)`. Reported as `Inserted` -- from a
-            // subscriber's perspective this call made `T` present with a new
-            // value, exactly what the archetype-migration path reports.
-            if let Some(registry) = &self.subscriptions {
-                crate::subscriptions::lock(registry).record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Inserted,
-                );
-            }
+            self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
+            self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
             return;
         }
 
@@ -1439,17 +1392,8 @@ impl World {
             t.record_component_change(entity, cid, 0, Vec::new());
         }
 
-        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Inserted);
-
-        // Subscription delivery (SceneDB#47): the component is now present
-        // on `entity` with a new value.
-        if let Some(registry) = &self.subscriptions {
-            crate::subscriptions::lock(registry).record(
-                entity,
-                cid,
-                crate::subscriptions::ComponentChangeKind::Inserted,
-            );
-        }
+        self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
+        self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Inserted);
     }
 
     /// Remove a component from an entity, returning its value.
@@ -1508,6 +1452,7 @@ impl World {
                     .swap_remove(row)
             },
             |value| value as *const T as *const (),
+            |value: &T| -> &dyn Any { value },
         )
     }
 
@@ -1516,8 +1461,8 @@ impl World {
     ///
     /// Runs the same removal path as [`Self::remove`]: the GPU row is
     /// cleared and var-len allocations released, the handle ledger releases
-    /// the value's handles, and the change tracker, change journals and
-    /// subscriptions all record the removal. `None` if `entity` is dead or
+    /// the value's handles, and the change tracker and change journals
+    /// record the removal. `None` if `entity` is dead or
     /// does not have `component`.
     pub fn remove_dyn(
         &mut self,
@@ -1527,17 +1472,21 @@ impl World {
         profiling::profile_scope_loc!("World::remove_dyn");
         let take = |col: &mut dyn ErasedColumn, row: usize| col.swap_remove_boxed(row);
         let ptr = |value: &Box<dyn Any + Send + Sync>| &**value as *const dyn Any as *const ();
+        fn any(value: &Box<dyn Any + Send + Sync>) -> &dyn Any {
+            &**value
+        }
         if let Some(shared) = self.change_tracker.clone() {
             let mut guard = shared.lock();
-            self.remove_core(entity, component, Some(&mut guard), take, ptr)
+            self.remove_core(entity, component, Some(&mut guard), take, ptr, any)
         } else {
-            self.remove_core(entity, component, None, take, ptr)
+            self.remove_core(entity, component, None, take, ptr, any)
         }
     }
 
     /// The one removal path, shared by [`Self::remove`] and
     /// [`Self::remove_dyn`]. `take` moves the value out of its column;
-    /// `value_ptr` points at the moved-out value for the handle ledger.
+    /// `value_ptr` points at the moved-out value for the handle ledger;
+    /// `value_any` lends it to object subscribers.
     fn remove_core<R>(
         &mut self,
         entity: Entity,
@@ -1545,10 +1494,14 @@ impl World {
         tracker: Option<&mut ChangeTracker>,
         take: impl FnOnce(&mut dyn ErasedColumn, usize) -> R,
         value_ptr: impl FnOnce(&R) -> *const (),
+        value_any: impl FnOnce(&R) -> &dyn Any,
     ) -> Option<R> {
         if !self.is_alive(entity) {
             return None;
         }
+        // Resolved before the removal: the component being removed may be
+        // what places `entity` in its object.
+        let subscribers = self.object_subscribers(entity);
         let (old_arch_id, old_row) = {
             let s = &self.entity_slots[entity.index() as usize];
             (s.archetype, s.row as usize)
@@ -1613,16 +1566,17 @@ impl World {
             t.record_component_removal(entity, cid);
         }
 
-        self.record_journal(entity, cid, crate::subscriptions::ComponentChangeKind::Removed);
-
-        // Subscription delivery (SceneDB#47): the component's lifetime on
-        // this entity ended. The subscription itself stays armed: a later
-        // insert fires again without resubscribing.
-        if let Some(registry) = &self.subscriptions {
-            crate::subscriptions::lock(registry).record(
-                entity,
-                cid,
-                crate::subscriptions::ComponentChangeKind::Removed,
+        self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Removed);
+        if let Some((object, callbacks)) = subscribers {
+            crate::object_subscriptions::deliver(
+                &callbacks,
+                object,
+                crate::object_subscriptions::ObjectChange {
+                    entity,
+                    component: cid,
+                    kind: crate::change_journal::ComponentChangeKind::Removed,
+                    value: Some(value_any(&removed_val)),
+                },
             );
         }
 
@@ -1665,6 +1619,7 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
+        let subscribers = self.object_subscribers(entity);
         let value =
             Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
                 c.as_any_mut()
@@ -1676,13 +1631,14 @@ impl World {
                 #[cfg(feature = "gpu")]
                 gpu_mirror: self.gpu_mirror.as_ref(),
                 change_tracker: self.change_tracker.as_ref(),
-                subscriptions: self.subscriptions.as_ref(),
-                change_journals: &self.change_journals,
+                                change_journals: &self.change_journals,
                 handle_counts: &self.handle_counts,
+                subscribers,
             },
             entity,
             cid,
             &*value as *const T as *const (),
+            &*value as &dyn Any as *const dyn Any,
         );
         Some(Mut::new(value, hooks))
     }
@@ -1714,11 +1670,12 @@ impl World {
     }
 
     /// Mutable, type-erased access to `entity`'s `component`. The returned
-    /// [`MutDyn`] fires write hooks (GPU mirror, change tracker, subscriptions,
+    /// [`MutDyn`] fires write hooks (GPU mirror, change tracker,
     /// change journals, handle ledger) when mutable access is requested. Use
     /// `downcast_ref` for reads that should not report a mutation.
     pub fn get_dyn_mut(&mut self, entity: Entity, component: ComponentId) -> Option<MutDyn<'_>> {
         let (arch, row) = self.locate(entity)?;
+        let subscribers = self.object_subscribers(entity);
         let value = Self::get_erased_mut(&mut self.archetypes[arch.0 as usize], component)
             .map(|col| col.get_any_mut(row))?;
         let value_ptr: *const dyn Any = &*value;
@@ -1727,13 +1684,14 @@ impl World {
                 #[cfg(feature = "gpu")]
                 gpu_mirror: self.gpu_mirror.as_ref(),
                 change_tracker: self.change_tracker.as_ref(),
-                subscriptions: self.subscriptions.as_ref(),
-                change_journals: &self.change_journals,
+                                change_journals: &self.change_journals,
                 handle_counts: &self.handle_counts,
+                subscribers,
             },
             entity,
             component,
             value_ptr as *const (),
+            value_ptr,
         );
         Some(MutDyn::new(value, hooks))
     }
@@ -1885,19 +1843,13 @@ impl World {
             return Ok(());
         };
         let result = decode_into(col.as_mut(), row, bytes);
-        // Subscription delivery (SceneDB#47): `Delta::apply` writing remote
-        // state into this World is a real mutation -- local subscribers
-        // (live editor UI reading the same replicated World) must see it.
-        // Only a successful decode wrote anything; a malformed-bytes `Err`
-        // changed nothing.
+        // `Delta::apply` writing remote state into this World is a real
+        // mutation: change-journal readers (live editor UI reading the same
+        // replicated World) must see it. A malformed-bytes `Err` wrote
+        // nothing.
         if result.is_ok() {
-            if let Some(registry) = &self.subscriptions {
-                crate::subscriptions::lock(registry).record(
-                    entity,
-                    cid,
-                    crate::subscriptions::ComponentChangeKind::Mutated,
-                );
-            }
+            self.record_journal(entity, cid, crate::change_journal::ComponentChangeKind::Mutated);
+            self.notify_object_write(entity, cid, crate::change_journal::ComponentChangeKind::Mutated);
         }
         result
     }
@@ -1946,7 +1898,7 @@ impl World {
     /// `insert`'s migration branch uses, so a bundle component gets every
     /// first-insert hook a single insert gets (GPU mirror with
     /// `is_new_insert = true`, liveness, handle-ledger acquisition, change
-    /// tracker, journals and subscriptions).
+    /// tracker and journals).
     pub(crate) fn push_new_component<T: Component>(
         &mut self,
         arch_id: ArchetypeId,

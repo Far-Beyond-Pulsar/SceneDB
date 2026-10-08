@@ -5,17 +5,15 @@
 //! A system that derives state from a component (a renderer's acceleration
 //! structure, a spatial index, a physics proxy) needs to know which entities
 //! changed since it last looked. Rescanning every row each frame makes that
-//! system O(scene) even when nothing moved. [`crate::subscriptions`] answers
-//! "did this exact `(Entity, T)` change?" but its queue is drained by one
-//! owner ([`crate::World::take_component_change_events`]), so two consumers
-//! cannot share it, and it needs a subscription per entity.
+//! system O(scene) even when nothing moved, and a queue drained by one owner
+//! cannot be shared by two consumers.
 //!
 //! # The model
 //!
 //! A journal records every change to one component type in order: insert
 //! (including an in-place overwrite), a `get_mut` written through
-//! `DerefMut`, remove, and the removal implied by despawn -- the same sites
-//! subscriptions fire at. Any number of readers each hold their own
+//! `DerefMut`, remove, the removal implied by despawn, and a replicated
+//! write applied by `Delta::apply`. Any number of readers each hold their own
 //! [`ChangeCursor`] and read forward from it with
 //! [`crate::World::read_changes`]; reading never consumes anything another
 //! reader will see.
@@ -46,7 +44,6 @@
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
-use crate::subscriptions::ComponentChangeKind;
 use ahash::AHashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +55,33 @@ static NEXT_JOURNALS_ID: AtomicU64 = AtomicU64::new(1);
 /// Ring capacity per component type. At 64k entries a reader may skip over
 /// a thousand frames of a thousand changes each before it must rescan.
 pub const DEFAULT_JOURNAL_CAPACITY: usize = 1 << 16;
+
+/// What kind of write produced a [`ComponentChange`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComponentChangeKind {
+    /// `T` was added to the entity (first insert, re-insert after a remove,
+    /// or an in-place overwrite by `insert`).
+    Inserted,
+    /// `T`'s value was written through `Mut`'s `DerefMut` (or handed out
+    /// mutable via `into_inner`), or replaced by a replicated write. A
+    /// borrow-only `get_mut` records nothing.
+    Mutated,
+    /// `T` was taken off the entity (explicit remove, or the entity
+    /// despawned while holding `T`).
+    Removed,
+}
+
+impl ComponentChangeKind {
+    /// Stable lowercase name (`"inserted"` / `"mutated"` / `"removed"`),
+    /// for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Mutated => "mutated",
+            Self::Removed => "removed",
+        }
+    }
+}
 
 /// One recorded change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
