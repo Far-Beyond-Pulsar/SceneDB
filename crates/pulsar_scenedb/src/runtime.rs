@@ -140,16 +140,17 @@ pub fn shared() -> &'static Runtime {
     runtime()
 }
 
-/// Why [`attach`] refused a runtime.
+/// Why [`attach`] (this crate's, or another world crate's runtime attach
+/// built on the same rules) refused a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachError {
     /// The pointer was null.
     Null,
     /// The runtime was built by a copy of another ABI: another version of
-    /// this crate, other features, or another compiler.
+    /// the crate, other features, or another compiler.
     Abi { expected: u64, found: u64 },
-    /// This copy already allocated component ids of its own, which the
-    /// owner's ids would contradict.
+    /// This copy already used state of its own (here, allocated component
+    /// ids), which the owner's would contradict.
     AlreadyInUse,
     /// This copy is already attached to another runtime.
     AlreadyAttached,
@@ -158,18 +159,14 @@ pub enum AttachError {
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Null => f.write_str("no SceneDB runtime given"),
+            Self::Null => f.write_str("no runtime given"),
             Self::Abi { expected, found } => write!(
                 f,
-                "SceneDB runtime ABI mismatch (expected {expected:#x}, found {found:#x}): \
-                 the library was built from other SceneDB sources, features or compiler"
+                "runtime ABI mismatch (expected {expected:#x}, found {found:#x}): \
+                 the library was built from other sources, features or compiler"
             ),
-            Self::AlreadyInUse => {
-                f.write_str("this SceneDB copy already allocated component ids of its own")
-            }
-            Self::AlreadyAttached => {
-                f.write_str("this SceneDB copy is attached to another runtime")
-            }
+            Self::AlreadyInUse => f.write_str("this copy already used state of its own"),
+            Self::AlreadyAttached => f.write_str("this copy is attached to another runtime"),
         }
     }
 }
