@@ -94,7 +94,6 @@
 use crate::component::ComponentId;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 /// A plain, fixed-size asset-identity handle — what lands in a component
 /// field to say "this slot references content X". `repr(C)` `Pod` newtype
@@ -190,13 +189,24 @@ pub struct HandleLedgerRegistration {
 
 pulsar_reflection::inventory::collect!(HandleLedgerRegistration);
 
-fn registry_map() -> &'static HashMap<ComponentId, CollectHandlesFn> {
-    static MAP: OnceLock<HashMap<ComponentId, CollectHandlesFn>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        pulsar_reflection::inventory::iter::<HandleLedgerRegistration>()
-            .map(|r| ((r.component_id)(), r.collect_from_value))
-            .collect()
-    })
+/// This copy's collectors by component, extended by attached copies' (see
+/// `crate::runtime`).
+static COLLECTORS: crate::runtime::AppendTable<CollectHandlesFn> =
+    crate::runtime::AppendTable::new(|| {
+        let mut map: HashMap<ComponentId, Vec<CollectHandlesFn>> = HashMap::new();
+        for r in pulsar_reflection::inventory::iter::<HandleLedgerRegistration>() {
+            map.entry((r.component_id)()).or_default().push(r.collect_from_value);
+        }
+        map
+    });
+
+pub(crate) fn own_collect_fn_for(id: ComponentId) -> Option<CollectHandlesFn> {
+    COLLECTORS.get(id).and_then(|fns| fns.first().copied())
+}
+
+/// Add an attached copy's registrations to this copy's table.
+pub(crate) fn extend(registrations: &[&'static HandleLedgerRegistration]) {
+    COLLECTORS.extend(registrations.iter().map(|r| ((r.component_id)(), r.collect_from_value)));
 }
 
 /// Looks up the collector for `cid`'s component type, if the derive
@@ -208,7 +218,7 @@ fn registry_map() -> &'static HashMap<ComponentId, CollectHandlesFn> {
 /// `gpu::world_mirror::dispatch_for`'s cost shape exactly.
 #[inline]
 pub(crate) fn collect_fn_for(id: ComponentId) -> Option<CollectHandlesFn> {
-    registry_map().get(&id).copied()
+    (crate::runtime::runtime().collect_handles)(id)
 }
 
 /// Per-thread reusable scratch buffer for collector output. The hot path

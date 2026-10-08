@@ -74,6 +74,7 @@ pub mod component_methods;
 pub mod component_ref;
 pub mod mut_guard;
 pub mod component;
+pub mod runtime;
 pub mod entity;
 pub mod handle;
 pub mod handle_ledger;

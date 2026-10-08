@@ -50,7 +50,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::change_journal::ComponentChangeKind;
@@ -97,7 +96,6 @@ pub fn entity_is_its_own_object(_: &crate::World, entity: Entity) -> Entity {
     entity
 }
 
-static NEXT_SUBSCRIPTION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 pub(crate) struct ObjectSubscriptions {
@@ -107,7 +105,7 @@ pub(crate) struct ObjectSubscriptions {
 
 impl ObjectSubscriptions {
     pub(crate) fn subscribe(&mut self, object: Entity, callback: ObjectCallback) -> SubscriptionId {
-        let id = SubscriptionId(NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed));
+        let id = SubscriptionId((crate::runtime::runtime().next_subscription_id)());
         self.by_object.entry(object).or_default().push((id, callback));
         self.objects.insert(id, object);
         id

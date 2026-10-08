@@ -46,11 +46,9 @@ use crate::component::ComponentId;
 use crate::entity::Entity;
 use ahash::AHashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Source of journal-set ids; 0 is never handed out.
-static NEXT_JOURNALS_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Ring capacity per component type. At 64k entries a reader may skip over
 /// a thousand frames of a thousand changes each before it must rescan.
@@ -150,7 +148,7 @@ pub(crate) struct ChangeJournals {
 impl Default for ChangeJournals {
     fn default() -> Self {
         Self {
-            id: NEXT_JOURNALS_ID.fetch_add(1, Ordering::Relaxed),
+            id: (crate::runtime::runtime().next_journals_id)(),
             journals: AHashMap::default(),
         }
     }

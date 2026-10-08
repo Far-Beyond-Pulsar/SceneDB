@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+
+use crate::runtime::runtime;
 
 /// A dense `u32` identifier assigned to each component type.
 ///
@@ -18,22 +18,14 @@ use std::sync::{Mutex, OnceLock};
 /// A previous implementation used a per-monomorphisation `OnceLock`, but
 /// this triggered linker ICF (identical-code folding) on macOS, which
 /// merged the statics across different `T` and caused CID collisions.
-/// The current approach uses a thread-local cache + global `Mutex`.
+/// The current approach uses a thread-local cache over the process's
+/// [`runtime`](crate::runtime), which every linked copy of this crate shares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(pub u32);
 
-// ID 0 is reserved â€” columns are stored with id â‰¥ 1.
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-
-// Each entry is (TypeId, `std::any::type_name::<T>()`) captured the one time
-// `T` is registered -- the name rides along for free so telemetry/tooling
-// can label a ComponentId without compile-time knowledge of `T`. Display
-// only: `type_name` is not guaranteed stable across Rust versions or crate
-// rebuilds, so never parse it.
-fn registry() -> &'static Mutex<Vec<(TypeId, &'static str)>> {
-    static REG: OnceLock<Mutex<Vec<(TypeId, &'static str)>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(Vec::new()))
-}
+// ID 0 is reserved: columns are stored with id >= 1. Ids are allocated by
+// the process's SceneDB runtime (`crate::runtime`), keyed by type name and
+// layout, so every statically linked copy of this crate agrees on them.
 
 thread_local! {
     /// Per-thread cache: maps TypeId â†’ ComponentId.  Rebuilt lazily on
@@ -48,7 +40,7 @@ thread_local! {
 ///
 /// - **Hot path** (cached): thread-local linear scan over ~8â€“20 entries, no
 ///   synchronization.
-/// - **Cold path** (first call per type per thread): acquires the global `Mutex`,
+/// - **Cold path** (first call per type per thread): asks the process's runtime,
 ///   then populates the thread-local cache for subsequent calls.
 pub fn component_id<T: 'static>() -> ComponentId {
     let tid = TypeId::of::<T>();
@@ -62,18 +54,13 @@ pub fn component_id<T: 'static>() -> ComponentId {
     }) {
         return cid;
     }
-    // Slow path â€” register globally, then cache locally.
-    let mut reg = registry().lock().expect("ComponentId registry lock");
-    for (i, &(rtid, _)) in reg.iter().enumerate() {
-        if rtid == tid {
-            let cid = ComponentId(i as u32 + 1);
-            CID_CACHE.with(|cache| cache.borrow_mut().push((tid, cid)));
-            return cid;
-        }
-    }
-    let cid = ComponentId(reg.len() as u32 + 1);
-    reg.push((tid, std::any::type_name::<T>()));
-    NEXT_ID.store(cid.0 + 1, Ordering::Relaxed);
+    // Slow path â€” register with the process's runtime, then cache locally.
+    let cid = (runtime().component_id)(
+        tid,
+        std::any::type_name::<T>(),
+        std::mem::size_of::<T>(),
+        std::mem::align_of::<T>(),
+    );
     CID_CACHE.with(|cache| cache.borrow_mut().push((tid, cid)));
     cid
 }
@@ -84,23 +71,15 @@ pub fn component_id<T: 'static>() -> ComponentId {
 ///
 /// Panics if `type_id` has not been registered via [`component_id::<T>()`].
 pub fn resolve_id(type_id: TypeId) -> ComponentId {
-    let reg = registry().lock().expect("ComponentId registry lock");
-    for (i, &(tid, _)) in reg.iter().enumerate() {
-        if tid == type_id {
-            return ComponentId(i as u32 + 1);
-        }
-    }
-    panic!("TypeId {:?} is not registered as a component", type_id);
+    try_resolve_id(type_id)
+        .unwrap_or_else(|| panic!("TypeId {:?} is not registered as a component", type_id))
 }
 
 /// Resolve a [`TypeId`] to its [`ComponentId`], or `None` if no
 /// `component_id::<T>()` call has registered it yet. The non-panicking
 /// counterpart of [`resolve_id`].
 pub fn try_resolve_id(type_id: TypeId) -> Option<ComponentId> {
-    let reg = registry().lock().expect("ComponentId registry lock");
-    reg.iter()
-        .position(|&(tid, _)| tid == type_id)
-        .map(|i| ComponentId(i as u32 + 1))
+    (runtime().resolve_type)(type_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,13 +93,6 @@ pub fn try_resolve_id(type_id: TypeId) -> Option<ComponentId> {
 pub(crate) struct ErasedComponentInfo {
     pub(crate) id: ComponentId,
     pub(crate) new_column: fn() -> Box<dyn ErasedColumn>,
-}
-
-type ErasedRegistry = std::sync::RwLock<std::collections::HashMap<TypeId, ErasedComponentInfo>>;
-
-fn erased_registry() -> &'static ErasedRegistry {
-    static REG: OnceLock<ErasedRegistry> = OnceLock::new();
-    REG.get_or_init(Default::default)
 }
 
 fn new_column_of<T: Component>() -> Box<dyn ErasedColumn> {
@@ -137,36 +109,23 @@ fn new_column_of<T: Component>() -> Box<dyn ErasedColumn> {
 /// not depend on what else happened to run first.
 pub fn register_component<T: Component>() -> ComponentId {
     let id = component_id::<T>();
-    let tid = TypeId::of::<T>();
-    if erased_registry()
-        .read()
-        .expect("erased component registry lock")
-        .contains_key(&tid)
-    {
-        return id;
-    }
-    erased_registry()
-        .write()
-        .expect("erased component registry lock")
-        .entry(tid)
-        .or_insert(ErasedComponentInfo { id, new_column: new_column_of::<T> });
+    (runtime().register_erased)(
+        TypeId::of::<T>(),
+        ErasedComponentInfo {
+            id,
+            new_column: new_column_of::<T>,
+        },
+    );
     id
 }
 
 /// Whether `type_id` has been registered with [`register_component`].
 pub fn is_registered_for_erased_insert(type_id: TypeId) -> bool {
-    erased_registry()
-        .read()
-        .expect("erased component registry lock")
-        .contains_key(&type_id)
+    erased_info(type_id).is_some()
 }
 
 pub(crate) fn erased_info(type_id: TypeId) -> Option<ErasedComponentInfo> {
-    erased_registry()
-        .read()
-        .expect("erased component registry lock")
-        .get(&type_id)
-        .copied()
+    (runtime().erased_info)(type_id)
 }
 
 /// Returns the total number of component types registered so far.
@@ -174,8 +133,7 @@ pub(crate) fn erased_info(type_id: TypeId) -> Option<ErasedComponentInfo> {
 /// This is the number of distinct `T` for which `component_id::<T>()` has
 /// been called across all threads.
 pub fn component_count() -> u32 {
-    let reg = registry().lock().expect("ComponentId registry lock");
-    reg.len() as u32
+    (runtime().component_count)()
 }
 
 /// Returns the [`TypeId`] corresponding to a [`ComponentId`].
@@ -186,8 +144,7 @@ pub fn component_count() -> u32 {
 ///
 /// Panics if `id` has not been registered.
 pub fn type_of(id: ComponentId) -> TypeId {
-    let reg = registry().lock().expect("ComponentId registry lock");
-    reg[id.0 as usize - 1].0
+    (runtime().type_of)(id).unwrap_or_else(|| panic!("{id:?} is not a registered component"))
 }
 
 /// Returns the `std::any::type_name::<T>()` recorded for `id` when its type
@@ -200,8 +157,7 @@ pub fn type_of(id: ComponentId) -> TypeId {
 ///
 /// Panics if `id` has not been registered.
 pub fn type_name(id: ComponentId) -> &'static str {
-    let reg = registry().lock().expect("ComponentId registry lock");
-    reg[id.0 as usize - 1].1
+    (runtime().type_name)(id).unwrap_or_else(|| panic!("{id:?} is not a registered component"))
 }
 
 //  Component trait
