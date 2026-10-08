@@ -50,6 +50,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::change_journal::ComponentChangeKind;
@@ -57,7 +58,9 @@ use crate::component::ComponentId;
 use crate::entity::Entity;
 
 /// Identifies one subscription; pass it to
-/// [`crate::World::unsubscribe_object`].
+/// [`crate::World::unsubscribe_object`]. Ids are unique across every
+/// `World` in the process, so an id kept past a world replacement never
+/// matches (and never ends) a subscription on the new world.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SubscriptionId(u64);
 
@@ -94,17 +97,17 @@ pub fn entity_is_its_own_object(_: &crate::World, entity: Entity) -> Entity {
     entity
 }
 
+static NEXT_SUBSCRIPTION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Default)]
 pub(crate) struct ObjectSubscriptions {
-    next: u64,
     by_object: HashMap<Entity, Vec<(SubscriptionId, ObjectCallback)>>,
     objects: HashMap<SubscriptionId, Entity>,
 }
 
 impl ObjectSubscriptions {
     pub(crate) fn subscribe(&mut self, object: Entity, callback: ObjectCallback) -> SubscriptionId {
-        self.next += 1;
-        let id = SubscriptionId(self.next);
+        let id = SubscriptionId(NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed));
         self.by_object.entry(object).or_default().push((id, callback));
         self.objects.insert(id, object);
         id

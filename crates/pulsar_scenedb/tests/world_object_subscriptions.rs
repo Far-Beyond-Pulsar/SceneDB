@@ -193,6 +193,20 @@ fn unsubscribing_stops_only_that_subscriber() {
     assert_eq!(*second_seen.lock().unwrap(), 1);
 }
 
+#[test]
+fn an_id_from_a_replaced_world_ends_nothing_on_the_new_one() {
+    let mut old = World::new();
+    let e = old.spawn();
+    let stale = old.subscribe_object(e, |_, _| {}).unwrap();
+
+    let mut world = World::new();
+    let e = world.spawn();
+    let seen = recorder(&mut world, e);
+    assert!(!world.unsubscribe_object(stale));
+    world.insert(e, Health(1));
+    assert_eq!(take(&seen).len(), 1, "the new world's subscription still delivers");
+}
+
 #[derive(pulsar_scenedb_derive::Replicate, Default, Clone, Copy, PartialEq, Debug)]
 struct Replicated {
     #[replicate(encoding = Pod, condition = Always)]
