@@ -26,8 +26,9 @@ use crate::entity::Entity;
 pub struct Mut<'a, T> {
     value: &'a mut T,
     /// Set by `DerefMut`: whether the caller actually wrote through the
-    /// guard. Journal, subscription and handle hooks only fire when set; a
-    /// borrow-only `get_mut` is not a mutation.
+    /// guard. Every hook (GPU mirror, change tracker, journal, subscriptions,
+    /// handles) fires only when set; a borrow-only `get_mut` is not a
+    /// mutation.
     mutated_via_deref_mut: bool,
     hooks: MutHooks,
 }
@@ -166,14 +167,17 @@ impl MutHooks {
         }
     }
 
-    /// Guard drop. The GPU dispatch and change record run on every drop
-    /// (shipped behavior: an explicit `get_mut` re-uploads, including `Once`
-    /// fields); handle and journal hooks only on a real write.
+    /// Guard drop. Every hook runs only on a real write (`DerefMut`, or a
+    /// successful `MutDyn::downcast_mut`): a borrow-only guard uploads
+    /// nothing, records no change and notifies no one. A write re-uploads
+    /// every `#[gpu]` field of the row, including `Once` fields (an explicit
+    /// `get_mut` write is a deliberate change).
     fn fire_on_drop(&self, value: *const (), mutated: bool) {
-        if mutated {
-            if let Some(hook) = &self.handle {
-                hook.fire(value);
-            }
+        if !mutated {
+            return;
+        }
+        if let Some(hook) = &self.handle {
+            hook.fire(value);
         }
         #[cfg(feature = "gpu")]
         if let Some(hook) = &self.gpu {
@@ -185,13 +189,11 @@ impl MutHooks {
             hook.tracker
                 .record_component_change(hook.entity, hook.component_id, 0, Vec::new());
         }
-        if mutated {
-            if let Some(hook) = &self.journal {
-                hook.fire();
-            }
-            if let Some(hook) = &self.subscription {
-                hook.fire();
-            }
+        if let Some(hook) = &self.journal {
+            hook.fire();
+        }
+        if let Some(hook) = &self.subscription {
+            hook.fire();
         }
     }
 
