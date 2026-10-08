@@ -64,10 +64,11 @@
 //! attempt, despite compiling cleanly with no errors or warnings pointing
 //! at the problem, was not.
 use crate::component::ComponentId;
+use crate::runtime::AppendTable;
 use crate::gpu::{DirtyTrackedSceneBuffer, GpuColumnSet, SceneGpuStore, TextureStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 /// The initial capacity `#[derive(SceneStore)]`'s generated per-type
 /// dispatch function passes to `T::register_gpu_columns_growable` when
@@ -720,13 +721,63 @@ fn group_by_component<R, F: Copy>(
     map
 }
 
-fn registry_map() -> &'static HashMap<ComponentId, Vec<DispatchFn>> {
-    static MAP: OnceLock<HashMap<ComponentId, Vec<DispatchFn>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        group_by_component(pulsar_reflection::inventory::iter::<GpuMirrorRegistration>(), |r| {
-            ((r.component_id)(), r.dispatch)
-        })
+/// This copy's dispatch, clear and release functions by component, each
+/// extended by attached copies' registrations (see `crate::runtime`).
+static DISPATCH: AppendTable<DispatchFn> = AppendTable::new(|| {
+    group_by_component(pulsar_reflection::inventory::iter::<GpuMirrorRegistration>(), |r| {
+        ((r.component_id)(), r.dispatch)
     })
+});
+static CLEAR: AppendTable<ClearFn> = AppendTable::new(|| {
+    group_by_component(pulsar_reflection::inventory::iter::<GpuClearRegistration>(), |r| {
+        ((r.component_id)(), r.clear)
+    })
+});
+static RELEASE: AppendTable<ReleaseFn> = AppendTable::new(|| {
+    group_by_component(pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>(), |r| {
+        ((r.component_id)(), r.release)
+    })
+});
+
+/// The GPU dispatch part of a [`crate::runtime::Runtime`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GpuDispatchRuntime {
+    dispatch: fn(ComponentId) -> Option<&'static [DispatchFn]>,
+    clear: fn(ComponentId) -> Option<&'static [ClearFn]>,
+    release: fn(ComponentId) -> Option<&'static [ReleaseFn]>,
+}
+
+impl GpuDispatchRuntime {
+    pub(crate) const OWN: Self = Self {
+        dispatch: |id| DISPATCH.get(id),
+        clear: |id| CLEAR.get(id),
+        release: |id| RELEASE.get(id),
+    };
+}
+
+/// The GPU registrations one copy's `inventory` collected.
+pub(crate) struct GpuRegistrations {
+    dispatch: Vec<&'static GpuMirrorRegistration>,
+    clear: Vec<&'static GpuClearRegistration>,
+    release: Vec<&'static VarLenReleaseRegistration>,
+}
+
+impl GpuRegistrations {
+    pub(crate) fn collected() -> Self {
+        Self {
+            dispatch: pulsar_reflection::inventory::iter::<GpuMirrorRegistration>().collect(),
+            clear: pulsar_reflection::inventory::iter::<GpuClearRegistration>().collect(),
+            release: pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>().collect(),
+        }
+    }
+}
+
+/// Add an attached copy's registrations to this copy's tables.
+pub(crate) fn extend(registrations: &GpuRegistrations) {
+    DISPATCH.extend(registrations.dispatch.iter().map(|r| ((r.component_id)(), r.dispatch)));
+    CLEAR.extend(registrations.clear.iter().map(|r| ((r.component_id)(), r.clear)));
+    RELEASE.extend(registrations.release.iter().map(|r| ((r.component_id)(), r.release)));
 }
 
 /// Looks up `id`'s dispatch functions, if any were registered for it
@@ -738,7 +789,7 @@ fn registry_map() -> &'static HashMap<ComponentId, Vec<DispatchFn>> {
 /// second `TypeId` resolution. Callers run every function in the slice.
 #[inline]
 pub(crate) fn dispatch_for(id: ComponentId) -> Option<&'static [DispatchFn]> {
-    registry_map().get(&id).map(Vec::as_slice)
+    (crate::runtime::runtime().gpu.dispatch)(id)
 }
 
 /// Removal counterpart to [`write_gpu_columns_at_row`]: writes zeros into
@@ -816,20 +867,11 @@ pub struct GpuClearRegistration {
 
 pulsar_reflection::inventory::collect!(GpuClearRegistration);
 
-fn clear_registry_map() -> &'static HashMap<ComponentId, Vec<ClearFn>> {
-    static MAP: OnceLock<HashMap<ComponentId, Vec<ClearFn>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        group_by_component(pulsar_reflection::inventory::iter::<GpuClearRegistration>(), |r| {
-            ((r.component_id)(), r.clear)
-        })
-    })
-}
-
 /// Looks up `id`'s GPU-row clear functions (the derive's own and any
 /// derived row's).
 #[inline]
 pub(crate) fn clear_dispatch_for(id: ComponentId) -> Option<&'static [ClearFn]> {
-    clear_registry_map().get(&id).map(Vec::as_slice)
+    (crate::runtime::runtime().gpu.clear)(id)
 }
 
 /// Despawn/removal counterpart to [`DispatchFn`]/[`GpuMirrorRegistration`]:
@@ -848,15 +890,6 @@ pub struct VarLenReleaseRegistration {
 
 pulsar_reflection::inventory::collect!(VarLenReleaseRegistration);
 
-fn release_registry_map() -> &'static HashMap<ComponentId, Vec<ReleaseFn>> {
-    static MAP: OnceLock<HashMap<ComponentId, Vec<ReleaseFn>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        group_by_component(pulsar_reflection::inventory::iter::<VarLenReleaseRegistration>(), |r| {
-            ((r.component_id)(), r.release)
-        })
-    })
-}
-
 /// Looks up `id`'s var-len release function, if the derive generated one
 /// (i.e. the type has at least one `Vec<T>`-typed `#[gpu]` field, interned
 /// or not). Called from `World::despawn_inner`/`remove_inner` — see those
@@ -866,7 +899,7 @@ fn release_registry_map() -> &'static HashMap<ComponentId, Vec<ReleaseFn>> {
 /// and the two dispatch signatures take different arguments).
 #[inline]
 pub(crate) fn release_dispatch_for(id: ComponentId) -> Option<&'static [ReleaseFn]> {
-    release_registry_map().get(&id).map(Vec::as_slice)
+    (crate::runtime::runtime().gpu.release)(id)
 }
 
 #[cfg(test)]
