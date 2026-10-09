@@ -193,8 +193,12 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         if min_capacity <= self.capacity {
             return Ok(false);
         }
-        let device_limit_rows =
-            (device.limits().max_buffer_size / std::mem::size_of::<T>().max(1) as u64) as u32;
+        // Clamp before narrowing: on GPUs with a huge `max_buffer_size` the row
+        // count can reach 2^32, which a bare `as u32` wraps to 0 (spurious
+        // `CapacityError { max: 0 }` on the very first allocation).
+        let device_limit_rows = (device.limits().max_buffer_size
+            / std::mem::size_of::<T>().max(1) as u64)
+            .min(u32::MAX as u64) as u32;
         let effective_max = match self.max_capacity {
             Some(max) => max.min(device_limit_rows),
             None => device_limit_rows,
