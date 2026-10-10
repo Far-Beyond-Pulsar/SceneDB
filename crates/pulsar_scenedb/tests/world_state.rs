@@ -20,9 +20,9 @@ const LISTED: &[(&str, usize, &str)] = &[
         "the world method inventory list and the method table, extended through the runtime",
     ),
     (
-        "gpu/interned_pool.rs",
+        "gpu/mod.rs",
         1,
-        "the test device shared by one copy's interned-pool tests",
+        "the test device shared by one copy's GPU unit tests",
     ),
     (
         "gpu/tier_layout.rs",
