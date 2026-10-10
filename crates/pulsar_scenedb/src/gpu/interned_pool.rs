@@ -446,39 +446,8 @@ mod tests {
     use super::*;
     use std::sync::Arc as StdArc;
 
-    /// One process-lifetime device/queue, shared by every test in this
-    /// module instead of each test creating its own (the pattern the rest
-    /// of this crate's GPU test files use). `wgpu::Device`/`Queue` are
-    /// `Send + Sync` by design specifically so concurrent callers can share
-    /// one — each test still creates its OWN `InternedVarLenPool`/buffers
-    /// on top, so there is no cross-test state to contaminate. This exists
-    /// because this module alone adds nine GPU-context-touching tests to
-    /// the lib test binary; on constrained hardware/driver combinations,
-    /// `cargo test`'s default parallelism creating that many concurrent
-    /// `wgpu::Instance::request_adapter`/`request_device` calls (on top of
-    /// every OTHER GPU test file's own fresh devices, all in the same
-    /// process) can stall badly enough to look hung rather than merely
-    /// slow — sharing one device here removes this module's contribution
-    /// to that pressure without changing what each test actually proves.
     fn test_device() -> (StdArc<wgpu::Device>, StdArc<wgpu::Queue>) {
-        static SHARED: std::sync::OnceLock<(StdArc<wgpu::Device>, StdArc<wgpu::Queue>)> = std::sync::OnceLock::new();
-        SHARED.get_or_init(create_device).clone()
-    }
-
-    fn create_device() -> (StdArc<wgpu::Device>, StdArc<wgpu::Queue>) {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no adapter — GPU tests need a local GPU");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("interned-var-len-pool-test"),
-            ..Default::default()
-        }))
-        .expect("device");
+        let (device, queue) = crate::gpu::test_device();
         (StdArc::new(device), StdArc::new(queue))
     }
 

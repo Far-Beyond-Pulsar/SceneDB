@@ -39,6 +39,33 @@ mod var_len_pool;
 mod view_upload;
 pub mod world_mirror;
 
+/// The one device every GPU unit test in this crate shares (SceneDB#59).
+/// Each module creating its own made `cargo test`'s parallel threads
+/// request dozens of adapters and devices at once, which stalls some
+/// drivers until the run looks hung.
+#[cfg(test)]
+pub(crate) fn test_device() -> (wgpu::Device, wgpu::Queue) {
+    static SHARED: std::sync::OnceLock<(wgpu::Device, wgpu::Queue)> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))
+            .expect("no adapter — GPU tests need a local GPU");
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("scenedb-unit-tests"),
+                ..Default::default()
+            }))
+            .expect("device")
+        })
+        .clone()
+}
+
 pub use assets::{
     ArenaError, ClusterBuffer, ClusterError, ClusterNode, GeometryArena, MaterialError,
     MaterialRegistry, MaterialRow, MeshError, MeshMetadata, MeshRegistry, MeshletBuffer,
