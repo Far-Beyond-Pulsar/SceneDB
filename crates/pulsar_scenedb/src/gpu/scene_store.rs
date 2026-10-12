@@ -2233,66 +2233,73 @@ impl SceneGpuStore {
         if self.tier_engine.configured().is_none() {
             return Err(super::tier::TierError::NotConfigured);
         }
+        // One rung below the committed tier, read under the slot's shard
+        // lock so a flush executing its earlier intents cannot interleave.
+        // Where that is nothing (already at the bottom, or nothing resident
+        // above the rank) while a touch is still queued, the release
+        // withdraws that touch instead: otherwise the queued promotion would
+        // run after it and leave the slot resident with no demand.
+        let release_kind = |committed: Tier, pending: Option<Tier>| -> Option<super::tier::TransitionKind> {
+            let relative = match (committed, span) {
+                // Rank-scoped partial demotes stay relative (they do not
+                // commute under folding; see fold_kinds).
+                (Tier::Vram, TierSpan::ThroughRank(r)) => Some(
+                    super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r)),
+                ),
+                // Nothing resident above that rank.
+                (_, TierSpan::ThroughRank(_)) => None,
+                (_, _) => committed
+                    .lower()
+                    .map(|lower| super::tier::TransitionKind::SetTo { tier: lower, through_rank: u32::MAX }),
+            };
+            relative.or(match (pending, span) {
+                // Runs after the queued promotion (mixed kinds keep FIFO).
+                (Some(Tier::Vram), TierSpan::ThroughRank(r)) => Some(
+                    super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r)),
+                ),
+                (Some(target), TierSpan::Whole) if target > committed => Some(
+                    super::tier::TransitionKind::SetTo { tier: committed, through_rank: u32::MAX },
+                ),
+                _ => None,
+            })
+        };
         match sel {
             super::tier::TierSelector::Interned { .. } => Err(super::tier::TierError::Pinned),
             super::tier::TierSelector::PoolSlot { pool, handle } => {
                 let hooks = self.tier_pools.read().expect("SceneGpuStore tier_pools lock poisoned").get(&pool).cloned().ok_or(super::tier::TierError::UnknownResource)?;
-                let st = hooks.slot_state(handle.offset as u64).ok_or(super::tier::TierError::UnknownResource)?;
-                if st.count != handle.count {
-                    return Err(super::tier::TierError::StaleHandle);
-                }
-                let kind = match (st.tier, span) {
-                    // Rank-scoped partial demotes stay relative (they do not
-                    // commute under folding; see fold_kinds).
-                    (Tier::Vram, TierSpan::ThroughRank(r)) => {
-                        super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r))
+                let mut result = Ok(());
+                self.tier_engine.queue_after_pending(sel, |pending| {
+                    let Some(st) = hooks.slot_state(handle.offset as u64) else {
+                        result = Err(super::tier::TierError::UnknownResource);
+                        return None;
+                    };
+                    if st.count != handle.count {
+                        result = Err(super::tier::TierError::StaleHandle);
+                        return None;
                     }
-                    (_, TierSpan::ThroughRank(_)) => {
-                        return Ok(()); // nothing resident above that rank
-                    }
-                    (_, _) => {
-                        let Some(lower) = st.tier.lower() else { return Ok(()) };
-                        super::tier::TransitionKind::SetTo { tier: lower, through_rank: u32::MAX }
-                    }
-                };
-                let seq = self.tier_engine.tick();
-                self.tier_engine.queue_transition(super::tier::PendingTransition {
-                    target: sel,
-                    kind,
-                    seq,
+                    let kind = release_kind(st.tier, pending)?;
+                    Some(super::tier::PendingTransition { target: sel, kind, seq: self.tier_engine.tick() })
                 });
-                Ok(())
+                result
             }
             super::tier::TierSelector::Row { column, row } => {
                 if self.row_stride_for(column).is_none() {
                     return Err(super::tier::TierError::UnknownResource);
                 }
                 let table = self.tier_engine.row_table(column);
-                let t = table.lock().expect("row tier table poisoned");
-                if row as usize >= t.present.len() || !t.present[row as usize] {
-                    return Err(super::tier::TierError::UnknownResource);
-                }
-                let current = Tier::from_u8(t.tier[row as usize]).unwrap_or(Tier::Ram);
-                drop(t);
-                let kind = match (current, span) {
-                    (Tier::Vram, TierSpan::ThroughRank(r)) => {
-                        super::tier::TransitionKind::Demote(super::tier::DemoteExtent::AboveRank(r))
+                let mut result = Ok(());
+                self.tier_engine.queue_after_pending(sel, |pending| {
+                    let t = table.lock().expect("row tier table poisoned");
+                    if row as usize >= t.present.len() || !t.present[row as usize] {
+                        result = Err(super::tier::TierError::UnknownResource);
+                        return None;
                     }
-                    (_, TierSpan::ThroughRank(_)) => {
-                        return Ok(()); // nothing resident above that rank
-                    }
-                    (_, _) => {
-                        let Some(lower) = current.lower() else { return Ok(()) };
-                        super::tier::TransitionKind::SetTo { tier: lower, through_rank: u32::MAX }
-                    }
-                };
-                let seq = self.tier_engine.tick();
-                self.tier_engine.queue_transition(super::tier::PendingTransition {
-                    target: sel,
-                    kind,
-                    seq,
+                    let current = Tier::from_u8(t.tier[row as usize]).unwrap_or(Tier::Ram);
+                    drop(t);
+                    let kind = release_kind(current, pending)?;
+                    Some(super::tier::PendingTransition { target: sel, kind, seq: self.tier_engine.tick() })
                 });
-                Ok(())
+                result
             }
         }
     }

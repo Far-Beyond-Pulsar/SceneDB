@@ -280,7 +280,7 @@ fn entities_sharing_an_asset_share_one_load() {
 }
 
 #[test]
-fn editing_another_property_neither_reloads_nor_rebinds() {
+fn editing_another_property_does_not_reload() {
     let gate = kind("t-edit");
     set_content("edit/a", Ok(vec![1]));
     let id = AssetId::declare("t-edit", "edit/a");
@@ -290,14 +290,21 @@ fn editing_another_property_neither_reloads_nor_rebinds() {
     resolve(&mut world);
 
     world.get_mut::<Mesh>(e).unwrap().tint = 9;
+    let report = world.pump_assets();
+    assert_eq!((report.started, report.bound), (0, 0));
+    let m = mesh(&world, e);
+    assert_eq!((m.tint, m.binds), (9, 1));
+
+    // Replacing the whole value rebinds it (from the loaded payload, so a
+    // value without derived data gets it back), but never reloads.
     let mut overwritten = mesh(&world, e);
     overwritten.tint = 10;
     world.insert(e, overwritten);
     let report = world.pump_assets();
-    assert_eq!((report.started, report.bound), (0, 0));
+    assert_eq!((report.started, report.bound), (0, 1));
     assert_eq!(gate.calls(), 1);
     let m = mesh(&world, e);
-    assert_eq!((m.tint, m.binds), (10, 1));
+    assert_eq!((m.tint, m.binds), (10, 2));
 }
 
 #[test]
@@ -453,4 +460,77 @@ fn asset_ids_are_stable_and_never_zero_for_a_real_source() {
     // Kind and source are separated, so moving bytes between them changes
     // the id.
     assert_ne!(AssetId::of("ab", "c"), AssetId::of("a", "bc"));
+}
+
+#[test]
+fn asset_work_pending_tells_a_frame_loop_when_to_pump() {
+    let gate = kind("t-pending");
+    set_content("pending/a", Ok(vec![1]));
+    let id = AssetId::declare("t-pending", "pending/a");
+    let mut world = World::new();
+    assert!(!world.asset_work_pending());
+
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    assert!(world.asset_work_pending(), "a new reference");
+
+    gate.close();
+    world.pump_assets();
+    assert!(world.asset_work_pending(), "a load in flight");
+    gate.open();
+    resolve(&mut world);
+    assert!(!world.asset_work_pending());
+
+    // A superseded load still counts until its result is received.
+    gate.close();
+    world.reload_asset(id);
+    assert!(world.asset_work_pending(), "a requested reload");
+    world.pump_assets();
+    world.reload_asset(id);
+    world.pump_assets();
+    gate.open();
+    resolve(&mut world);
+    assert!(!world.asset_work_pending());
+    assert_eq!(mesh(&world, e).geometry(), geometry(&[1]));
+}
+
+#[test]
+fn registering_a_binding_again_replaces_it() {
+    let _gate = kind("t-rebind");
+    // A second copy of the defining crate registers the same binding.
+    register_binding::<Mesh>("t-rebind", bind_mesh);
+    set_content("rebind/a", Ok(vec![2]));
+    let id = AssetId::declare("t-rebind", "rebind/a");
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    resolve(&mut world);
+    assert_eq!(
+        mesh(&world, e).binds,
+        1,
+        "bound once, not once per registration"
+    );
+}
+
+#[test]
+fn replacing_a_component_with_one_naming_the_same_asset_binds_it_again() {
+    let gate = kind("t-replace-same");
+    set_content("replace-same/a", Ok(vec![4, 4]));
+    let id = AssetId::declare("t-replace-same", "replace-same/a");
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    resolve(&mut world);
+
+    // A value decoded from a file names the asset but carries no derived data.
+    world.insert(e, Mesh::of(id));
+    assert_eq!(mesh(&world, e).geometry(), (0, 0));
+    let report = world.pump_assets();
+    assert_eq!((report.started, report.bound), (0, 1));
+    assert_eq!(mesh(&world, e).geometry(), geometry(&[4, 4]));
+    assert_eq!(gate.calls(), 1, "bound from the loaded payload");
+    assert_eq!(world.asset_ref_count(id), 1);
+
+    // Bindings write through `get_mut`, which does not rebind.
+    assert!(!world.asset_work_pending());
 }

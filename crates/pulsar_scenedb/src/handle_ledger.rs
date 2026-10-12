@@ -298,6 +298,12 @@ impl HandleCounts {
         self.touched_assets.drain().collect()
     }
 
+    /// Whether any declared asset id gained a reference since the last
+    /// [`Self::take_touched_assets`].
+    pub(crate) fn has_touched_assets(&self) -> bool {
+        !self.touched_assets.is_empty()
+    }
+
     /// One fewer live reference to `id`. Releasing an id that was never
     /// acquired, or releasing past zero, is tolerated (not always a caller
     /// bug — `Mut::into_inner`'s documented escape hatch can legitimately
@@ -395,6 +401,23 @@ pub(crate) fn report_value_acquire(counts: &mut HandleCounts, collect: CollectHa
         for &id in scratch.iter() {
             if !id.is_zero() {
                 counts.acquire(id);
+            }
+        }
+    });
+}
+
+/// Whole-value replace path, after [`report_value_swap`]: marks every
+/// declared asset id `value` references as touched even when the replaced
+/// value referenced it too. The new value's asset-derived data may not be
+/// bound (a decoded value carries none), so [`crate::World::pump_assets`]
+/// binds it again. `get_mut` writes, bindings' own included, do not come
+/// through here.
+pub(crate) fn report_value_replaced(counts: &mut HandleCounts, collect: CollectHandlesFn, value: *const ()) {
+    with_scratch(|scratch| {
+        (collect)(value, scratch);
+        for &id in scratch.iter() {
+            if !id.is_zero() && crate::assets::is_declared(id) {
+                counts.touched_assets.insert(id);
             }
         }
     });

@@ -1286,6 +1286,11 @@ impl World {
                     old_ptr,
                     source.value_ptr(),
                 );
+                crate::handle_ledger::report_value_replaced(
+                    &mut counts,
+                    collect,
+                    source.value_ptr(),
+                );
             }
 
             if let Some(t) = tracker.as_deref_mut() {

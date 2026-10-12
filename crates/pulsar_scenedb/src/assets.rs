@@ -171,7 +171,8 @@ pub fn register_loader(
         .insert(kind, Arc::new(load));
 }
 
-/// Register how components of type `T` take in assets of `kind`: `bind`
+/// Register how components of type `T` take in assets of `kind`, replacing
+/// an earlier registration for the same kind and component: `bind`
 /// runs, through `get_mut`, on every `T` whose `AssetId` fields name an
 /// asset of `kind` when that asset finishes loading (ready or failed), and
 /// when a `T` starts referencing an asset that is already resolved. `bind`
@@ -189,12 +190,13 @@ pub fn register_binding<T: Component>(kind: &'static str, bind: fn(&mut T, &Asse
             }
         }),
     };
-    bindings()
-        .write()
-        .expect("asset bindings poisoned")
-        .entry(kind)
-        .or_default()
-        .push(binding);
+    let mut bindings = bindings().write().expect("asset bindings poisoned");
+    let kind_bindings = bindings.entry(kind).or_default();
+    // Each statically linked copy of the defining crate registers its own; the
+    // component id is shared, so the last one replaces the others.
+    let component = component_id::<T>();
+    kind_bindings.retain(|existing| (existing.component)() != component);
+    kind_bindings.push(binding);
 }
 
 struct Declared {
@@ -278,6 +280,9 @@ pub(crate) struct AssetTable {
     receiver: Mutex<Receiver<Completion>>,
     /// Ids to (re)load at the next pump.
     requested: HashSet<AssetId>,
+    /// Loads started whose completion has not been received yet (stale ones
+    /// included).
+    outstanding: usize,
 }
 
 impl Default for AssetTable {
@@ -289,6 +294,7 @@ impl Default for AssetTable {
             sender,
             receiver: Mutex::new(receiver),
             requested: HashSet::new(),
+            outstanding: 0,
         }
     }
 }
@@ -327,6 +333,7 @@ impl World {
                 .expect("asset receiver poisoned");
             receiver.try_iter().collect()
         };
+        self.assets.outstanding -= completions.len();
         for completion in completions {
             let Some(entry) = self.assets.entries.get_mut(&completion.id) else {
                 report.stale += 1;
@@ -416,6 +423,19 @@ impl World {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// Whether [`Self::pump_assets`] has anything to do: a load in flight,
+    /// one requested, or an asset newly referenced. Cheap and `&self`, so a
+    /// frame loop can skip taking the world mutably when it is `false`.
+    pub fn asset_work_pending(&self) -> bool {
+        self.assets.outstanding > 0
+            || !self.assets.requested.is_empty()
+            || self
+                .handle_counts
+                .lock()
+                .expect("World handle_counts: mutex poisoned")
+                .has_touched_assets()
     }
 
     /// Where `id` stands in this world.
@@ -527,6 +547,7 @@ impl World {
             return LoadStart::Failed;
         };
         entry.state = AssetState::Loading;
+        self.assets.outstanding += 1;
         let sender = self.assets.sender.clone();
         std::thread::Builder::new()
             .name(format!("scenedb-asset-{kind}"))
