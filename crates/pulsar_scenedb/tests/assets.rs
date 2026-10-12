@@ -454,3 +454,35 @@ fn asset_ids_are_stable_and_never_zero_for_a_real_source() {
     // the id.
     assert_ne!(AssetId::of("ab", "c"), AssetId::of("a", "bc"));
 }
+
+#[test]
+fn asset_work_pending_tells_a_frame_loop_when_to_pump() {
+    let gate = kind("t-pending");
+    set_content("pending/a", Ok(vec![1]));
+    let id = AssetId::declare("t-pending", "pending/a");
+    let mut world = World::new();
+    assert!(!world.asset_work_pending());
+
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    assert!(world.asset_work_pending(), "a new reference");
+
+    gate.close();
+    world.pump_assets();
+    assert!(world.asset_work_pending(), "a load in flight");
+    gate.open();
+    resolve(&mut world);
+    assert!(!world.asset_work_pending());
+
+    // A superseded load still counts until its result is received.
+    gate.close();
+    world.reload_asset(id);
+    assert!(world.asset_work_pending(), "a requested reload");
+    world.pump_assets();
+    world.reload_asset(id);
+    world.pump_assets();
+    gate.open();
+    resolve(&mut world);
+    assert!(!world.asset_work_pending());
+    assert_eq!(mesh(&world, e).geometry(), geometry(&[1]));
+}

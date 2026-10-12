@@ -298,6 +298,12 @@ impl HandleCounts {
         self.touched_assets.drain().collect()
     }
 
+    /// Whether any declared asset id gained a reference since the last
+    /// [`Self::take_touched_assets`].
+    pub(crate) fn has_touched_assets(&self) -> bool {
+        !self.touched_assets.is_empty()
+    }
+
     /// One fewer live reference to `id`. Releasing an id that was never
     /// acquired, or releasing past zero, is tolerated (not always a caller
     /// bug — `Mut::into_inner`'s documented escape hatch can legitimately
