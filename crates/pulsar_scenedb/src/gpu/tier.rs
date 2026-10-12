@@ -858,6 +858,35 @@ impl TierEngine {
         shard.lock().expect("tier shard lock poisoned").push(t);
     }
 
+    /// Queues the transition `f` decides on, with `target`'s shard locked:
+    /// `f` receives the tier the newest queued absolute intent for `target`
+    /// will set (`None` when there is none, or the newest is relative) and
+    /// returns the transition to queue, if any. While the shard is locked no
+    /// flush executes `target`'s intents, so state `f` reads is committed and
+    /// cannot change under it: a relative verb (a release) reading the
+    /// committed tier outside the lock could see it before another thread's
+    /// flush commits an earlier intent, and a release that finds nothing to
+    /// withdraw must still see the touch queued ahead of it.
+    pub(crate) fn queue_after_pending(
+        &self,
+        target: TierSelector,
+        f: impl FnOnce(Option<Tier>) -> Option<PendingTransition>,
+    ) {
+        let shard = &self.shards[Self::shard_of(&target)];
+        let mut guard = shard.lock().expect("tier shard lock poisoned");
+        let pending = guard
+            .iter()
+            .rev()
+            .find(|t| t.target == target)
+            .and_then(|t| match t.kind {
+                TransitionKind::SetTo { tier, .. } => Some(tier),
+                _ => None,
+            });
+        if let Some(t) = f(pending) {
+            guard.push(t);
+        }
+    }
+
     /// Drains every shard, invoking `f` on each non-empty batch WHILE THE
     /// SHARD LOCK IS HELD. Holding through execution is load-bearing: it
     /// guarantees strict per-id FIFO across overlapping flushes (a later

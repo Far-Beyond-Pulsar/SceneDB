@@ -646,6 +646,64 @@ fn case_7a_thrash_single_thread_exact_convergence() {
     assert!(per_op_ns < 200_000.0, "thrash regressed catastrophically: {per_op_ns:.0} ns/op");
 }
 
+/// The race behind `case_7b`'s intermittent stranded residency, made
+/// deterministic: a release that finds nothing to withdraw (the slot is on
+/// disk) while a touch is still queued withdraws that touch, instead of
+/// letting the promotion run after it and leave the slot resident with no
+/// demand. The rank-scoped release does the same for a queued promotion.
+#[test]
+fn a_release_withdraws_a_touch_still_queued_ahead_of_it() {
+    let ctx = test_context("tier-release-after-queued-touch");
+    let store = SceneGpuStore::new(&ctx, scene_cfg());
+    Blob::register_gpu_columns_growable(&store, 4, ctx.device());
+    store.configure_tiers(
+        TierConfig { vram_budget_bytes: u64::MAX / 4, ram_budget_bytes: u64::MAX / 2 },
+        &[],
+    )
+    .unwrap();
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    let e = world.spawn();
+    world.insert(e, Blob { data: vec![7; 4] });
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+    let sel = pool_sel("Blob::data", blob_handle(&store, e.index()));
+    let tier = |store: &SceneGpuStore| {
+        let audit = store.tier_audit();
+        assert_eq!(audit.len(), 1);
+        (audit[0].tier, audit[0].vram_bytes)
+    };
+
+    // Spill it: Ram -> Disk.
+    store.release_tier(sel, TierSpan::Whole).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    assert_eq!(tier(&store), (Tier::Disk, 0));
+
+    // Touch and release within one frame: nothing is left resident.
+    store.touch_tier(sel, TierSpan::Whole, Tier::Vram).unwrap();
+    store.release_tier(sel, TierSpan::Whole).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    assert_eq!(tier(&store), (Tier::Disk, 0));
+    assert_eq!(store.tier_vram_used(), 0);
+
+    // A touch flushed on its own still promotes; its release demotes.
+    store.touch_tier(sel, TierSpan::Whole, Tier::Vram).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    assert_eq!(tier(&store).0, Tier::Vram);
+    store.release_tier(sel, TierSpan::Whole).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    assert_eq!(tier(&store), (Tier::Ram, 0));
+
+    // Rank-scoped: a queued promotion from Ram is withdrawn above the rank.
+    store.touch_tier(sel, TierSpan::Whole, Tier::Vram).unwrap();
+    store.release_tier(sel, TierSpan::ThroughRank(0)).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    store.release_tier(sel, TierSpan::Whole).unwrap();
+    store.flush_tier_transitions(ctx.queue());
+    assert_eq!(tier(&store).1, 0, "nothing stranded above the released rank");
+    assert_eq!(store.tier_vram_used(), 0);
+}
+
 #[test]
 fn case_7b_thrash_storm_concurrent_invariants_and_accounting() {
     const IDS: usize = 10_000;
