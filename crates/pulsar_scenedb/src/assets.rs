@@ -171,7 +171,8 @@ pub fn register_loader(
         .insert(kind, Arc::new(load));
 }
 
-/// Register how components of type `T` take in assets of `kind`: `bind`
+/// Register how components of type `T` take in assets of `kind`, replacing
+/// an earlier registration for the same kind and component: `bind`
 /// runs, through `get_mut`, on every `T` whose `AssetId` fields name an
 /// asset of `kind` when that asset finishes loading (ready or failed), and
 /// when a `T` starts referencing an asset that is already resolved. `bind`
@@ -189,12 +190,13 @@ pub fn register_binding<T: Component>(kind: &'static str, bind: fn(&mut T, &Asse
             }
         }),
     };
-    bindings()
-        .write()
-        .expect("asset bindings poisoned")
-        .entry(kind)
-        .or_default()
-        .push(binding);
+    let mut bindings = bindings().write().expect("asset bindings poisoned");
+    let kind_bindings = bindings.entry(kind).or_default();
+    // Each statically linked copy of the defining crate registers its own; the
+    // component id is shared, so the last one replaces the others.
+    let component = component_id::<T>();
+    kind_bindings.retain(|existing| (existing.component)() != component);
+    kind_bindings.push(binding);
 }
 
 struct Declared {

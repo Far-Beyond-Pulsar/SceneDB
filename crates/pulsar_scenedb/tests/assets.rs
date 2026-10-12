@@ -486,3 +486,21 @@ fn asset_work_pending_tells_a_frame_loop_when_to_pump() {
     assert!(!world.asset_work_pending());
     assert_eq!(mesh(&world, e).geometry(), geometry(&[1]));
 }
+
+#[test]
+fn registering_a_binding_again_replaces_it() {
+    let _gate = kind("t-rebind");
+    // A second copy of the defining crate registers the same binding.
+    register_binding::<Mesh>("t-rebind", bind_mesh);
+    set_content("rebind/a", Ok(vec![2]));
+    let id = AssetId::declare("t-rebind", "rebind/a");
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    resolve(&mut world);
+    assert_eq!(
+        mesh(&world, e).binds,
+        1,
+        "bound once, not once per registration"
+    );
+}
