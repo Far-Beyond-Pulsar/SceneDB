@@ -373,7 +373,9 @@ fn as_handle_id_field(ty: &Type) -> bool {
     let Some(last) = type_path.path.segments.last() else {
         return false;
     };
-    if last.ident != "HandleId" {
+    // An `AssetId` (SceneDB#84) is counted exactly like a `HandleId`: same
+    // u128 newtype shape, so the collector's `HandleId(field.0)` covers both.
+    if last.ident != "HandleId" && last.ident != "AssetId" {
         return false;
     }
     matches!(last.arguments, syn::PathArguments::None)

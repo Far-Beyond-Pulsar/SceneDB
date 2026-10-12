@@ -30,7 +30,7 @@ use crate::handle_ledger::{CollectHandlesFn, HandleLedgerRegistration};
 
 /// Version of [`Runtime`]'s ABI. Bump it on any change to `Runtime`'s fields
 /// or to a type passed through them.
-pub const ABI_VERSION: u64 = 1;
+pub const ABI_VERSION: u64 = 2;
 
 /// Folded into [`Runtime::abi`] so that a layout change which forgot to bump
 /// [`ABI_VERSION`], or a copy built with other features, is still refused.
@@ -44,6 +44,7 @@ const FINGERPRINT: u64 = {
         size_of::<crate::World>(),
         align_of::<crate::World>(),
         size_of::<Registrations>(),
+        size_of::<crate::assets::AssetRegistries>(),
         cfg!(feature = "gpu") as usize,
     ];
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -79,6 +80,8 @@ pub struct Runtime {
     #[cfg(feature = "gpu")]
     pub(crate) gpu: crate::gpu::world_mirror::GpuDispatchRuntime,
     pub(crate) add_registrations: fn(&Registrations),
+    /// Declared asset sources, loaders and bindings (SceneDB#84).
+    pub(crate) asset_registries: fn() -> &'static crate::assets::AssetRegistries,
 }
 
 /// The registrations one copy's `inventory` collected, handed to the owner
@@ -123,6 +126,7 @@ static OWN: Runtime = Runtime {
     #[cfg(feature = "gpu")]
     gpu: crate::gpu::world_mirror::GpuDispatchRuntime::OWN,
     add_registrations: own::add_registrations,
+    asset_registries: own::asset_registries,
 };
 
 /// The owner's runtime once this copy is attached; null while it owns its
@@ -449,6 +453,13 @@ mod own {
 
     pub(super) fn collect_handles(id: ComponentId) -> Option<CollectHandlesFn> {
         crate::handle_ledger::own_collect_fn_for(id)
+    }
+
+    static ASSET_REGISTRIES: std::sync::OnceLock<crate::assets::AssetRegistries> =
+        std::sync::OnceLock::new();
+
+    pub(super) fn asset_registries() -> &'static crate::assets::AssetRegistries {
+        ASSET_REGISTRIES.get_or_init(Default::default)
     }
 
     pub(super) fn add_registrations(registrations: &Registrations) {

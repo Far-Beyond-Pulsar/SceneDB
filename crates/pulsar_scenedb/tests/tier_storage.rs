@@ -79,8 +79,8 @@ struct SegBlob {
 /// The interned/STATIC shape (`mirror = Once` + content id) — meshes are the
 /// first static citizens and their behavior is the byte-identical gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AssetId(HandleId);
-impl ContentAddressed for AssetId {
+struct MeshAssetKey(HandleId);
+impl ContentAddressed for MeshAssetKey {
     fn content_id(&self) -> HandleId {
         self.0
     }
@@ -88,7 +88,7 @@ impl ContentAddressed for AssetId {
 
 #[derive(Clone, Debug, SceneStore)]
 struct MeshRow {
-    asset: AssetId,
+    asset: MeshAssetKey,
     #[gpu(mirror = Once, content_id = "asset")]
     vertices: Vec<u32>,
 }
@@ -283,7 +283,7 @@ fn case_3_budget_overflow_evicts_exact_lru_victims_and_never_pinned_statics() {
 
     // A pinned STATIC floor lives alongside everything below.
     let mesh_e = world.spawn();
-    world.insert(mesh_e, MeshRow { asset: AssetId(HandleId(900)), vertices: vec![1, 2, 3] });
+    world.insert(mesh_e, MeshRow { asset: MeshAssetKey(HandleId(900)), vertices: vec![1, 2, 3] });
     let interned_sel =
         TierSelector::Interned { pool: BufferKey::of("MeshRow::vertices"), id: HandleId(900) };
     store.touch_tier(interned_sel, TierSpan::Whole, Tier::Vram).unwrap(); // demand stamp on a static: legal no-op
@@ -509,8 +509,8 @@ fn case_6_once_static_fields_are_pinned_frozen_and_behave_identically() {
     let id = HandleId(77);
     let a = world.spawn();
     let b = world.spawn();
-    world.insert(a, MeshRow { asset: AssetId(id), vertices: vec![1, 2, 3] });
-    world.insert(b, MeshRow { asset: AssetId(id), vertices: vec![1, 2, 3] });
+    world.insert(a, MeshRow { asset: MeshAssetKey(id), vertices: vec![1, 2, 3] });
+    world.insert(b, MeshRow { asset: MeshAssetKey(id), vertices: vec![1, 2, 3] });
     world.flush_gpu_mirror(ctx.queue()).unwrap();
 
     let vpool = store.interned_var_len_pool::<u32>(BufferKey::of("MeshRow::vertices")).unwrap();
@@ -542,9 +542,9 @@ fn case_6_once_static_fields_are_pinned_frozen_and_behave_identically() {
     // baseline rerun is the Step-8 gate; these probes pin the most likely
     // breakage points inline).
     let c = world.spawn();
-    world.insert(c, MeshRow { asset: AssetId(id), vertices: vec![9, 9, 9, 9] });
+    world.insert(c, MeshRow { asset: MeshAssetKey(id), vertices: vec![9, 9, 9, 9] });
     let d = world.spawn();
-    world.insert(d, MeshRow { asset: AssetId(id), vertices: vec![7, 7, 7] });
+    world.insert(d, MeshRow { asset: MeshAssetKey(id), vertices: vec![7, 7, 7] });
     world.flush_gpu_mirror(ctx.queue()).unwrap();
     assert_eq!(vpool.audit(), vec![(id, 2, 16)], "first writer's 4-element size wins for BOTH rows");
     let hc = MeshRow::vertices_gpu_handle(&store, c.index()).unwrap();

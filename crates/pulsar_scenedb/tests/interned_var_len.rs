@@ -17,9 +17,9 @@ use std::sync::Arc;
 /// path, since this crate has no domain knowledge of assets and shouldn't
 /// need any to test the mechanism.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AssetId(HandleId);
+struct MeshAssetKey(HandleId);
 
-impl ContentAddressed for AssetId {
+impl ContentAddressed for MeshAssetKey {
     fn content_id(&self) -> HandleId {
         self.0
     }
@@ -29,7 +29,7 @@ impl ContentAddressed for AssetId {
 /// var-len payload fields sharing it.
 #[derive(Clone, Debug, SceneStore)]
 struct MeshComponent {
-    asset: AssetId,
+    asset: MeshAssetKey,
     #[gpu(mirror = Once, content_id = "asset")]
     vertices: Vec<u32>,
     #[gpu(mirror = Once, content_id = "asset")]
@@ -92,7 +92,7 @@ fn ten_entities_one_asset_share_one_gpu_allocation() {
             let e = world.spawn();
             world.insert(
                 e,
-                MeshComponent { asset: AssetId(id), vertices: vec![1, 2, 3], indices: vec![0, 1, 2] },
+                MeshComponent { asset: MeshAssetKey(id), vertices: vec![1, 2, 3], indices: vec![0, 1, 2] },
             );
             e
         })
@@ -121,7 +121,7 @@ fn despawning_all_referencing_entities_frees_the_shared_allocation() {
     let entities: Vec<Entity> = (0..5)
         .map(|_| {
             let e = world.spawn();
-            world.insert(e, MeshComponent { asset: AssetId(id), vertices: vec![9, 9], indices: vec![0] });
+            world.insert(e, MeshComponent { asset: MeshAssetKey(id), vertices: vec![9, 9], indices: vec![0] });
             e
         })
         .collect();
@@ -147,8 +147,8 @@ fn removing_the_component_without_despawning_also_frees_correctly() {
     let id = HandleId(3);
     let a = world.spawn();
     let b = world.spawn();
-    world.insert(a, MeshComponent { asset: AssetId(id), vertices: vec![1], indices: vec![1] });
-    world.insert(b, MeshComponent { asset: AssetId(id), vertices: vec![1], indices: vec![1] });
+    world.insert(a, MeshComponent { asset: MeshAssetKey(id), vertices: vec![1], indices: vec![1] });
+    world.insert(b, MeshComponent { asset: MeshAssetKey(id), vertices: vec![1], indices: vec![1] });
 
     let vpool = vertices_pool(&store);
     assert_eq!(vpool.audit(), vec![(id, 2, 4)]);
@@ -169,15 +169,15 @@ fn switching_an_entity_to_a_different_asset_decrefs_the_old_one() {
     let b = HandleId(20);
     let e1 = world.spawn();
     let e2 = world.spawn();
-    world.insert(e1, MeshComponent { asset: AssetId(a), vertices: vec![1, 1], indices: vec![0] });
-    world.insert(e2, MeshComponent { asset: AssetId(a), vertices: vec![1, 1], indices: vec![0] });
+    world.insert(e1, MeshComponent { asset: MeshAssetKey(a), vertices: vec![1, 1], indices: vec![0] });
+    world.insert(e2, MeshComponent { asset: MeshAssetKey(a), vertices: vec![1, 1], indices: vec![0] });
 
     let vpool = vertices_pool(&store);
     assert_eq!(vpool.audit(), vec![(a, 2, 8)]);
 
     // Rewrite e1 onto a DIFFERENT asset -- old (a) drops to 1 ref, new (b)
     // gets its own fresh allocation.
-    world.insert(e1, MeshComponent { asset: AssetId(b), vertices: vec![2, 2, 2], indices: vec![0] });
+    world.insert(e1, MeshComponent { asset: MeshAssetKey(b), vertices: vec![2, 2, 2], indices: vec![0] });
     let mut audit = vpool.audit();
     audit.sort_by_key(|(id, ..)| id.0);
     assert_eq!(audit, vec![(a, 1, 8), (b, 1, 12)]);
@@ -189,7 +189,7 @@ fn equal_asset_rewrite_of_the_same_entity_does_not_double_count() {
     let id = HandleId(42);
     let e = world.spawn();
     for _ in 0..10 {
-        world.insert(e, MeshComponent { asset: AssetId(id), vertices: vec![1, 2], indices: vec![0] });
+        world.insert(e, MeshComponent { asset: MeshAssetKey(id), vertices: vec![1, 2], indices: vec![0] });
     }
     let vpool = vertices_pool(&store);
     assert_eq!(vpool.audit(), vec![(id, 1, 8)], "10 identical rewrites of the SAME entity must still net to refcount 1");
@@ -205,8 +205,8 @@ fn zero_asset_still_writes_privately_but_never_shares() {
     let (mut world, store, _queue) = mirrored_world();
     let e1 = world.spawn();
     let e2 = world.spawn();
-    world.insert(e1, MeshComponent { asset: AssetId::default(), vertices: vec![1, 2, 3], indices: vec![0] });
-    world.insert(e2, MeshComponent { asset: AssetId::default(), vertices: vec![9, 9], indices: vec![0] });
+    world.insert(e1, MeshComponent { asset: MeshAssetKey::default(), vertices: vec![1, 2, 3], indices: vec![0] });
+    world.insert(e2, MeshComponent { asset: MeshAssetKey::default(), vertices: vec![9, 9], indices: vec![0] });
 
     let vpool = vertices_pool(&store);
     assert!(vpool.audit().is_empty(), "a private allocation is never interned/shared, so it's invisible to audit");
@@ -244,7 +244,7 @@ fn leak_loop_repeated_spawn_and_despawn_of_many_entities_leaves_nothing_resident
                 let id = HandleId(round * 10 + (k % 4) as u128 + 1);
                 world.insert(
                     e,
-                    MeshComponent { asset: AssetId(id), vertices: vec![1, 2, 3, 4], indices: vec![0, 1, 2] },
+                    MeshComponent { asset: MeshAssetKey(id), vertices: vec![1, 2, 3, 4], indices: vec![0, 1, 2] },
                 );
                 e
             })
@@ -266,11 +266,11 @@ fn same_id_different_bytes_collision_keeps_first_writers_bytes() {
     let id = HandleId(99);
     let e1 = world.spawn();
     let e2 = world.spawn();
-    world.insert(e1, MeshComponent { asset: AssetId(id), vertices: vec![1, 2, 3], indices: vec![0] });
+    world.insert(e1, MeshComponent { asset: MeshAssetKey(id), vertices: vec![1, 2, 3], indices: vec![0] });
     // Same id, DIFFERENT vertex data -- a real content-id function should
     // never produce this, but the pool must not silently corrupt state if
     // it happens (upstream bug, not a supported path).
-    world.insert(e2, MeshComponent { asset: AssetId(id), vertices: vec![7, 7, 7, 7, 7], indices: vec![0] });
+    world.insert(e2, MeshComponent { asset: MeshAssetKey(id), vertices: vec![7, 7, 7, 7, 7], indices: vec![0] });
 
     let vpool = vertices_pool(&store);
     let audit = vpool.audit();

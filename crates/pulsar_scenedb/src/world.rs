@@ -134,7 +134,11 @@ pub struct World {
     /// `SharedChangeTracker`. Not
     /// feature-gated: handles are a domain-neutral concept with no GPU
     /// dependency whatsoever.
-    handle_counts: std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
+    pub(crate) handle_counts:
+        std::sync::Arc<std::sync::Mutex<crate::handle_ledger::HandleCounts>>,
+    /// The assets this world's components reference: their load state,
+    /// versions and payloads, and in-flight loads. See [`crate::assets`].
+    pub(crate) assets: crate::assets::AssetTable,
 }
 
 pub use crate::mut_guard::{Mut, MutDyn};
@@ -170,6 +174,7 @@ impl World {
             handle_counts: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::handle_ledger::HandleCounts::default(),
             )),
+            assets: crate::assets::AssetTable::default(),
         }
     }
 

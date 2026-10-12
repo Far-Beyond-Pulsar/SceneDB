@@ -65,6 +65,7 @@
 
 pub mod actor;
 pub mod archetype;
+pub mod assets;
 pub mod bundle;
 pub mod cell;
 pub mod cell_type;
@@ -111,6 +112,10 @@ pub mod world_telemetry;
 
 pub use actor::{Actor, ActorRegistry};
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
+pub use assets::{
+    register_binding, register_loader, AssetId, AssetPayload, AssetPumpReport, AssetState,
+    AssetView,
+};
 pub use bundle::Bundle;
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
