@@ -47,7 +47,7 @@ const LISTED: &[(&str, usize, &str)] = &[
     ),
     (
         "runtime.rs",
-        6,
+        7,
         "the runtime itself: OWN, ATTACHED, and the state it owns",
     ),
     ("simd.rs", 1, "a constant lookup table"),

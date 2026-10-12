@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AssetId(HandleId);
-impl ContentAddressed for AssetId {
+struct MeshAssetKey(HandleId);
+impl ContentAddressed for MeshAssetKey {
     fn content_id(&self) -> HandleId {
         self.0
     }
@@ -36,7 +36,7 @@ struct SingleHandleRow {
 
 #[derive(Clone, Debug, SceneStore)]
 struct MeshRow {
-    asset: AssetId,
+    asset: MeshAssetKey,
     #[gpu(mirror = Once, content_id = "asset")]
     vertices: Vec<u32>,
 }
@@ -96,7 +96,7 @@ fn bm5_despawn_storm_10k_mixed_entities() {
         .map(|i| {
             let e = world.spawn();
             let id = HandleId((i as u128 % 50) + 1); // heavy sharing: 200 refs/id
-            world.insert(e, MeshRow { asset: AssetId(id), vertices: vec![1, 2, 3, 4] });
+            world.insert(e, MeshRow { asset: MeshAssetKey(id), vertices: vec![1, 2, 3, 4] });
             e
         })
         .collect();
@@ -134,7 +134,7 @@ fn bm6_resident_bytes_invariant_shared_vs_distinct() {
     let shared_id = HandleId(777);
     for _ in 0..N {
         let e = world.spawn();
-        world.insert(e, MeshRow { asset: AssetId(shared_id), vertices: vec![1u32; ELEMS_PER_ASSET] });
+        world.insert(e, MeshRow { asset: MeshAssetKey(shared_id), vertices: vec![1u32; ELEMS_PER_ASSET] });
     }
     let vpool = store.interned_var_len_pool::<u32>(BufferKey::of("MeshRow::vertices")).unwrap();
     let audit = vpool.audit();
@@ -153,7 +153,7 @@ fn bm6_resident_bytes_invariant_shared_vs_distinct() {
     world2.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store2), queue));
     for i in 0..N {
         let e = world2.spawn();
-        world2.insert(e, MeshRow { asset: AssetId(HandleId(1000 + i as u128)), vertices: vec![1u32; ELEMS_PER_ASSET] });
+        world2.insert(e, MeshRow { asset: MeshAssetKey(HandleId(1000 + i as u128)), vertices: vec![1u32; ELEMS_PER_ASSET] });
     }
     let vpool2 = store2.interned_var_len_pool::<u32>(BufferKey::of("MeshRow::vertices")).unwrap();
     let audit2 = vpool2.audit();

@@ -276,6 +276,10 @@ pub(crate) struct HandleCounts {
     /// steady-state path, so an entry lingering here for the `World`'s
     /// lifetime is immaterial.
     warned_underflow: std::collections::HashSet<HandleId>,
+    /// Declared asset ids ([`crate::assets::AssetId`]) that gained a
+    /// reference since [`World::pump_assets`](crate::World::pump_assets)
+    /// last took them: the ids it must load or bind.
+    touched_assets: std::collections::HashSet<HandleId>,
 }
 
 impl HandleCounts {
@@ -284,6 +288,14 @@ impl HandleCounts {
     /// boundary — see the module doc's "Zero-value convention").
     fn acquire(&mut self, id: HandleId) {
         *self.counts.entry(id).or_insert(0) += 1;
+        if crate::assets::is_declared(id) {
+            self.touched_assets.insert(id);
+        }
+    }
+
+    /// The declared asset ids that gained a reference since the last call.
+    pub(crate) fn take_touched_assets(&mut self) -> Vec<HandleId> {
+        self.touched_assets.drain().collect()
     }
 
     /// One fewer live reference to `id`. Releasing an id that was never
