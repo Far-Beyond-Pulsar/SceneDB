@@ -406,6 +406,23 @@ pub(crate) fn report_value_acquire(counts: &mut HandleCounts, collect: CollectHa
     });
 }
 
+/// Whole-value replace path, after [`report_value_swap`]: marks every
+/// declared asset id `value` references as touched even when the replaced
+/// value referenced it too. The new value's asset-derived data may not be
+/// bound (a decoded value carries none), so [`crate::World::pump_assets`]
+/// binds it again. `get_mut` writes, bindings' own included, do not come
+/// through here.
+pub(crate) fn report_value_replaced(counts: &mut HandleCounts, collect: CollectHandlesFn, value: *const ()) {
+    with_scratch(|scratch| {
+        (collect)(value, scratch);
+        for &id in scratch.iter() {
+            if !id.is_zero() && crate::assets::is_declared(id) {
+                counts.touched_assets.insert(id);
+            }
+        }
+    });
+}
+
 /// Removal path: release every nonzero handle `collect` finds — the exact
 /// inverse of [`report_value_acquire`], called with the value being taken
 /// OUT of the world.
