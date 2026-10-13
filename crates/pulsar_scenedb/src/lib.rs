@@ -113,8 +113,8 @@ pub mod world_telemetry;
 pub use actor::{Actor, ActorRegistry};
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use assets::{
-    register_binding, register_loader, AssetId, AssetPayload, AssetPumpReport, AssetState,
-    AssetView,
+    asset_load_workers, register_binding, register_loader, register_payload_size, AssetId,
+    AssetPayload, AssetPumpReport, AssetState, AssetView, SizeFn, DEFAULT_ASSET_CACHE_BUDGET,
 };
 pub use bundle::Bundle;
 pub use cell::CellStorage;

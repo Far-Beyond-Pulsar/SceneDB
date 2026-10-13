@@ -11,8 +11,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use pulsar_scenedb::{
-    register_binding, register_loader, AssetId, AssetPayload, AssetState, AssetView, Entity,
-    SceneStore, World,
+    asset_load_workers, register_binding, register_loader, register_payload_size, AssetId,
+    AssetPayload, AssetState, AssetView, Entity, SceneStore, World,
 };
 
 /// A mesh-like component: it names its asset, and its binding fills in
@@ -446,6 +446,126 @@ fn eviction_drops_only_unreferenced_assets() {
     assert_eq!(gate.calls(), 3);
     assert_eq!(mesh(&world, c).geometry(), geometry(&[2]));
     assert_counts_agree(&world);
+}
+
+/// `t-budget`'s payloads count 4 bytes per vertex.
+fn vertex_bytes(payload: &AssetPayload) -> usize {
+    payload
+        .downcast_ref::<Vec<u32>>()
+        .map_or(0, |v| v.len() * 4)
+}
+
+#[test]
+fn the_cache_budget_drops_the_payloads_referenced_longest_ago() {
+    let gate = kind("t-budget");
+    register_payload_size("t-budget", vertex_bytes);
+    // 100 vertices: 400 bytes each.
+    let ids: Vec<AssetId> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|name| {
+            let source = format!("budget/{name}");
+            set_content(&source, Ok(vec![1; 100]));
+            AssetId::declare("t-budget", &source)
+        })
+        .collect();
+    let mut world = World::new();
+    world.set_asset_cache_budget(1000);
+    let entities: Vec<Entity> = ids
+        .iter()
+        .map(|&id| {
+            let e = world.spawn();
+            world.insert(e, Mesh::of(id));
+            e
+        })
+        .collect();
+    resolve(&mut world);
+    assert_eq!(world.unreferenced_asset_bytes(), 0);
+
+    // Released one at a time: a first, then b, then c.
+    world.despawn(entities[0]);
+    assert_eq!(world.pump_assets().evicted, 0, "400 bytes fit");
+    world.despawn(entities[1]);
+    assert_eq!(world.pump_assets().evicted, 0, "800 bytes fit");
+    world.despawn(entities[2]);
+    assert_eq!(world.pump_assets().evicted, 1, "1200 bytes do not");
+
+    assert_eq!(
+        world.asset_state(ids[0]),
+        AssetState::Unresolved,
+        "the one referenced longest ago goes"
+    );
+    assert_eq!(world.asset_state(ids[1]), AssetState::Ready);
+    assert_eq!(world.asset_state(ids[2]), AssetState::Ready);
+    assert_eq!(world.unreferenced_asset_bytes(), 800);
+
+    // A referenced payload is never evicted, whatever the budget.
+    world.set_asset_cache_budget(0);
+    assert_eq!(world.pump_assets().evicted, 2);
+    assert_eq!(world.asset_state(ids[3]), AssetState::Ready);
+    assert_eq!(mesh(&world, entities[3]).geometry(), geometry(&[1; 100]));
+
+    // An evicted asset loads again when referenced again.
+    let calls = gate.calls();
+    let again = world.spawn();
+    world.insert(again, Mesh::of(ids[0]));
+    resolve(&mut world);
+    assert_eq!(gate.calls(), calls + 1);
+    assert_eq!(mesh(&world, again).geometry(), geometry(&[1; 100]));
+    assert_counts_agree(&world);
+}
+
+#[test]
+fn a_kind_without_a_size_is_never_evicted_by_the_budget() {
+    kind("t-unsized");
+    set_content("unsized/a", Ok(vec![1; 100]));
+    let id = AssetId::declare("t-unsized", "unsized/a");
+    let mut world = World::new();
+    world.set_asset_cache_budget(0);
+    let e = world.spawn();
+    world.insert(e, Mesh::of(id));
+    resolve(&mut world);
+    world.despawn(e);
+    assert_eq!(world.pump_assets().evicted, 0);
+    assert_eq!(world.asset_state(id), AssetState::Ready);
+    // Eviction on request still drops it.
+    assert_eq!(world.evict_unreferenced_assets(), 1);
+}
+
+#[test]
+fn loads_beyond_the_worker_count_queue_and_all_finish() {
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static MOST: AtomicUsize = AtomicUsize::new(0);
+    register_loader("t-many", |source| -> Result<AssetPayload, String> {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MOST.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        Ok(Arc::new(vec![source.len() as u32]))
+    });
+    register_binding::<Mesh>("t-many", bind_mesh);
+
+    let count = asset_load_workers() * 3;
+    let mut world = World::new();
+    let entities: Vec<(Entity, String)> = (0..count)
+        .map(|index| {
+            let source = format!("many/{index}");
+            let e = world.spawn();
+            world.insert(e, Mesh::of(AssetId::declare("t-many", &source)));
+            (e, source)
+        })
+        .collect();
+    assert_eq!(world.pump_assets().started, count);
+    resolve(&mut world);
+
+    assert!(
+        MOST.load(Ordering::SeqCst) <= asset_load_workers(),
+        "{} loads ran at once on {} workers",
+        MOST.load(Ordering::SeqCst),
+        asset_load_workers()
+    );
+    for (e, source) in entities {
+        assert_eq!(mesh(&world, e).geometry(), geometry(&[source.len() as u32]));
+    }
 }
 
 #[test]

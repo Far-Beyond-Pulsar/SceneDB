@@ -12,8 +12,9 @@
 //!   reference counting [`crate::handle_ledger`] does for content handles. The
 //!   derive treats an `AssetId` field exactly like a `HandleId` field.
 //! - **[`World::pump_assets`]** starts loads for referenced ids the world has
-//!   not resolved, off the write path (a worker thread runs the kind's
-//!   loader), and applies finished loads: each records the payload and its
+//!   not resolved, off the write path (one of a fixed set of worker threads
+//!   runs the kind's loader; more loads than workers wait their turn), and
+//!   applies finished loads: each records the payload and its
 //!   state and *binds* every component that references the id. A binding
 //!   ([`register_binding`]) is a kind's way to derive component data from the
 //!   payload (a mesh component's geometry, say), written through `get_mut`
@@ -26,9 +27,14 @@
 //! - **Reload** ([`World::reload_asset`], [`World::asset_source_changed`])
 //!   bumps the asset's content version and rebinds every dependent when the
 //!   new data arrives. No editor subscription is needed for this.
-//! - The world keeps each asset's payload (its CPU data) until it is
-//!   evicted ([`World::evict_unreferenced_assets`]), so a rebuild has
-//!   something to rebuild from.
+//! - The world keeps each asset's payload (its CPU data) while components
+//!   reference it, so a rebuild has something to rebuild from. Payloads no
+//!   component references any more stay cached, up to a byte budget
+//!   ([`World::set_asset_cache_budget`]): past it, [`World::pump_assets`]
+//!   drops the ones referenced longest ago. A kind reports its payloads'
+//!   size with [`register_payload_size`]; payloads of a kind that does not
+//!   are never evicted by the budget. [`World::evict_unreferenced_assets`]
+//!   drops them all.
 //!
 //! Loaders and bindings are registered process-wide, once, by the crate that
 //! defines the asset kind; every world uses them.
@@ -171,6 +177,20 @@ pub fn register_loader(
         .insert(kind, Arc::new(load));
 }
 
+/// How many bytes a loaded payload holds, for the cache budget.
+pub type SizeFn = fn(&AssetPayload) -> usize;
+
+/// Register how to measure `kind`'s payloads, replacing any earlier one.
+/// The world counts them against its cache budget once no component
+/// references them ([`World::set_asset_cache_budget`]).
+pub fn register_payload_size(kind: &'static str, size: SizeFn) {
+    registries()
+        .sizes
+        .write()
+        .expect("asset sizes poisoned")
+        .insert(kind, size);
+}
+
 /// Register how components of type `T` take in assets of `kind`, replacing
 /// an earlier registration for the same kind and component: `bind`
 /// runs, through `get_mut`, on every `T` whose `AssetId` fields name an
@@ -222,6 +242,7 @@ pub(crate) struct AssetRegistries {
     sources: RwLock<HashMap<AssetId, Declared>>,
     loaders: RwLock<HashMap<&'static str, LoadFn>>,
     bindings: RwLock<HashMap<&'static str, Vec<Binding>>>,
+    sizes: RwLock<HashMap<&'static str, SizeFn>>,
 }
 
 fn registries() -> &'static AssetRegistries {
@@ -257,6 +278,10 @@ struct Entry {
     /// The request a completion must carry to be applied.
     token: u64,
     payload: Option<AssetPayload>,
+    /// The payload's size, when its kind reports one.
+    bytes: usize,
+    /// The last pump that saw a component reference it.
+    last_used: u64,
 }
 
 enum LoadStart {
@@ -283,7 +308,15 @@ pub(crate) struct AssetTable {
     /// Loads started whose completion has not been received yet (stale ones
     /// included).
     outstanding: usize,
+    /// Pumps run, for [`Entry::last_used`].
+    pumps: u64,
+    /// Bytes of unreferenced payloads kept cached.
+    budget: usize,
 }
+
+/// The default [`World::set_asset_cache_budget`]: 256 MiB of payloads no
+/// component references.
+pub const DEFAULT_ASSET_CACHE_BUDGET: usize = 256 << 20;
 
 impl Default for AssetTable {
     fn default() -> Self {
@@ -295,6 +328,8 @@ impl Default for AssetTable {
             receiver: Mutex::new(receiver),
             requested: HashSet::new(),
             outstanding: 0,
+            pumps: 0,
+            budget: DEFAULT_ASSET_CACHE_BUDGET,
         }
     }
 }
@@ -312,6 +347,8 @@ pub struct AssetPumpReport {
     pub bound: usize,
     /// Loads still in flight.
     pub loading: usize,
+    /// Unreferenced payloads dropped to stay within the cache budget.
+    pub evicted: usize,
 }
 
 impl World {
@@ -323,6 +360,7 @@ impl World {
     pub fn pump_assets(&mut self) -> AssetPumpReport {
         let mut report = AssetPumpReport::default();
         let mut to_bind: HashSet<AssetId> = HashSet::new();
+        self.assets.pumps += 1;
 
         // Finished loads.
         let completions: Vec<Completion> = {
@@ -346,6 +384,7 @@ impl World {
             entry.version += 1;
             match completion.result {
                 Ok(payload) => {
+                    entry.bytes = payload_size(entry.kind, &payload);
                     entry.state = AssetState::Ready;
                     entry.payload = Some(payload);
                 }
@@ -353,6 +392,7 @@ impl World {
                     tracing::warn!(kind = entry.kind, source = %entry.source, %message, "asset failed to load");
                     entry.state = AssetState::Failed(Arc::from(message));
                     entry.payload = None;
+                    entry.bytes = 0;
                 }
             }
             report.completed += 1;
@@ -405,16 +445,22 @@ impl World {
             .values()
             .filter(|entry| entry.state == AssetState::Loading)
             .count();
+        report.evicted = self.enforce_asset_cache_budget();
         report
     }
 
     /// Pump until no load is in flight, or `timeout` passes: for headless
-    /// loading and tests. Returns `false` on timeout.
+    /// loading and tests. Superseded loads still running count as in
+    /// flight, so every load started has finished when this returns `true`.
+    /// Returns `false` on timeout.
     pub fn resolve_assets_blocking(&mut self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let report = self.pump_assets();
-            if report.loading == 0 && self.assets.requested.is_empty() {
+            if report.loading == 0
+                && self.assets.requested.is_empty()
+                && self.assets.outstanding == 0
+            {
                 // One more pump binds anything the last one completed.
                 return true;
             }
@@ -498,6 +544,64 @@ impl World {
         ids.len()
     }
 
+    /// Keep at most `bytes` of payloads no component references (see
+    /// [`register_payload_size`]); the next [`Self::pump_assets`] that has
+    /// work drops the ones referenced longest ago until they fit. Payloads
+    /// components reference are never evicted. Defaults to
+    /// [`DEFAULT_ASSET_CACHE_BUDGET`].
+    pub fn set_asset_cache_budget(&mut self, bytes: usize) {
+        self.assets.budget = bytes;
+    }
+
+    /// The budget [`Self::set_asset_cache_budget`] set.
+    pub fn asset_cache_budget(&self) -> usize {
+        self.assets.budget
+    }
+
+    /// Bytes of cached payloads no component references.
+    pub fn unreferenced_asset_bytes(&self) -> usize {
+        self.assets
+            .entries
+            .iter()
+            .filter(|(id, _)| self.asset_ref_count(**id) == 0)
+            .map(|(_, entry)| entry.bytes)
+            .sum()
+    }
+
+    /// Note which assets components still reference, then drop unreferenced
+    /// payloads, least recently referenced first, until they fit the budget.
+    /// Returns how many were dropped.
+    fn enforce_asset_cache_budget(&mut self) -> usize {
+        let pump = self.assets.pumps;
+        let mut unreferenced: Vec<(u64, AssetId, usize)> = Vec::new();
+        let mut cached = 0usize;
+        let ids: Vec<AssetId> = self.assets.entries.keys().copied().collect();
+        for id in ids {
+            let referenced = self.asset_ref_count(id) > 0;
+            let entry = self.assets.entries.get_mut(&id).expect("listed entry");
+            if referenced {
+                entry.last_used = pump;
+            } else if entry.bytes > 0 && entry.state != AssetState::Loading {
+                cached += entry.bytes;
+                unreferenced.push((entry.last_used, id, entry.bytes));
+            }
+        }
+        if cached <= self.assets.budget {
+            return 0;
+        }
+        unreferenced.sort_unstable();
+        let mut evicted = 0;
+        for (_, id, bytes) in unreferenced {
+            if cached <= self.assets.budget {
+                break;
+            }
+            self.assets.entries.remove(&id);
+            cached -= bytes;
+            evicted += 1;
+        }
+        evicted
+    }
+
     /// Drop the payloads of assets no component references, keeping their
     /// identity (a later reference loads them again). Returns how many.
     pub fn evict_unreferenced_assets(&mut self) -> usize {
@@ -532,6 +636,8 @@ impl World {
             version: 0,
             token,
             payload: None,
+            bytes: 0,
+            last_used: 0,
         });
         entry.token = token;
         let loader = loaders()
@@ -549,15 +655,11 @@ impl World {
         entry.state = AssetState::Loading;
         self.assets.outstanding += 1;
         let sender = self.assets.sender.clone();
-        std::thread::Builder::new()
-            .name(format!("scenedb-asset-{kind}"))
-            .spawn(move || {
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(&source)))
-                        .unwrap_or_else(|_| Err("the loader panicked".to_owned()));
-                let _ = sender.send(Completion { id, token, result });
-            })
-            .expect("spawn asset loader thread");
+        run_load(Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(&source)))
+                .unwrap_or_else(|_| Err("the loader panicked".to_owned()));
+            let _ = sender.send(Completion { id, token, result });
+        }));
         LoadStart::Started
     }
 
@@ -620,4 +722,48 @@ impl World {
         }
         entities
     }
+}
+
+/// `payload`'s size as its kind reports it, or 0.
+fn payload_size(kind: &str, payload: &AssetPayload) -> usize {
+    registries()
+        .sizes
+        .read()
+        .expect("asset sizes poisoned")
+        .get(kind)
+        .map_or(0, |size| size(payload))
+}
+
+type LoadJob = Box<dyn FnOnce() + Send>;
+
+/// How many threads run loaders: the machine's parallelism, at least 4, so
+/// one slow load does not hold up the rest. Loads beyond it queue.
+pub fn asset_load_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .max(4)
+}
+
+/// Queue `job` on the loader threads, starting them on first use.
+fn run_load(job: LoadJob) {
+    static JOBS: std::sync::OnceLock<Sender<LoadJob>> = std::sync::OnceLock::new();
+    let jobs = JOBS.get_or_init(|| {
+        let (sender, receiver) = channel::<LoadJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..asset_load_workers() {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("scenedb-asset-load-{index}"))
+                .spawn(move || loop {
+                    let job = receiver.lock().expect("asset load queue poisoned").recv();
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => return,
+                    }
+                })
+                .expect("spawn asset loader thread");
+        }
+        sender
+    });
+    jobs.send(job).expect("asset loader threads are running");
 }
