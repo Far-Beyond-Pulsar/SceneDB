@@ -30,7 +30,7 @@ use crate::handle_ledger::{CollectHandlesFn, HandleLedgerRegistration};
 
 /// Version of [`Runtime`]'s ABI. Bump it on any change to `Runtime`'s fields
 /// or to a type passed through them.
-pub const ABI_VERSION: u64 = 2;
+pub const ABI_VERSION: u64 = 3;
 
 /// Folded into [`Runtime::abi`] so that a layout change which forgot to bump
 /// [`ABI_VERSION`], or a copy built with other features, is still refused.

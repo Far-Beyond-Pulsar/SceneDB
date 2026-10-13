@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 /// `(file under src/, declarations, why)`.
 const LISTED: &[(&str, usize, &str)] = &[
     (
+        "assets.rs",
+        1,
+        "the loader threads' job queue: each copy runs the loads its own calls start, with the \
+         loaders and payloads shared through the runtime",
+    ),
+    (
         "component.rs",
         2,
         "CID_CACHE: per-copy TypeId -> ComponentId cache, filled from the runtime",
