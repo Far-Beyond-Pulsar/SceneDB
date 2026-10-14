@@ -654,3 +654,112 @@ fn replacing_a_component_with_one_naming_the_same_asset_binds_it_again() {
     // Bindings write through `get_mut`, which does not rebind.
     assert!(!world.asset_work_pending());
 }
+
+/// A component naming a list of assets (a mesh's material slots): its
+/// hand-written collector reports one id per entry, so its count follows
+/// the value.
+#[derive(Clone, Debug, Default)]
+struct Palette {
+    assets: Vec<AssetId>,
+    /// Each asset bound into this palette, in binding order.
+    bound: Vec<AssetId>,
+}
+
+fn collect_palette(value: *const (), out: &mut Vec<pulsar_scenedb::handle_ledger::HandleId>) {
+    // SAFETY: reached only through `Palette`'s own registration, with a
+    // pointer to a live `Palette`.
+    let palette = unsafe { &*(value as *const Palette) };
+    out.extend(palette.assets.iter().map(|id| id.handle()));
+}
+
+pulsar_scenedb::pulsar_reflection::inventory::submit! {
+    pulsar_scenedb::handle_ledger::HandleLedgerRegistration {
+        component_id: pulsar_scenedb::component_id::<Palette>,
+        collect_from_value: collect_palette,
+    }
+}
+
+fn bind_palette(palette: &mut Palette, view: &AssetView) {
+    assert!(
+        palette.assets.contains(&view.id),
+        "bound to an asset the palette does not name"
+    );
+    palette.bound.push(view.id);
+}
+
+#[test]
+fn a_list_of_references_counts_each_entry_and_rebinds_only_new_ones() {
+    let _gate = kind("t-list");
+    register_binding::<Palette>("t-list", bind_palette);
+    let [a, b, c] = ["list/a", "list/b", "list/c"].map(|source| {
+        set_content(source, Ok(vec![1]));
+        AssetId::declare("t-list", source)
+    });
+    let counts = |world: &World| [a, b, c].map(|id| world.asset_ref_count(id));
+    let bound = |world: &World, e| world.get::<Palette>(e).unwrap().bound.clone();
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(
+        e,
+        Palette {
+            assets: vec![a],
+            ..Default::default()
+        },
+    );
+    resolve(&mut world);
+    assert_eq!(counts(&world), [1, 0, 0]);
+    assert_eq!(bound(&world, e), vec![a]);
+
+    // A write that adds an entry references it; the one already there is
+    // neither released nor bound again.
+    world.get_mut::<Palette>(e).unwrap().assets.push(b);
+    assert_eq!(counts(&world), [1, 1, 0]);
+    resolve(&mut world);
+    assert_eq!(bound(&world, e), vec![a, b]);
+    assert_counts_agree(&world);
+
+    // The same id twice is two references (the new one binds, as any new
+    // reference to a resolved asset does).
+    world.get_mut::<Palette>(e).unwrap().assets.push(b);
+    assert_eq!(counts(&world), [1, 2, 0]);
+    resolve(&mut world);
+    assert_eq!(bound(&world, e), vec![a, b, b]);
+
+    // Dropping entries releases them and binds nothing.
+    world
+        .get_mut::<Palette>(e)
+        .unwrap()
+        .assets
+        .retain(|id| *id == b);
+    assert_eq!(counts(&world), [0, 2, 0]);
+    resolve(&mut world);
+    assert_eq!(bound(&world, e), vec![a, b, b], "nothing new to bind");
+
+    // Replacing the value whole with a different-length list counts each
+    // entry once, and (as for any whole replacement) binds every asset it
+    // names, since a new value carries none of the bound data.
+    world.insert(
+        e,
+        Palette {
+            assets: vec![b, c, a],
+            bound: Vec::new(),
+        },
+    );
+    assert_eq!(counts(&world), [1, 1, 1]);
+    resolve(&mut world);
+    let mut rebound = bound(&world, e);
+    rebound.sort_by_key(|id| id.0);
+    let mut expected = vec![a, b, c];
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(rebound, expected);
+    assert_counts_agree(&world);
+
+    // Emptied, then removed: nothing is left referenced.
+    world.get_mut::<Palette>(e).unwrap().assets.clear();
+    assert_eq!(counts(&world), [0, 0, 0]);
+    world.get_mut::<Palette>(e).unwrap().assets = vec![c];
+    assert!(world.remove::<Palette>(e).is_some());
+    assert_eq!(counts(&world), [0, 0, 0]);
+    assert_counts_agree(&world);
+}

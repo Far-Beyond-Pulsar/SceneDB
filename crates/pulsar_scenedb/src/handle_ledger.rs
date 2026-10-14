@@ -168,8 +168,11 @@ pub trait ContentAddressed {
 /// `GpuMirrorRegistration::dispatch`'s `data` contract) onto `out`, in field
 /// declaration order. Pure: no locks, no user callbacks, no allocation
 /// beyond appending to the caller's buffer. Declaration order matters —
-/// `report_value_swap` pairs two collections positionally, so both sides of
-/// a swap are the SAME field ordering by construction.
+/// two collections of the same count are paired positionally, so both sides
+/// of a swap are the SAME field ordering by construction. A hand-written
+/// collector may also report a list whose length follows the value (one id
+/// per entry of a `Vec`); collections of different counts are compared as
+/// multisets, so an id present on both sides keeps its reference.
 pub type CollectHandlesFn = fn(value: *const (), out: &mut Vec<HandleId>);
 
 /// One `#[derive(SceneStore)]` struct's entry in the handle-counting
@@ -357,26 +360,28 @@ pub(crate) fn report_value_swap(
     old: *const (),
     new: *const (),
 ) {
-    // ONE buffer, two passes: the old ids land at [0..n), the new ids at
-    // [n..2n). Deliberately NOT two nested `with_scratch` calls — the inner
+    // ONE buffer, two passes: the old ids land at [0..n), the new ids
+    // after them. Deliberately NOT two nested `with_scratch` calls — the inner
     // one would see its own thread-local already borrowed and fall into the
     // reentrant-fresh-allocation arm EVERY time, silently converting the
     // steady-state no-alloc guarantee back into a per-swap heap hit.
     with_scratch(|buf| {
         (collect)(old, buf);
         let n = buf.len();
-        if n == 0 {
-            return;
-        }
         (collect)(new, buf);
-        debug_assert_eq!(
-            buf.len(),
-            2 * n,
-            "handle-field count changed between two reads of the same type — collector bug"
-        );
-        for i in 0..n.min(buf.len() - n) {
-            let o = buf[i];
-            let v = buf[n + i];
+        let (old, new) = buf.split_at(n);
+        diff_handles(counts, old, new);
+    });
+}
+
+/// Count the change from `old`'s handles to `new`'s. Fixed-shape collectors
+/// (one entry per field) are compared slot by slot. A collector whose
+/// count follows the value (a list of references) gets a multiset
+/// difference: an id in both is untouched, so an unchanged reference is
+/// never released and acquired again (which would rebind its component).
+fn diff_handles(counts: &mut HandleCounts, old: &[HandleId], new: &[HandleId]) {
+    if old.len() == new.len() {
+        for (&o, &v) in old.iter().zip(new) {
             if o == v {
                 continue;
             }
@@ -387,7 +392,36 @@ pub(crate) fn report_value_swap(
                 counts.acquire(v);
             }
         }
-    });
+        return;
+    }
+    let sorted = |ids: &[HandleId]| {
+        let mut ids: Vec<HandleId> = ids.iter().copied().filter(|id| !id.is_zero()).collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids
+    };
+    let (old, new) = (sorted(old), sorted(new));
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        match (old.get(i), new.get(j)) {
+            (Some(o), Some(v)) if o == v => {
+                i += 1;
+                j += 1;
+            }
+            (Some(o), Some(v)) if o.0 < v.0 => {
+                counts.release(*o);
+                i += 1;
+            }
+            (Some(o), None) => {
+                counts.release(*o);
+                i += 1;
+            }
+            (_, Some(v)) => {
+                counts.acquire(*v);
+                j += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
 }
 
 /// First-insert path: acquire every nonzero handle `collect` finds. No
@@ -442,8 +476,8 @@ pub(crate) fn report_value_release(counts: &mut HandleCounts, collect: CollectHa
 /// `get_mut` time by `World::get_mut` -- after that point there is no way
 /// back at the old value, since the caller is about to mutate through the
 /// guard), and only the NEW side is collected live. Same single-buffer
-/// discipline as [`report_value_swap`]: one scratch fill, positional zip
-/// against `captured`.
+/// discipline as [`report_value_swap`]: one scratch fill, compared with
+/// `captured` the same way.
 pub(crate) fn report_captured_swap(
     counts: &mut HandleCounts,
     collect: CollectHandlesFn,
@@ -452,23 +486,7 @@ pub(crate) fn report_captured_swap(
 ) {
     with_scratch(|buf| {
         (collect)(new, buf);
-        debug_assert_eq!(
-            buf.len(),
-            captured_old.len(),
-            "handle-field count changed between get_mut capture and drop -- collector bug"
-        );
-        for (i, &v) in buf.iter().enumerate() {
-            let o = captured_old[i];
-            if o == v {
-                continue;
-            }
-            if !o.is_zero() {
-                counts.release(o);
-            }
-            if !v.is_zero() {
-                counts.acquire(v);
-            }
-        }
+        diff_handles(counts, captured_old, buf);
     });
 }
 

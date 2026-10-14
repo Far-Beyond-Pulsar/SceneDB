@@ -20,7 +20,12 @@ mod var_len;
 /// - `#[gpu(mirror = Once)]` — GPU-mirrored field uploaded once at registration.
 /// - `#[gpu(mirror = DirtyTracked)]` — GPU-mirrored field synced every frame
 ///   (default for bare `#[gpu]`).
-#[proc_macro_derive(SceneStore, attributes(gpu))]
+/// - `#[scene_store(collect_handles = path)]` (on the struct) — references
+///   the type's fields do not spell as `HandleId`/`AssetId` fields (one per
+///   entry of a list, an id derived from a path): `path` is a
+///   `fn(&Self, &mut Vec<HandleId>)` the generated handle collector calls
+///   after the fields.
+#[proc_macro_derive(SceneStore, attributes(gpu, scene_store))]
 pub fn derive_scene_store(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     scene_store::expand(input)
