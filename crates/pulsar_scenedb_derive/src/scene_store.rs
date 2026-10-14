@@ -403,15 +403,17 @@ fn generate_handle_registration(
     name: &Ident,
     ty_generics: &syn::TypeGenerics,
     field_infos: &[FieldInfo],
+    extra: Option<&syn::Path>,
 ) -> TokenStream {
     let handle_fields: Vec<&Ident> = field_infos
         .iter()
         .filter(|f| f.is_handle)
         .map(|f| &f.ident)
         .collect();
-    if handle_fields.is_empty() {
+    if handle_fields.is_empty() && extra.is_none() {
         return quote! {};
     }
+    let extra_call = extra.map(|path| quote! { #path(data, out); });
 
     let collect_fn_name = quote::format_ident!("__scenedb_handle_collect_{}", name);
     quote! {
@@ -430,6 +432,7 @@ fn generate_handle_registration(
                 // `component_id`.
                 let data = unsafe { &*(value as *const #name #ty_generics) };
                 #( out.push(::pulsar_scenedb::handle_ledger::HandleId(data.#handle_fields.0)); )*
+                #extra_call
             }
 
             ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
@@ -770,7 +773,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     // the ledger collector + link-time registration, or nothing at all for
     // structs without handle fields. Computed before the var-len early
     // return so both branches share it -- one source, no drift.
-    let handle_registration = generate_handle_registration(name, &ty_generics, &field_infos);
+    let collect_handles = struct_collect_handles(&input.attrs)?;
+    let handle_registration =
+        generate_handle_registration(name, &ty_generics, &field_infos, collect_handles.as_ref());
 
     if field_infos.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -969,4 +974,23 @@ fn generate_pod_impl(
     quote! {
         unsafe impl #impl_generics ::pulsar_scenedb::page::Pod for #name #ty_generics #wc {}
     }
+}
+
+/// The struct's `#[scene_store(collect_handles = path)]`, if any.
+fn struct_collect_handles(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Path>> {
+    let mut found = None;
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("scene_store"))
+    {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("collect_handles") {
+                found = Some(meta.value()?.parse::<syn::Path>()?);
+                Ok(())
+            } else {
+                Err(meta.error("expected `collect_handles = path`"))
+            }
+        })?;
+    }
+    Ok(found)
 }
