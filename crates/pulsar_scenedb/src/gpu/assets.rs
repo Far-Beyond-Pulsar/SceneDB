@@ -912,6 +912,12 @@ pub enum TextureError {
     SlotVacant,
     /// `slot` was never allocated (`>= slot_count()`).
     SlotOutOfRange,
+    /// [`TextureStore::register_mips`] was given a different number of mip
+    /// levels than the descriptor declares.
+    MipCountMismatch,
+    /// [`TextureStore::register_mips`] was given a level whose byte length is
+    /// not `blocks wide x blocks high x block size` for its extent and format.
+    MipSizeMismatch,
 }
 
 /// SceneDB-owned bindless texture residency (Ownership Law, CONTRACTS C0,
@@ -967,17 +973,7 @@ impl TextureStore {
         desc: &wgpu::TextureDescriptor<'_>,
         data: &[u8],
     ) -> Result<u32, TextureError> {
-        let slot = match self.free.pop() {
-            Some(s) => s,
-            None => {
-                if self.next >= self.max_slots {
-                    return Err(TextureError::SlotsExhausted);
-                }
-                let s = self.next;
-                self.next += 1;
-                s
-            }
-        };
+        let slot = self.allocate_slot()?;
 
         let texture = device.create_texture(desc);
 
@@ -1028,6 +1024,123 @@ impl TextureStore {
         }
         self.textures[slot_idx] = Some(texture);
 
+        Ok(slot)
+    }
+
+    /// Like [`Self::register`], for a texture with a mip chain and/or a
+    /// block-compressed format (BC, ETC2, ASTC).
+    ///
+    /// `mips[i]` is the bytes of level `i`, tightly packed rows of blocks (a
+    /// texel for an uncompressed format): `ceil(width_i / block_width)` blocks
+    /// per row, `ceil(height_i / block_height)` rows, each block
+    /// `format.block_copy_size` bytes. Its length is checked against that, and
+    /// the count of levels against `desc.mip_level_count`, before a slot is
+    /// taken, so a bad call costs nothing.
+    ///
+    /// For a compressed format the device must have been created with the
+    /// matching feature (`TEXTURE_COMPRESSION_BC` and so on), and the level 0
+    /// extent must be a multiple of the block size: both are wgpu rules, and
+    /// wgpu reports them when the texture is created. Smaller levels round up
+    /// to whole blocks.
+    pub fn register_mips(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        mips: &[&[u8]],
+    ) -> Result<u32, TextureError> {
+        assert_eq!(
+            (desc.dimension, desc.size.depth_or_array_layers, desc.sample_count),
+            (wgpu::TextureDimension::D2, 1, 1),
+            "TextureStore::register_mips takes a single-layer, single-sample 2D texture"
+        );
+        if mips.len() != desc.mip_level_count as usize {
+            return Err(TextureError::MipCountMismatch);
+        }
+        let (block_width, block_height) = desc.format.block_dimensions();
+        let block_size = desc
+            .format
+            .block_copy_size(None)
+            .expect("depth-stencil and multi-planar formats have no single block_copy_size");
+        let layouts: Vec<(wgpu::Extent3d, u32, u32)> = (0..desc.mip_level_count)
+            .map(|level| {
+                let logical = desc
+                    .mip_level_size(level)
+                    .expect("level is within the descriptor's mip count");
+                let physical = logical.physical_size(desc.format);
+                let blocks_wide = physical.width / block_width;
+                let blocks_high = physical.height / block_height;
+                (physical, blocks_wide * block_size, blocks_high)
+            })
+            .collect();
+        for (data, (_, bytes_per_row, rows)) in mips.iter().zip(&layouts) {
+            if data.len() != (*bytes_per_row as usize) * (*rows as usize) {
+                return Err(TextureError::MipSizeMismatch);
+            }
+        }
+
+        let slot = self.allocate_slot()?;
+        let texture = device.create_texture(desc);
+        for (level, (data, (physical, bytes_per_row, rows))) in
+            mips.iter().zip(&layouts).enumerate()
+        {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(*bytes_per_row),
+                    rows_per_image: Some(*rows),
+                },
+                *physical,
+            );
+        }
+        self.upload_count += 1;
+        let index = slot as usize;
+        if index >= self.textures.len() {
+            self.textures.resize_with(index + 1, || None);
+        }
+        self.textures[index] = Some(texture);
+        Ok(slot)
+    }
+
+    /// The next free slot (LIFO reuse, else a fresh index), or
+    /// `SlotsExhausted`.
+    fn allocate_slot(&mut self) -> Result<u32, TextureError> {
+        match self.free.pop() {
+            Some(slot) => Ok(slot),
+            None => {
+                if self.next >= self.max_slots {
+                    return Err(TextureError::SlotsExhausted);
+                }
+                let slot = self.next;
+                self.next += 1;
+                Ok(slot)
+            }
+        }
+    }
+
+    /// Gives an *existing* texture a slot in this store, with no upload.
+    ///
+    /// A texture is a device resource, not a scene resource: scenes on the
+    /// same device (two viewports of one level) can show the same image from
+    /// one GPU allocation. `wgpu::Texture` is reference-counted, so the store
+    /// holds a clone and the memory is freed when the last store (and the
+    /// caller's cache) lets go. The caller is responsible for `texture` being
+    /// from this store's device and suitable for the bindless array
+    /// (`TEXTURE_BINDING`); nothing here checks either.
+    pub fn register_shared(&mut self, texture: wgpu::Texture) -> Result<u32, TextureError> {
+        let slot = self.allocate_slot()?;
+        let index = slot as usize;
+        if index >= self.textures.len() {
+            self.textures.resize_with(index + 1, || None);
+        }
+        self.textures[index] = Some(texture);
         Ok(slot)
     }
 

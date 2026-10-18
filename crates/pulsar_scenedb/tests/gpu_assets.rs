@@ -1476,3 +1476,46 @@ fn meshlet_buffer_upload_count_increments_on_append_and_rebuild_not_on_rejection
     assert_eq!(err, Err(MeshletError::InvalidRadius));
     assert_eq!(meshlets.upload_count(), 2, "rejected append (invalid radius) does not increment");
 }
+
+#[test]
+fn a_texture_can_be_shared_between_stores_without_a_second_upload() {
+    let ctx = test_context();
+    let mut first = TextureStore::new(16);
+    let mut second = TextureStore::new(16);
+    let slot_a = first
+        .register(ctx.device(), ctx.queue(), &rgba_desc(1, 1), &[1u8, 2, 3, 4])
+        .expect("first register uploads");
+    let shared = first.texture(slot_a).expect("resident").clone();
+
+    let slot_b = second.register_shared(shared).expect("adopt");
+    assert_eq!(first.upload_count(), 1);
+    assert_eq!(second.upload_count(), 0, "adopting a texture uploads nothing");
+    assert_eq!(
+        first.texture(slot_a),
+        second.texture(slot_b),
+        "both stores hold the same GPU texture"
+    );
+
+    // The adopted slot behaves like any other: it can be dropped and recycled,
+    // and dropping it from one store leaves the other's texture alive.
+    second.unregister(slot_b).expect("unregister");
+    assert!(second.texture(slot_b).is_none());
+    assert!(first.texture(slot_a).is_some());
+    let reused = second
+        .register_shared(first.texture(slot_a).unwrap().clone())
+        .expect("recycled");
+    assert_eq!(reused, slot_b, "the freed slot is reused");
+}
+
+#[test]
+fn adopting_a_texture_into_a_full_store_is_a_hard_error() {
+    let ctx = test_context();
+    let mut source = TextureStore::new(16);
+    let slot = source
+        .register(ctx.device(), ctx.queue(), &rgba_desc(1, 1), &[0u8; 4])
+        .expect("register");
+    let texture = source.texture(slot).unwrap().clone();
+    let mut tiny = TextureStore::new(1);
+    tiny.register_shared(texture.clone()).expect("fits");
+    assert_eq!(tiny.register_shared(texture), Err(TextureError::SlotsExhausted));
+}

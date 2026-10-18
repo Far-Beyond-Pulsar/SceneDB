@@ -66,6 +66,8 @@
 pub mod actor;
 pub mod archetype;
 pub mod assets;
+pub mod derived;
+pub mod residency;
 pub mod bundle;
 pub mod cell;
 pub mod cell_type;
@@ -117,6 +119,14 @@ pub use assets::{
     AssetPayload, AssetPumpReport, AssetState, AssetView, SizeFn, DEFAULT_ASSET_CACHE_BUDGET,
 };
 pub use bundle::Bundle;
+pub use derived::{
+    derive_cached, derived_cache_dir, forget_derived, derived_stats, prune_derived_cache, set_derived_cache_dir,
+    DerivedRequest, DerivedStats, PruneReport,
+};
+pub use residency::{
+    residency_budget, residency_stats, set_residency_budget, Prefetch, Residency, ResidencyStats,
+    DEFAULT_RESIDENCY_BUDGET,
+};
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use change_journal::{ChangeCursor, ChangeRead, ComponentChange, ComponentChangeKind};
