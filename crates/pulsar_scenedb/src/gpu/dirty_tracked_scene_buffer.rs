@@ -131,6 +131,28 @@ struct DirtyTrackedState<T: Pod> {
     /// capacity; grown lazily inside `flush` itself, same as `buf`.
     scatter_indices: DynamicGpuBuffer<u32>,
     scatter_values: DynamicGpuBuffer<u32>,
+    /// The rows the last non-empty flush wrote, as `[count, row0, row1, ..]`
+    /// (see [`FlushedRows`]); kept so GPU consumers can visit only those rows.
+    flushed: DynamicGpuBuffer<u32>,
+    flushed_count: u32,
+    flush_sequence: u64,
+}
+
+/// The rows the most recent non-empty [`DirtyTrackedSceneBuffer::flush`]
+/// wrote, for GPU consumers that only need to revisit what changed.
+///
+/// `buffer` holds `[count, row0, row1, ..]` as `u32` words, rows ascending;
+/// `count` is also known on the CPU so dispatches can be sized without a
+/// readback. The list describes exactly one flush: `sequence` counts
+/// non-empty flushes, so a consumer that last saw `sequence - 1` has seen
+/// every write since, and any other gap (or a reallocation of the data
+/// buffer, see [`DirtyTrackedSceneBuffer::epoch`]) means it must treat every
+/// row as changed. The buffer is overwritten by the next non-empty flush.
+#[derive(Clone, Debug)]
+pub struct FlushedRows {
+    pub buffer: wgpu::Buffer,
+    pub count: u32,
+    pub sequence: u64,
 }
 
 /// Grows `state.shadow`/`state.dirty` (pure CPU, no GPU work) to cover
@@ -276,6 +298,9 @@ pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
     /// See [`DirtyTrackedSceneBuffer::epoch`].
     fn epoch(&self) -> u64;
 
+    /// See [`DirtyTrackedSceneBuffer::flushed_rows`].
+    fn flushed_rows(&self) -> Option<FlushedRows>;
+
     /// Type-erased counterpart to [`DirtyTrackedSceneBuffer::get`] — `None`
     /// if `row` has never been written. Lets a caller that only has a
     /// `ComponentId` in hand (e.g. [`super::SceneGpuStore::read_dirty_tracked_row_bytes`])
@@ -321,7 +346,16 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
         let scatter = Arc::new(ScatterWritePipeline::new(&device));
         Self {
             scatter,
-            state: RwLock::new(DirtyTrackedState { buf, shadow, dirty, scatter_indices, scatter_values }),
+            state: RwLock::new(DirtyTrackedState {
+                buf,
+                shadow,
+                dirty,
+                scatter_indices,
+                scatter_values,
+                flushed: DynamicGpuBuffer::new(&device, &format!("{label}-flushed-rows"), 1),
+                flushed_count: 0,
+                flush_sequence: 0,
+            }),
             device,
         }
     }
@@ -455,8 +489,30 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             let DirtyTrackedState { buf, shadow, scatter_indices, scatter_values, .. } = &mut *state;
             flush_via_scatter(&self.device, queue, &self.scatter, buf, shadow, scatter_indices, scatter_values, &dirty_rows)
         };
+        // Expose which rows this flush wrote: one O(dirty) upload.
+        let count = dirty_rows.len() as u32;
+        let mut list = Vec::with_capacity(dirty_rows.len() + 1);
+        list.push(count);
+        list.extend_from_slice(&dirty_rows);
+        state
+            .flushed
+            .ensure_capacity(&self.device, queue, count + 1)
+            .expect("flushed-row list has no max_capacity -- growth cannot fail");
+        state.flushed.write(queue, 0, &list);
+        state.flushed_count = count;
+        state.flush_sequence += 1;
         state.dirty.clear_all();
         stats
+    }
+
+    /// The rows the last non-empty flush wrote; `None` before the first.
+    pub fn flushed_rows(&self) -> Option<FlushedRows> {
+        let state = self.state.read().expect("DirtyTrackedSceneBuffer lock poisoned");
+        (state.flush_sequence > 0).then(|| FlushedRows {
+            buffer: state.flushed.buffer().clone(),
+            count: state.flushed_count,
+            sequence: state.flush_sequence,
+        })
     }
 
     pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
@@ -503,6 +559,10 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedGpuBufferDispatch for DirtyTrac
 
     fn flush(&self, queue: &wgpu::Queue) -> SyncStats {
         DirtyTrackedSceneBuffer::flush(self, queue)
+    }
+
+    fn flushed_rows(&self) -> Option<FlushedRows> {
+        DirtyTrackedSceneBuffer::flushed_rows(self)
     }
 
     fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
@@ -772,5 +832,33 @@ mod tests {
 
         let (device, _queue) = test_device();
         let _buf: DirtyTrackedSceneBuffer<ThreeBytes> = DirtyTrackedSceneBuffer::new(device, "test", 4);
+    }
+
+    #[test]
+    fn flush_exposes_the_rows_it_wrote_as_a_counted_ascending_list() {
+        let (device, queue) = test_device();
+        let buf: DirtyTrackedSceneBuffer<u32> = DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", 64);
+        assert!(buf.flushed_rows().is_none(), "nothing flushed yet");
+
+        buf.mark_dirty(40, 1);
+        buf.mark_dirty(3, 2);
+        buf.mark_dirty(17, 3);
+        buf.flush(&queue);
+        let first = buf.flushed_rows().expect("flushed");
+        assert_eq!((first.count, first.sequence), (3, 1));
+        let words = readback(&device, &queue, &first.buffer, 4 * 4);
+        let words: Vec<u32> = words.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(words, vec![3, 3, 17, 40]);
+
+        // An empty flush changes nothing; the next real one replaces the list.
+        buf.flush(&queue);
+        assert_eq!(buf.flushed_rows().unwrap().sequence, 1);
+        buf.mark_dirty(9, 4);
+        buf.flush(&queue);
+        let second = buf.flushed_rows().unwrap();
+        assert_eq!((second.count, second.sequence), (1, 2));
+        let words = readback(&device, &queue, &second.buffer, 2 * 4);
+        let words: Vec<u32> = words.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(words, vec![1, 9]);
     }
 }

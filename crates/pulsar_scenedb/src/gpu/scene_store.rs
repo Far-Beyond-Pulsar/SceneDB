@@ -11,7 +11,7 @@
 
 use super::{
     BufferAccess, BufferHandle, BufferKey, CapacityError, DirtyMask, DirtyTrackedGpuBufferDispatch,
-    DirtyTrackedSceneBuffer, EngineGpuContext, GenerationBuffer, GpuBufferDispatch,
+    DirtyTrackedSceneBuffer, EngineGpuContext, FlushedRows, GenerationBuffer, GpuBufferDispatch,
     GpuBufferRegistry, GrowableGpuBufferDispatch, GrowableSceneBuffer, RegionError, RegionPool,
     SceneBuffer, SimulateWitness, SubmissionTracker, SyncStats,
 };
@@ -845,6 +845,17 @@ impl SceneGpuStore {
         };
         self.registry.sync(key, buffer, epoch);
         self.registry.resolve(key)
+    }
+
+    /// The rows `key`'s buffer received in its last non-empty mirror flush
+    /// (see [`FlushedRows`]). `None` unless `key` is a dirty-tracked column
+    /// that has flushed.
+    pub fn flushed_rows(&self, key: BufferKey) -> Option<FlushedRows> {
+        let owners = self.owners.read().expect("SceneGpuStore owners lock poisoned");
+        match &owners.get(&key)?.kind {
+            SharedKind::DirtyTracked(b) => b.flushed_rows(),
+            _ => None,
+        }
     }
 
     /// The `BufferKey` a `ComponentId` was registered under, if any — lets

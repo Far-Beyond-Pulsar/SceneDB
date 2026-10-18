@@ -79,7 +79,7 @@ pub use buffer_registry::{
 };
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
-pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer};
+pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, FlushedRows};
 pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
 pub use growable_scene_buffer::{GrowableGpuBufferDispatch, GrowableSceneBuffer};
 pub use generation::GenerationBuffer;

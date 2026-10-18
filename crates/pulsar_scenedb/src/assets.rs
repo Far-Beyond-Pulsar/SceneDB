@@ -243,9 +243,13 @@ pub(crate) struct AssetRegistries {
     loaders: RwLock<HashMap<&'static str, LoadFn>>,
     bindings: RwLock<HashMap<&'static str, Vec<Binding>>>,
     sizes: RwLock<HashMap<&'static str, SizeFn>>,
+    /// The residency cache (see [`crate::residency`]).
+    pub(crate) residency: Mutex<crate::residency::State>,
+    /// The derived-data cache (see [`crate::derived`]).
+    pub(crate) derived: Mutex<crate::derived::State>,
 }
 
-fn registries() -> &'static AssetRegistries {
+pub(crate) fn registries() -> &'static AssetRegistries {
     (crate::runtime::runtime().asset_registries)()
 }
 
@@ -734,7 +738,7 @@ fn payload_size(kind: &str, payload: &AssetPayload) -> usize {
         .map_or(0, |size| size(payload))
 }
 
-type LoadJob = Box<dyn FnOnce() + Send>;
+pub(crate) type LoadJob = Box<dyn FnOnce() + Send>;
 
 /// How many threads run loaders: the machine's parallelism, at least 4, so
 /// one slow load does not hold up the rest. Loads beyond it queue.
@@ -745,7 +749,7 @@ pub fn asset_load_workers() -> usize {
 }
 
 /// Queue `job` on the loader threads, starting them on first use.
-fn run_load(job: LoadJob) {
+pub(crate) fn run_load(job: LoadJob) {
     static JOBS: std::sync::OnceLock<Sender<LoadJob>> = std::sync::OnceLock::new();
     let jobs = JOBS.get_or_init(|| {
         let (sender, receiver) = channel::<LoadJob>();
