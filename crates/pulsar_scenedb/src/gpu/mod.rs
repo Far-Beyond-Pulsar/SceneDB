@@ -90,7 +90,7 @@ pub use grid::{
 pub use harvest::{
     revalidate_run, HarvestLease, HarvestPipeline, HarvestStaging, HarvestStats, MeshClass, View,
 };
-pub use interned_pool::InternedVarLenPool;
+pub use interned_pool::{InternedGpuLease, InternedVarLenPool};
 pub use placement::{GpuHeavy, GpuRef, structural_content_id};
 pub use phase::{BoundaryPhase, CompactedPhase, FrameDriver, HarvestPhase, RetiredPhase, SimulateA, SimulateB, SimulateWitness};
 pub use readback::{readback_bytes, readback_row};
