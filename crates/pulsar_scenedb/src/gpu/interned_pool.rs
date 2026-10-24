@@ -79,6 +79,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use super::tier::{TierAuditKey, TierAuditRecord, TierEngine, TieredInternedHooks, StaticSnapshot};
+use super::dynamic_buffer::CapacityError;
 use super::var_len_pool::VarLenGpuPool;
 use super::VarLenHandle;
 use crate::handle_ledger::HandleId;
@@ -280,55 +281,76 @@ impl<T: Pod + Send + Sync + 'static> InternedVarLenPool<T> {
             Self::decref_locked(&mut state, &self.pool, old_id);
         }
 
-        let new_range = if let Some((range, mismatch)) = {
-            // Named-field destructure (not `state.entries.get_mut(..)`
-            // directly): gives `entries`/`warned_collision` disjoint local
-            // `&mut` bindings so the borrow checker can see the two field
-            // touches below don't alias, without needing a second lock
-            // round-trip.
-            let InternState { entries, warned_collision, .. } = &mut *state;
-            entries.get_mut(&new_id).map(|entry| {
-                entry.refcount += 1;
-                let fp = fingerprint(data);
-                let mismatch = fp != entry.fingerprint && warned_collision.insert(new_id);
-                (entry.range, mismatch)
-            })
-        } {
-            if mismatch {
-                tracing::warn!(
-                    "InternedVarLenPool: content id {new_id:?} uploaded with DIFFERENT bytes than \
-                     its first writer -- first-writer-wins, original resident bytes kept unchanged. \
-                     This means an upstream content-id computation produced the same id for two \
-                     different payloads (a real bug there), not a supported update-in-place path. \
-                     This diagnostic fires once per id."
-                );
-            }
-            range
-        } else {
-            let range = self
-                .pool
-                .write_var_row(queue, VarLenHandle::default(), data)
-                .expect("interned var-len pool grows transparently, same no-capacity-ceiling contract as VarLenGpuPool itself");
-            let last_use = self
-                .engine
-                .read()
-                .expect("InternedVarLenPool engine lock poisoned")
-                .as_ref()
-                .map_or(0, |(engine, _)| engine.stamp());
-            state.entries.insert(
-                new_id,
-                InternEntry {
-                    range,
-                    refcount: 1,
-                    fingerprint: fingerprint(data),
-                    residency: StaticResidency { tier: super::tier::Tier::Ram, last_use },
-                },
-            );
-            range
-        };
+        let new_range = self
+            .intern_locked(&mut state, queue, new_id, data)
+            .expect("interned var-len pool grows transparently, same no-capacity-ceiling contract as VarLenGpuPool itself");
 
         state.set_row(row, new_id, VarLenHandle::default());
         new_range
+    }
+
+    /// Takes one reference on `id`'s interned range: an existing entry's
+    /// refcount goes up (first writer wins: a different payload fires the
+    /// once-per-id collision diagnostic and keeps the resident bytes), a new
+    /// one is allocated and written. `id` is nonzero.
+    fn intern_locked(
+        &self,
+        state: &mut InternState,
+        queue: &wgpu::Queue,
+        id: HandleId,
+        data: &[T],
+    ) -> Result<VarLenHandle, CapacityError> {
+        // Named-field destructure: `entries`/`warned_collision` as disjoint
+        // `&mut` bindings, without a second lock round-trip.
+        let InternState { entries, warned_collision, .. } = state;
+        if let Some(entry) = entries.get_mut(&id) {
+            entry.refcount += 1;
+            if fingerprint(data) != entry.fingerprint && warned_collision.insert(id) {
+                tracing::warn!(
+                    "InternedVarLenPool: content id {id:?} uploaded with DIFFERENT bytes than                      its first writer -- first-writer-wins, original resident bytes kept unchanged.                      This means an upstream content-id computation produced the same id for two                      different payloads (a real bug there), not a supported update-in-place path.                      This diagnostic fires once per id."
+                );
+            }
+            return Ok(entry.range);
+        }
+        let range = self.pool.write_var_row(queue, VarLenHandle::default(), data)?;
+        let last_use = self
+            .engine
+            .read()
+            .expect("InternedVarLenPool engine lock poisoned")
+            .as_ref()
+            .map_or(0, |(engine, _)| engine.stamp());
+        entries.insert(
+            id,
+            InternEntry {
+                range,
+                refcount: 1,
+                fingerprint: fingerprint(data),
+                residency: StaticResidency { tier: super::tier::Tier::Ram, last_use },
+            },
+        );
+        Ok(range)
+    }
+
+    /// A reference on `id`'s content held by its owner rather than an entity
+    /// row: the same shared range every row and lease naming `id` gets
+    /// (allocated and written by the first of them), released when the
+    /// lease drops. For GPU consumers that share an asset's buffers without a
+    /// row of their own (another renderer's view of a mesh, a cache).
+    /// [`HandleId::ZERO`] has no identity to share: the lease owns a private
+    /// range instead.
+    pub fn acquire_shared(
+        self: &Arc<Self>,
+        queue: &wgpu::Queue,
+        id: HandleId,
+        data: &[T],
+    ) -> Result<InternedGpuLease<T>, CapacityError> {
+        let range = if id.is_zero() {
+            self.pool.write_var_row(queue, VarLenHandle::default(), data)?
+        } else {
+            let mut state = self.state.write().expect("InternedVarLenPool lock poisoned");
+            self.intern_locked(&mut state, queue, id, data)?
+        };
+        Ok(InternedGpuLease { pool: Arc::clone(self), id, range })
     }
 
     /// Despawn/removal path: release whatever id `row` currently holds (if
@@ -483,6 +505,43 @@ mod tests {
     }
 
     #[test]
+    fn a_lease_shares_a_rows_range_and_outlives_it() {
+        let (device, queue) = test_device();
+        let p = Arc::new(pool(&device));
+        let id = HandleId(3);
+
+        let row = p.upsert_row(&queue, 0, id, &[4, 5, 6]);
+        let lease = p.acquire_shared(&queue, id, &[4, 5, 6]).unwrap();
+        assert_eq!(lease.range(), row, "a lease and a row naming one id share its range");
+        assert_eq!(p.audit(), vec![(id, 2, 12)]);
+        p.release_row(0);
+        assert_eq!(p.resolve(id), Some((row.offset, row.count)), "the lease keeps it resident");
+        drop(lease);
+        assert!(p.audit().is_empty(), "the last reference was the lease");
+        assert_eq!(p.resolve(id), None);
+    }
+
+    #[test]
+    fn leases_alone_share_and_free() {
+        let (device, queue) = test_device();
+        let p = Arc::new(pool(&device));
+        let id = HandleId(5);
+        let a = p.acquire_shared(&queue, id, &[1, 2]).unwrap();
+        let b = p.acquire_shared(&queue, id, &[1, 2]).unwrap();
+        assert_eq!(a.range(), b.range());
+        assert_eq!(p.audit(), vec![(id, 2, 8)]);
+        drop(a);
+        assert_eq!(p.audit(), vec![(id, 1, 8)]);
+        drop(b);
+        assert!(p.audit().is_empty());
+        // No identity: a private range, freed with the lease.
+        let private = p.acquire_shared(&queue, HandleId::ZERO, &[7, 7, 7]).unwrap();
+        assert_eq!(private.range().count, 3);
+        assert!(p.audit().is_empty(), "a private range is not interned");
+        drop(private);
+    }
+
+    #[test]
     fn equal_id_rewrite_is_a_true_no_op() {
         let (device, queue) = test_device();
         let p = pool(&device);
@@ -570,5 +629,37 @@ mod tests {
         let p = pool(&device);
         p.release_row(999); // never written, way past id_by_row's length
         assert!(p.audit().is_empty());
+    }
+}
+/// One reference on an [`InternedVarLenPool`] range held outside the row
+/// tables ([`InternedVarLenPool::acquire_shared`]): the range stays resident
+/// while any row or lease names its id, and this lease's reference goes when
+/// it drops.
+pub struct InternedGpuLease<T: Pod + Send + Sync + 'static> {
+    pool: Arc<InternedVarLenPool<T>>,
+    id: HandleId,
+    range: VarLenHandle,
+}
+
+impl<T: Pod + Send + Sync + 'static> InternedGpuLease<T> {
+    /// The shared `{offset, count}` in the pool's buffer.
+    pub fn range(&self) -> VarLenHandle {
+        self.range
+    }
+
+    /// The content id held ([`HandleId::ZERO`]: a private range).
+    pub fn id(&self) -> HandleId {
+        self.id
+    }
+}
+
+impl<T: Pod + Send + Sync + 'static> Drop for InternedGpuLease<T> {
+    fn drop(&mut self) {
+        if self.id.is_zero() {
+            self.pool.pool.free_handle(self.range);
+            return;
+        }
+        let mut state = self.pool.state.write().expect("InternedVarLenPool lock poisoned");
+        InternedVarLenPool::decref_locked(&mut state, &self.pool.pool, self.id);
     }
 }
