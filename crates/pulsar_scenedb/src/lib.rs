@@ -63,7 +63,6 @@
 //! (Task 11) is **gated on Rev 2.4 R8** (unapproved as of M3-α) and carries
 //! to M3-β. M3-β (cull/indirect passes, Tests 13/2/4/5) is next.
 
-pub mod actor;
 pub mod archetype;
 pub mod assets;
 pub mod derived;
@@ -112,7 +111,6 @@ pub mod telemetry;
 #[cfg(feature = "telemetry")]
 pub mod world_telemetry;
 
-pub use actor::{Actor, ActorRegistry};
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use assets::{
     asset_load_workers, register_binding, register_loader, register_payload_size, AssetId,

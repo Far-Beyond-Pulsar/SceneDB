@@ -536,71 +536,6 @@ fn adversarial_random_component_churn() {
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// 8.  Actor lifecycle
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-struct TestActor {
-    pub began: bool,
-    pub ended: bool,
-    pub ticked: u32,
-}
-
-impl Actor for TestActor {
-    fn begin_play(&mut self, _entity: Entity, _world: &mut World) {
-        self.began = true;
-    }
-    fn end_play(&mut self, _entity: Entity, _world: &mut World) {
-        self.ended = true;
-    }
-    fn tick(&mut self, _entity: Entity, _world: &mut World) {
-        self.ticked += 1;
-    }
-}
-
-#[test]
-fn correctness_actor_register_tick_deregister() {
-    let mut world = World::new();
-    let mut registry = ActorRegistry::new();
-
-    let actor = TestActor {
-        began: false,
-        ended: false,
-        ticked: 0,
-    };
-    let entity = registry.register(actor, &mut world);
-    assert!(world.is_alive(entity));
-
-    // Tick once
-    registry.tick_all(&mut world);
-
-    // Deregister
-    registry.deregister(entity, &mut world);
-    assert!(!world.is_alive(entity));
-}
-
-#[test]
-fn correctness_actor_slot_reuse() {
-    let mut world = World::new();
-    let mut registry = ActorRegistry::new();
-
-    let e1 = registry.register(
-        TestActor { began: false, ended: false, ticked: 0 },
-        &mut world,
-    );
-    let idx1 = e1.index();
-    registry.deregister(e1, &mut world);
-
-    // New actor should reuse the entity slot
-    let e2 = registry.register(
-        TestActor { began: false, ended: false, ticked: 0 },
-        &mut world,
-    );
-    assert_eq!(e2.index(), idx1, "entity slot should be reused");
-    assert_ne!(e2.generation(), e1.generation());
-    assert!(world.is_alive(e2));
-}
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // 9.  Schedule
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
@@ -1783,61 +1718,6 @@ fn stress_schedule_mutate_components() {
             // Value may or may not be present depending on system order
         }
     }
-}
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// 21.  Actor lifecycle edge cases
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-/// Multiple actors registered, each creating entities in begin_play, verifying
-/// despawn order and entity slot reuse.
-#[test]
-fn stress_actor_mass_register_deregister() {
-    struct Spawner;
-
-    impl Actor for Spawner {
-        fn begin_play(&mut self, _entity: Entity, world: &mut World) {
-            // Spawn 10 children in begin_play.
-            for i in 0..10 {
-                let child = world.spawn();
-                world.insert(child, Health(i));
-            }
-        }
-    }
-
-    let mut world = World::new();
-    let mut registry = ActorRegistry::new();
-
-    // Register 50 actors, each spawning 10 children = 500 children total.
-    let actor_entities: Vec<Entity> = (0..50)
-        .map(|_| registry.register(Spawner, &mut world))
-        .collect();
-
-    // Total entities = 500 children + 50 actors.
-    let total = world.query::<()>().count();
-    assert_eq!(total, 550);
-
-    // Deregister all actors (should also wipe their children? No â€” children
-    // are independent entities, they survive actor deregistration).
-    for &e in &actor_entities {
-        registry.deregister(e, &mut world);
-    }
-
-    // Children still exist.
-    let child_count = world.query::<(&Health,)>().count();
-    assert_eq!(child_count, 500);
-
-    // The actors are gone.
-    let actor_count = world.query::<()>().count();
-    assert_eq!(actor_count, 500);
-
-    // Clean up children.
-    let children: Vec<Entity> = world.query::<(&Health,)>().map(|(e, _)| e).collect();
-    for e in children {
-        world.despawn(e);
-    }
-
-    world.assert_archetype_consistency();
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
