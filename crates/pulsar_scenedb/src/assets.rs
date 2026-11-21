@@ -413,6 +413,8 @@ pub(crate) struct AssetTable {
     priority: Option<AssetPriorityFn>,
     scores: HashMap<AssetId, f32>,
     scored_at: u64,
+    /// Where the viewer is; the priority function reads it.
+    focus: [f64; 3],
 }
 
 /// The default [`World::set_asset_cache_budget`]: 256 MiB of payloads no
@@ -438,6 +440,7 @@ impl Default for AssetTable {
             priority: None,
             scores: HashMap::new(),
             scored_at: 0,
+            focus: [0.0; 3],
         }
     }
 }
@@ -740,6 +743,18 @@ impl World {
     /// the rest wait, nearest first. At least 1.
     pub fn set_max_loads_in_flight(&mut self, max: usize) {
         self.assets.max_in_flight = max.max(1);
+    }
+
+    /// Where the viewer is, in world space: what a priority function
+    /// ([`Self::set_asset_priority`]) measures distance from. Set it each
+    /// frame; requests still waiting are rescored from it periodically.
+    pub fn set_asset_focus(&mut self, focus: [f64; 3]) {
+        self.assets.focus = focus;
+    }
+
+    /// The point [`Self::set_asset_focus`] set.
+    pub fn asset_focus(&self) -> [f64; 3] {
+        self.assets.focus
     }
 
 
