@@ -554,7 +554,8 @@ fn loads_beyond_the_worker_count_queue_and_all_finish() {
             (e, source)
         })
         .collect();
-    assert_eq!(world.pump_assets().started, count);
+    // Only the in-flight cap starts at once; the rest follow as those finish.
+    assert_eq!(world.pump_assets().started, count.min(asset_load_workers() * 2));
     resolve(&mut world);
 
     assert!(
