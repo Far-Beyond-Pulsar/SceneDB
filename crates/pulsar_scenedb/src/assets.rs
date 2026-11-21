@@ -440,9 +440,7 @@ impl World {
         }
 
         // Bind.
-        for id in to_bind {
-            report.bound += self.bind_dependents(id);
-        }
+        report.bound += self.bind_dependents(&to_bind);
         report.loading = self
             .assets
             .entries
@@ -667,47 +665,74 @@ impl World {
         LoadStart::Started
     }
 
-    /// Bind every component that currently references `id` to its entry.
-    fn bind_dependents(&mut self, id: AssetId) -> usize {
-        let Some(entry) = self.assets.entries.get(&id) else {
-            return 0;
-        };
-        let kind = entry.kind;
-        let source = entry.source.clone();
-        let state = entry.state.clone();
-        let version = entry.version;
-        let payload = entry.payload.clone();
-        let view = AssetView {
-            id,
-            kind,
-            source: &source,
-            state: &state,
-            version,
-            payload: payload.as_ref(),
-        };
-        let kind_bindings = bindings()
-            .read()
-            .expect("asset bindings poisoned")
-            .get(kind)
-            .cloned()
-            .unwrap_or_default();
+    /// Bind every component that references any of `ids` to its entry.
+    ///
+    /// One walk of each bound component's column serves every asset of the
+    /// kind, so a pump that completes N assets costs one pass over the
+    /// entities, not N. The pump runs under the world's write lock: with each
+    /// asset scanning every row itself, a level with thousands of assets and
+    /// entities froze every reader for seconds.
+    fn bind_dependents(&mut self, ids: &HashSet<AssetId>) -> usize {
+        let mut by_kind: HashMap<&'static str, Vec<AssetId>> = HashMap::new();
+        for &id in ids {
+            if let Some(entry) = self.assets.entries.get(&id) {
+                by_kind.entry(entry.kind).or_default().push(id);
+            }
+        }
         let mut bound = 0;
-        for binding in kind_bindings {
-            let component = (binding.component)();
-            for entity in self.entities_referencing(component, id.handle()) {
-                (binding.apply)(self, entity, &view);
-                bound += 1;
+        for (kind, kind_ids) in by_kind {
+            let kind_bindings = bindings()
+                .read()
+                .expect("asset bindings poisoned")
+                .get(kind)
+                .cloned()
+                .unwrap_or_default();
+            let wanted: HashSet<HandleId> = kind_ids.iter().map(|id| id.handle()).collect();
+            let found: Vec<HashMap<HandleId, Vec<Entity>>> = kind_bindings
+                .iter()
+                .map(|binding| self.entities_referencing((binding.component)(), &wanted))
+                .collect();
+            for id in kind_ids {
+                let Some(entry) = self.assets.entries.get(&id) else {
+                    continue;
+                };
+                let source = entry.source.clone();
+                let state = entry.state.clone();
+                let version = entry.version;
+                let payload = entry.payload.clone();
+                let view = AssetView {
+                    id,
+                    kind,
+                    source: &source,
+                    state: &state,
+                    version,
+                    payload: payload.as_ref(),
+                };
+                for (binding, found) in kind_bindings.iter().zip(&found) {
+                    let Some(entities) = found.get(&id.handle()) else {
+                        continue;
+                    };
+                    for &entity in entities {
+                        (binding.apply)(self, entity, &view);
+                        bound += 1;
+                    }
+                }
             }
         }
         bound
     }
 
-    /// The entities whose `component` holds `handle` in a counted field.
-    fn entities_referencing(&self, component: ComponentId, handle: HandleId) -> Vec<Entity> {
+    /// The entities whose `component` holds each of `wanted` in a counted
+    /// field, found in one walk of the column.
+    fn entities_referencing(
+        &self,
+        component: ComponentId,
+        wanted: &HashSet<HandleId>,
+    ) -> HashMap<HandleId, Vec<Entity>> {
+        let mut found: HashMap<HandleId, Vec<Entity>> = HashMap::new();
         let Some(collect) = crate::handle_ledger::collect_fn_for(component) else {
-            return Vec::new();
+            return found;
         };
-        let mut entities = Vec::new();
         let mut scratch = Vec::new();
         for arch in &self.archetypes {
             let Some(Some(col)) = arch.columns.get(component.0 as usize) else {
@@ -719,12 +744,16 @@ impl World {
                 let ptr = unsafe { col.get_raw(row) };
                 scratch.clear();
                 (collect)(ptr, &mut scratch);
-                if scratch.contains(&handle) {
-                    entities.push(arch.entities[row]);
+                let entity = arch.entities[row];
+                for handle in scratch.iter().filter(|h| wanted.contains(*h)) {
+                    let list = found.entry(*handle).or_default();
+                    if list.last() != Some(&entity) {
+                        list.push(entity);
+                    }
                 }
             }
         }
-        entities
+        found
     }
 }
 
