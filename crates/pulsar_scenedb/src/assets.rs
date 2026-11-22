@@ -36,6 +36,20 @@
 //!   are never evicted by the budget. [`World::evict_unreferenced_assets`]
 //!   drops them all.
 //!
+//! # Budgets, priority and quality tiers
+//!
+//! [`World::pump_assets`] does all of its work in one call. A frame thread
+//! calls [`World::pump_assets_within`] with an [`AssetBudget`] instead: at most
+//! that many finished loads are applied, and that many assets bound, per call
+//! (or until the time budget is spent); the rest wait in the world and
+//! [`AssetPumpReport::pending`] says how many. Loads are not all started at
+//! once: at most [`World::set_max_loads_in_flight`] run, chosen nearest first
+//! by the score [`World::set_asset_priority`]'s function gives the entities
+//! that reference the asset (lower is sooner). A kind registered with
+//! [`register_tiered_loader`] loads coarse first: each finished tier is bound
+//! (a component sees [`AssetView::tier`] and [`AssetView::complete`]) and the
+//! next tier is requested, after every first-tier load, again nearest first.
+//!
 //! Loaders and bindings are registered process-wide, once, by the crate that
 //! defines the asset kind; every world uses them.
 //!
@@ -49,6 +63,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::component::{component_id, Component, ComponentId};
 use crate::entity::Entity;
@@ -150,6 +165,10 @@ pub struct AssetView<'a> {
     /// Bumped by every completed (re)load: a component can store it to skip
     /// binding the same content twice.
     pub version: u64,
+    /// The tier of the payload (0 = coarsest; see [`register_tiered_loader`]).
+    pub tier: u8,
+    /// Whether the payload is the finest tier: no upgrade is coming.
+    pub complete: bool,
     payload: Option<&'a AssetPayload>,
 }
 
@@ -163,13 +182,38 @@ impl AssetView<'_> {
     }
 }
 
-/// Loads one asset of a kind from its source: runs on a worker thread.
-pub type LoadFn = Arc<dyn Fn(&str) -> Result<AssetPayload, String> + Send + Sync>;
+/// One tier of an asset, as a tiered loader returns it.
+pub struct TierLoad {
+    pub payload: AssetPayload,
+    /// No finer tier exists: the asset is complete.
+    pub last: bool,
+}
 
-/// Register the loader for `kind`, replacing any earlier one.
+/// Loads one tier of an asset of a kind from its source: runs on a worker
+/// thread. Tier 0 is the coarsest; the world asks for tier N+1 after tier N
+/// finished with `last == false`.
+pub type TieredLoadFn = Arc<dyn Fn(&str, u8) -> Result<TierLoad, String> + Send + Sync>;
+
+/// Register the loader for `kind`, replacing any earlier one. The asset is
+/// loaded at full quality in one step.
 pub fn register_loader(
     kind: &'static str,
     load: impl Fn(&str) -> Result<AssetPayload, String> + Send + Sync + 'static,
+) {
+    register_tiered_loader(kind, move |source, _| {
+        load(source).map(|payload| TierLoad {
+            payload,
+            last: true,
+        })
+    });
+}
+
+/// Register a loader that produces `kind`'s assets coarse first (low mips, a
+/// reduced mesh): the world binds each tier as it arrives and requests the
+/// next one while the asset stays referenced. Replaces any earlier loader.
+pub fn register_tiered_loader(
+    kind: &'static str,
+    load: impl Fn(&str, u8) -> Result<TierLoad, String> + Send + Sync + 'static,
 ) {
     loaders()
         .write()
@@ -240,7 +284,7 @@ struct Binding {
 #[derive(Default)]
 pub(crate) struct AssetRegistries {
     sources: RwLock<HashMap<AssetId, Declared>>,
-    loaders: RwLock<HashMap<&'static str, LoadFn>>,
+    loaders: RwLock<HashMap<&'static str, TieredLoadFn>>,
     bindings: RwLock<HashMap<&'static str, Vec<Binding>>>,
     sizes: RwLock<HashMap<&'static str, SizeFn>>,
     /// The residency cache (see [`crate::residency`]).
@@ -257,7 +301,7 @@ fn sources() -> &'static RwLock<HashMap<AssetId, Declared>> {
     &registries().sources
 }
 
-fn loaders() -> &'static RwLock<HashMap<&'static str, LoadFn>> {
+fn loaders() -> &'static RwLock<HashMap<&'static str, TieredLoadFn>> {
     &registries().loaders
 }
 
@@ -286,6 +330,12 @@ struct Entry {
     bytes: usize,
     /// The last pump that saw a component reference it.
     last_used: u64,
+    /// The tier `payload` holds.
+    tier: u8,
+    /// `payload` is the finest tier.
+    complete: bool,
+    /// A finer tier is loading while the coarser payload stays bound.
+    upgrading: bool,
 }
 
 enum LoadStart {
@@ -297,7 +347,43 @@ enum LoadStart {
 struct Completion {
     id: AssetId,
     token: u64,
-    result: Result<AssetPayload, String>,
+    tier: u8,
+    result: Result<TierLoad, String>,
+}
+
+/// How an entity ranks for loading: lower loads sooner (a camera distance,
+/// say). `None` ranks last.
+pub type AssetPriorityFn = Arc<dyn Fn(&World, Entity) -> Option<f32> + Send + Sync>;
+
+const UNRANKED: f32 = f32::MAX;
+/// Ids bound per column walk while a pump has time left.
+const BIND_CHUNK: usize = 16;
+/// Pumps between rescoring requests that still wait.
+const RESCORE_PUMPS: u64 = 30;
+
+/// What one [`World::pump_assets_within`] call may spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetBudget {
+    /// Finished loads applied, and assets bound, per call. A call always
+    /// makes progress, so a budget of 0 behaves as 1.
+    pub max_assets: usize,
+    /// Wall time after which the call stops taking more work, checked
+    /// between assets (one asset's dependents are bound together).
+    pub time: Option<Duration>,
+}
+
+impl AssetBudget {
+    /// No limit: [`World::pump_assets`].
+    pub const UNLIMITED: AssetBudget = AssetBudget {
+        max_assets: usize::MAX,
+        time: None,
+    };
+
+    /// A frame thread's share: 8 assets or 2 ms.
+    pub const FRAME: AssetBudget = AssetBudget {
+        max_assets: 8,
+        time: Some(Duration::from_millis(2)),
+    };
 }
 
 /// A world's assets: the [`AssetState`], version and payload of every asset
@@ -316,6 +402,19 @@ pub(crate) struct AssetTable {
     pumps: u64,
     /// Bytes of unreferenced payloads kept cached.
     budget: usize,
+    /// Finished loads received but not applied yet (over budget).
+    arrived: Vec<Completion>,
+    /// Applied assets whose dependents are not bound yet.
+    bind_queue: Vec<AssetId>,
+    /// Assets whose next tier should load once no first tier waits.
+    upgrades: HashSet<AssetId>,
+    /// At most this many loads run at once.
+    max_in_flight: usize,
+    priority: Option<AssetPriorityFn>,
+    scores: HashMap<AssetId, f32>,
+    scored_at: u64,
+    /// Where the viewer is; the priority function reads it.
+    focus: [f64; 3],
 }
 
 /// The default [`World::set_asset_cache_budget`]: 256 MiB of payloads no
@@ -334,6 +433,14 @@ impl Default for AssetTable {
             outstanding: 0,
             pumps: 0,
             budget: DEFAULT_ASSET_CACHE_BUDGET,
+            arrived: Vec::new(),
+            bind_queue: Vec::new(),
+            upgrades: HashSet::new(),
+            max_in_flight: asset_load_workers() * 2,
+            priority: None,
+            scores: HashMap::new(),
+            scored_at: 0,
+            focus: [0.0; 3],
         }
     }
 }
@@ -353,21 +460,39 @@ pub struct AssetPumpReport {
     pub loading: usize,
     /// Unreferenced payloads dropped to stay within the cache budget.
     pub evicted: usize,
+    /// Work left for later pumps: loads not started, in flight or finished
+    /// but not applied, finer tiers not loaded, assets not bound. Zero means
+    /// the world is settled.
+    pub pending: usize,
 }
 
 impl World {
-    /// Advance asset resolution: apply finished loads (dropping stale ones),
-    /// start loads for newly referenced or reloaded assets, and bind the
-    /// components that reference assets which resolved or which they started
-    /// referencing since the last pump. Cheap when nothing changed; call it
-    /// once per frame (or tick).
+    /// Advance asset resolution without a limit: [`Self::pump_assets_within`]
+    /// with [`AssetBudget::UNLIMITED`]. For headless loading and tests; a
+    /// frame thread uses the budgeted form.
     pub fn pump_assets(&mut self) -> AssetPumpReport {
+        self.pump_assets_within(AssetBudget::UNLIMITED)
+    }
+
+    /// Advance asset resolution within `budget`: apply finished loads
+    /// (dropping stale ones), start loads for newly referenced or reloaded
+    /// assets (nearest first, at most [`Self::set_max_loads_in_flight`] at a
+    /// time), and bind the components that reference assets which resolved or
+    /// which they started referencing. What the budget leaves undone waits for
+    /// the next call; [`AssetPumpReport::pending`] counts it. Cheap when
+    /// nothing changed; call it once per frame (or tick).
+    pub fn pump_assets_within(&mut self, budget: AssetBudget) -> AssetPumpReport {
+        let began = Instant::now();
+        let max = budget.max_assets.max(1);
+        let out_of_time = |done: usize| {
+            done >= 1 && budget.time.is_some_and(|limit| began.elapsed() >= limit)
+        };
         let mut report = AssetPumpReport::default();
-        let mut to_bind: HashSet<AssetId> = HashSet::new();
         self.assets.pumps += 1;
 
-        // Finished loads.
-        let completions: Vec<Completion> = {
+        // Finished loads: take them all off the channel, apply the nearest
+        // first while the budget lasts.
+        let received: Vec<Completion> = {
             let receiver = self
                 .assets
                 .receiver
@@ -375,32 +500,66 @@ impl World {
                 .expect("asset receiver poisoned");
             receiver.try_iter().collect()
         };
-        self.assets.outstanding -= completions.len();
-        for completion in completions {
-            let Some(entry) = self.assets.entries.get_mut(&completion.id) else {
+        self.assets.outstanding -= received.len();
+        self.assets.arrived.extend(received);
+        if self.assets.arrived.len() > 1 {
+            // Best last, so `pop` takes it.
+            let scores = &self.assets.scores;
+            self.assets.arrived.sort_by(|a, b| {
+                let key = |c: &Completion| scores.get(&c.id).copied().unwrap_or(UNRANKED);
+                key(b).total_cmp(&key(a))
+            });
+        }
+        let mut applied = 0usize;
+        while applied < max && !out_of_time(applied) {
+            let Some(completion) = self.assets.arrived.pop() else {
+                break;
+            };
+            let id = completion.id;
+            let Some(entry) = self.assets.entries.get_mut(&id) else {
                 report.stale += 1;
                 continue;
             };
-            if entry.token != completion.token || entry.state != AssetState::Loading {
+            if entry.token != completion.token
+                || !(entry.state == AssetState::Loading || entry.upgrading)
+            {
                 report.stale += 1;
                 continue;
             }
-            entry.version += 1;
+            let was_upgrade = entry.upgrading;
+            entry.upgrading = false;
             match completion.result {
-                Ok(payload) => {
-                    entry.bytes = payload_size(entry.kind, &payload);
+                Ok(load) => {
+                    entry.version += 1;
+                    entry.bytes = payload_size(entry.kind, &load.payload);
                     entry.state = AssetState::Ready;
-                    entry.payload = Some(payload);
+                    entry.payload = Some(load.payload);
+                    entry.tier = completion.tier;
+                    entry.complete = load.last;
+                    if !load.last {
+                        self.assets.upgrades.insert(id);
+                    }
+                }
+                Err(message) if was_upgrade => {
+                    // The coarse tier stays; there is nothing finer to wait for.
+                    tracing::warn!(kind = entry.kind, source = %entry.source, %message, "asset upgrade failed to load");
+                    entry.complete = true;
                 }
                 Err(message) => {
+                    entry.version += 1;
                     tracing::warn!(kind = entry.kind, source = %entry.source, %message, "asset failed to load");
                     entry.state = AssetState::Failed(Arc::from(message));
                     entry.payload = None;
                     entry.bytes = 0;
+                    entry.complete = true;
                 }
             }
+            if entry.complete {
+                self.assets.scores.remove(&id);
+            }
             report.completed += 1;
-            to_bind.insert(completion.id);
+            applied += 1;
+            self.assets.bind_queue.push(id);
         }
 
         // Assets that components started referencing since the last pump.
@@ -421,28 +580,35 @@ impl World {
                 }
                 Some(AssetState::Loading) => {}
                 Some(AssetState::Ready | AssetState::Failed(_)) => {
-                    to_bind.insert(id);
+                    self.assets.bind_queue.push(id);
                 }
             }
         }
 
-        // Start loads.
-        let requested: Vec<AssetId> = self.assets.requested.drain().collect();
-        for id in requested {
-            match self.start_load(id) {
-                LoadStart::Started => report.started += 1,
-                // No loader: failed on the spot, which its dependents see.
-                LoadStart::Failed => {
-                    to_bind.insert(id);
-                }
-                LoadStart::Undeclared => {}
+        self.start_pending_loads(&mut report);
+
+        // Bind, nearest first, in chunks (one column walk per chunk and kind).
+        if !self.assets.bind_queue.is_empty() {
+            let mut seen = HashSet::new();
+            let mut queue: Vec<AssetId> = std::mem::take(&mut self.assets.bind_queue)
+                .into_iter()
+                .filter(|id| seen.insert(*id))
+                .collect();
+            let scores = &self.assets.scores;
+            queue.sort_by(|a, b| {
+                let key = |id: &AssetId| scores.get(id).copied().unwrap_or(UNRANKED);
+                key(a).total_cmp(&key(b))
+            });
+            let mut next = 0usize;
+            while next < queue.len() && next < max && !out_of_time(next) {
+                let end = (next + BIND_CHUNK).min(queue.len()).min(max);
+                let chunk: HashSet<AssetId> = queue[next..end].iter().copied().collect();
+                report.bound += self.bind_dependents(&chunk);
+                next = end;
             }
+            self.assets.bind_queue = queue.split_off(next);
         }
 
-        // Bind.
-        for id in to_bind {
-            report.bound += self.bind_dependents(id);
-        }
         report.loading = self
             .assets
             .entries
@@ -450,8 +616,147 @@ impl World {
             .filter(|entry| entry.state == AssetState::Loading)
             .count();
         report.evicted = self.enforce_asset_cache_budget();
+        report.pending = self.assets.outstanding
+            + self.assets.arrived.len()
+            + self.assets.bind_queue.len()
+            + self.assets.requested.len()
+            + self.assets.upgrades.len();
         report
     }
+
+    /// Start the nearest requested loads, up to the in-flight cap; finer
+    /// tiers only once no first tier waits.
+    fn start_pending_loads(&mut self, report: &mut AssetPumpReport) {
+        let free = self
+            .assets
+            .max_in_flight
+            .saturating_sub(self.assets.outstanding);
+        if free == 0 {
+            return;
+        }
+        let upgrading = self.assets.requested.is_empty();
+        let mut candidates: Vec<AssetId> = if upgrading {
+            self.assets.upgrades.iter().copied().collect()
+        } else {
+            self.assets.requested.iter().copied().collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        if candidates.len() > free {
+            self.refresh_scores(&candidates);
+            let scores = &self.assets.scores;
+            candidates.sort_by(|a, b| {
+                let key = |id: &AssetId| scores.get(id).copied().unwrap_or(UNRANKED);
+                key(a).total_cmp(&key(b))
+            });
+            candidates.truncate(free);
+        }
+        for id in candidates {
+            if upgrading {
+                self.assets.upgrades.remove(&id);
+                let ready = self
+                    .assets
+                    .entries
+                    .get(&id)
+                    .is_some_and(|entry| entry.state == AssetState::Ready && !entry.complete);
+                // Nothing shows it any more: keep the coarse payload as it is.
+                if !ready || self.asset_ref_count(id) == 0 {
+                    continue;
+                }
+                let tier = self.assets.entries[&id].tier + 1;
+                if matches!(self.start_load(id, tier), LoadStart::Started) {
+                    report.started += 1;
+                }
+            } else {
+                self.assets.requested.remove(&id);
+                match self.start_load(id, 0) {
+                    LoadStart::Started => report.started += 1,
+                    // No loader: failed on the spot, which its dependents see.
+                    LoadStart::Failed => self.assets.bind_queue.push(id),
+                    LoadStart::Undeclared => {}
+                }
+            }
+        }
+    }
+
+    /// Score `ids` for loading order: the lowest score the priority function
+    /// gives an entity that references the asset. Scores are kept until the
+    /// asset completes and rescored every [`RESCORE_PUMPS`] pumps, since the
+    /// camera moves; one walk of each bound component's column serves every
+    /// id of its kind.
+    fn refresh_scores(&mut self, ids: &[AssetId]) {
+        let Some(priority) = self.assets.priority.clone() else {
+            return;
+        };
+        let stale = self.assets.pumps - self.assets.scored_at >= RESCORE_PUMPS;
+        let wanted: Vec<AssetId> = ids
+            .iter()
+            .copied()
+            .filter(|id| stale || !self.assets.scores.contains_key(id))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        self.assets.scored_at = self.assets.pumps;
+        let mut by_kind: HashMap<&'static str, HashSet<HandleId>> = HashMap::new();
+        let mut scored: HashMap<AssetId, f32> = wanted.iter().map(|id| (*id, UNRANKED)).collect();
+        for id in &wanted {
+            if let Some((kind, _)) = id.source() {
+                by_kind.entry(kind).or_default().insert(id.handle());
+            }
+        }
+        for (kind, handles) in by_kind {
+            let kind_bindings = bindings()
+                .read()
+                .expect("asset bindings poisoned")
+                .get(kind)
+                .cloned()
+                .unwrap_or_default();
+            for binding in &kind_bindings {
+                for (handle, entities) in self.entities_referencing((binding.component)(), &handles)
+                {
+                    let best = entities
+                        .iter()
+                        .filter_map(|&entity| priority(self, entity))
+                        .fold(UNRANKED, f32::min);
+                    let slot = scored.entry(AssetId(handle.0)).or_insert(UNRANKED);
+                    *slot = slot.min(best);
+                }
+            }
+        }
+        self.assets.scores.extend(scored);
+    }
+
+    /// Rank loads by `priority`: it scores an entity that references an asset
+    /// (lower loads sooner; a camera distance), and an asset takes the lowest
+    /// score of its dependents. Without one, loads start in no set order.
+    pub fn set_asset_priority(
+        &mut self,
+        priority: Option<impl Fn(&World, Entity) -> Option<f32> + Send + Sync + 'static>,
+    ) {
+        self.assets.priority = priority.map(|f| Arc::new(f) as AssetPriorityFn);
+        self.assets.scores.clear();
+    }
+
+    /// At most `max` loads run at once (default twice the loader threads);
+    /// the rest wait, nearest first. At least 1.
+    pub fn set_max_loads_in_flight(&mut self, max: usize) {
+        self.assets.max_in_flight = max.max(1);
+    }
+
+    /// Where the viewer is, in world space: what a priority function
+    /// ([`Self::set_asset_priority`]) measures distance from. Set it each
+    /// frame; requests still waiting are rescored from it periodically.
+    pub fn set_asset_focus(&mut self, focus: [f64; 3]) {
+        self.assets.focus = focus;
+    }
+
+    /// The point [`Self::set_asset_focus`] set.
+    pub fn asset_focus(&self) -> [f64; 3] {
+        self.assets.focus
+    }
+
 
     /// Pump until no load is in flight, or `timeout` passes: for headless
     /// loading and tests. Superseded loads still running count as in
@@ -461,10 +766,9 @@ impl World {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let report = self.pump_assets();
-            if report.loading == 0
-                && self.assets.requested.is_empty()
-                && self.assets.outstanding == 0
-            {
+            // Settled: nothing loading, waiting, unapplied, unbound or left to
+            // upgrade (every tier is loaded).
+            if report.pending == 0 {
                 // One more pump binds anything the last one completed.
                 return true;
             }
@@ -481,6 +785,9 @@ impl World {
     pub fn asset_work_pending(&self) -> bool {
         self.assets.outstanding > 0
             || !self.assets.requested.is_empty()
+            || !self.assets.arrived.is_empty()
+            || !self.assets.bind_queue.is_empty()
+            || !self.assets.upgrades.is_empty()
             || self
                 .handle_counts
                 .lock()
@@ -528,7 +835,9 @@ impl World {
             // A newer request supersedes the one in flight.
             entry.token = entry.token.wrapping_add(1);
             entry.state = AssetState::Unresolved;
+            entry.upgrading = false;
         }
+        self.assets.upgrades.remove(&id);
         self.assets.requested.insert(id);
     }
 
@@ -626,7 +935,7 @@ impl World {
 
     /// Queue a worker load of `id`. An id whose kind has no loader is marked
     /// failed instead; an undeclared one is left unresolved.
-    fn start_load(&mut self, id: AssetId) -> LoadStart {
+    fn start_load(&mut self, id: AssetId, tier: u8) -> LoadStart {
         let Some((kind, source)) = id.source() else {
             tracing::warn!(?id, "asset id was never declared; it cannot be loaded");
             return LoadStart::Undeclared;
@@ -642,6 +951,9 @@ impl World {
             payload: None,
             bytes: 0,
             last_used: 0,
+            tier: 0,
+            complete: false,
+            upgrading: false,
         });
         entry.token = token;
         let loader = loaders()
@@ -656,58 +968,101 @@ impl World {
             entry.payload = None;
             return LoadStart::Failed;
         };
-        entry.state = AssetState::Loading;
+        if tier == 0 {
+            entry.state = AssetState::Loading;
+            entry.upgrading = false;
+            entry.complete = false;
+        } else {
+            // The coarser payload stays bound while the finer tier loads.
+            entry.upgrading = true;
+        }
         self.assets.outstanding += 1;
         let sender = self.assets.sender.clone();
         run_load(Box::new(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(&source)))
-                .unwrap_or_else(|_| Err("the loader panicked".to_owned()));
-            let _ = sender.send(Completion { id, token, result });
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(&source, tier)))
+                    .unwrap_or_else(|_| Err("the loader panicked".to_owned()));
+            let _ = sender.send(Completion {
+                id,
+                token,
+                tier,
+                result,
+            });
         }));
         LoadStart::Started
     }
 
-    /// Bind every component that currently references `id` to its entry.
-    fn bind_dependents(&mut self, id: AssetId) -> usize {
-        let Some(entry) = self.assets.entries.get(&id) else {
-            return 0;
-        };
-        let kind = entry.kind;
-        let source = entry.source.clone();
-        let state = entry.state.clone();
-        let version = entry.version;
-        let payload = entry.payload.clone();
-        let view = AssetView {
-            id,
-            kind,
-            source: &source,
-            state: &state,
-            version,
-            payload: payload.as_ref(),
-        };
-        let kind_bindings = bindings()
-            .read()
-            .expect("asset bindings poisoned")
-            .get(kind)
-            .cloned()
-            .unwrap_or_default();
+    /// Bind every component that references any of `ids` to its entry.
+    ///
+    /// One walk of each bound component's column serves every asset of the
+    /// kind, so a pump that completes N assets costs one pass over the
+    /// entities, not N. The pump runs under the world's write lock: with each
+    /// asset scanning every row itself, a level with thousands of assets and
+    /// entities froze every reader for seconds.
+    fn bind_dependents(&mut self, ids: &HashSet<AssetId>) -> usize {
+        let mut by_kind: HashMap<&'static str, Vec<AssetId>> = HashMap::new();
+        for &id in ids {
+            if let Some(entry) = self.assets.entries.get(&id) {
+                by_kind.entry(entry.kind).or_default().push(id);
+            }
+        }
         let mut bound = 0;
-        for binding in kind_bindings {
-            let component = (binding.component)();
-            for entity in self.entities_referencing(component, id.handle()) {
-                (binding.apply)(self, entity, &view);
-                bound += 1;
+        for (kind, kind_ids) in by_kind {
+            let kind_bindings = bindings()
+                .read()
+                .expect("asset bindings poisoned")
+                .get(kind)
+                .cloned()
+                .unwrap_or_default();
+            let wanted: HashSet<HandleId> = kind_ids.iter().map(|id| id.handle()).collect();
+            let found: Vec<HashMap<HandleId, Vec<Entity>>> = kind_bindings
+                .iter()
+                .map(|binding| self.entities_referencing((binding.component)(), &wanted))
+                .collect();
+            for id in kind_ids {
+                let Some(entry) = self.assets.entries.get(&id) else {
+                    continue;
+                };
+                let source = entry.source.clone();
+                let state = entry.state.clone();
+                let version = entry.version;
+                let (tier, complete) = (entry.tier, entry.complete);
+                let payload = entry.payload.clone();
+                let view = AssetView {
+                    id,
+                    kind,
+                    source: &source,
+                    state: &state,
+                    version,
+                    tier,
+                    complete,
+                    payload: payload.as_ref(),
+                };
+                for (binding, found) in kind_bindings.iter().zip(&found) {
+                    let Some(entities) = found.get(&id.handle()) else {
+                        continue;
+                    };
+                    for &entity in entities {
+                        (binding.apply)(self, entity, &view);
+                        bound += 1;
+                    }
+                }
             }
         }
         bound
     }
 
-    /// The entities whose `component` holds `handle` in a counted field.
-    fn entities_referencing(&self, component: ComponentId, handle: HandleId) -> Vec<Entity> {
+    /// The entities whose `component` holds each of `wanted` in a counted
+    /// field, found in one walk of the column.
+    fn entities_referencing(
+        &self,
+        component: ComponentId,
+        wanted: &HashSet<HandleId>,
+    ) -> HashMap<HandleId, Vec<Entity>> {
+        let mut found: HashMap<HandleId, Vec<Entity>> = HashMap::new();
         let Some(collect) = crate::handle_ledger::collect_fn_for(component) else {
-            return Vec::new();
+            return found;
         };
-        let mut entities = Vec::new();
         let mut scratch = Vec::new();
         for arch in &self.archetypes {
             let Some(Some(col)) = arch.columns.get(component.0 as usize) else {
@@ -719,12 +1074,16 @@ impl World {
                 let ptr = unsafe { col.get_raw(row) };
                 scratch.clear();
                 (collect)(ptr, &mut scratch);
-                if scratch.contains(&handle) {
-                    entities.push(arch.entities[row]);
+                let entity = arch.entities[row];
+                for handle in scratch.iter().filter(|h| wanted.contains(*h)) {
+                    let list = found.entry(*handle).or_default();
+                    if list.last() != Some(&entity) {
+                        list.push(entity);
+                    }
                 }
             }
         }
-        entities
+        found
     }
 }
 
