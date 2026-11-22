@@ -1,0 +1,18 @@
+[package]
+name = "scenedb_dylib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SceneDB (the archetype ECS and the GPU mirror: worlds, components, journals) as one shared Rust dylib, on top of the reflection, profiling and UI libraries. A binary or plugin library that links it shares one SceneDB: its component ids, registries and ledgers exist once per process. Built with `-C prefer-dynamic` (.cargo/config.toml)."
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+# wgpu comes from the framework's library, reflection and the profiler from theirs: one copy of each.
+wgpui_dylib = { git = "https://github.com/Far-Beyond-Pulsar/WGPUI" }
+reflection_dylib = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection" }
+profiling_dylib = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling" }
+# `gpu` is the feature every consumer builds with: features are additive, so one without it would
+# build a different SceneDB than this library holds.
+pulsar_scenedb = { path = "../pulsar_scenedb", features = ["gpu"] }
