@@ -1,3 +1,4 @@
+// ci control: no-op
 //! Asset references, owned by the world (SceneDB#84).
 //!
 //! A component names an asset with an [`AssetId`] field: a stable identity
