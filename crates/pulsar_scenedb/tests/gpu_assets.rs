@@ -55,6 +55,10 @@ fn vg_mesh() -> MeshMetadata {
 }
 
 fn test_context() -> EngineGpuContext {
+    // Creating several wgpu instances and devices at once crashes lavapipe
+    // (SIGSEGV in CI, intermittently by timing); take turns.
+    static DEVICE_CREATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _device_creation = DEVICE_CREATION.lock().unwrap_or_else(|p| p.into_inner());
     // Upstream wgpu 30: `Instance::new` still takes an owned
     // `InstanceDescriptor`, but the type no longer derives `Default` — use
     // the `new_without_display_handle()` constructor (headless, no window
