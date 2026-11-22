@@ -49,6 +49,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
         vulkaninfo --summary || true
+    # Tests run one at a time: several wgpu instances/devices created at once
+    # crash lavapipe (SIGSEGV, intermittent; a no-op PR on main hit it too).
     - name: Test pulsar_scenedb with the gpu feature
       run: >
         cargo test -p pulsar_scenedb --features gpu --verbose
@@ -67,6 +69,7 @@ jobs:
         --test world_gpu_mirror_liveness
         --test world_gpu_mirror_dirty_tracked
         --test world_gpu_mirror_reservation_shrink
+        -- --test-threads=1
     - name: Test allocation-count assertions (informational)
       # alloc_gate_gpu.rs asserts EXACT GPU allocation counts (e.g. "N=32 ->
       # 9 allocs, N=64 -> 8 allocs" must be equal) -- observed to differ
@@ -92,7 +95,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
     - name: Test pulsar_scenedb with all features
-      run: cargo test -p pulsar_scenedb --all-features --no-fail-fast --verbose
+      run: cargo test -p pulsar_scenedb --all-features --no-fail-fast --verbose -- --test-threads=1
 
   transport:
     # Explicit, separate job for the real-socket replication transport
