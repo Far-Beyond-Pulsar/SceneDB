@@ -1,6 +1,6 @@
 [package]
 name = "scenedb_dylib"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "SceneDB (the archetype ECS and the GPU mirror: worlds, components, journals) as one shared Rust dylib, on top of the reflection, profiling and UI libraries. A binary or plugin library that links it shares one SceneDB: its component ids, registries and ledgers exist once per process. Built with `-C prefer-dynamic` (.cargo/config.toml)."
