@@ -358,6 +358,8 @@ pub type AssetPriorityFn = Arc<dyn Fn(&World, Entity) -> Option<f32> + Send + Sy
 const UNRANKED: f32 = f32::MAX;
 /// Ids bound per column walk while a pump has time left.
 const BIND_CHUNK: usize = 16;
+/// Entities bound between two looks at the clock inside one asset's dependents.
+const BIND_SLICE: usize = 64;
 /// Pumps between rescoring requests that still wait.
 const RESCORE_PUMPS: u64 = 30;
 
@@ -386,6 +388,15 @@ impl AssetBudget {
     };
 }
 
+/// The entities of one asset's binding that are still to be bound (the last
+/// first, so `pop` takes the next).
+struct PartialBind {
+    id: AssetId,
+    kind: &'static str,
+    apply: ApplyFn,
+    entities: Vec<Entity>,
+}
+
 /// A world's assets: the [`AssetState`], version and payload of every asset
 /// it has resolved, and its in-flight loads.
 pub(crate) struct AssetTable {
@@ -406,6 +417,9 @@ pub(crate) struct AssetTable {
     arrived: Vec<Completion>,
     /// Applied assets whose dependents are not bound yet.
     bind_queue: Vec<AssetId>,
+    /// Dependents of an asset that a pump ran out of time before reaching: one
+    /// asset shared by thousands of entities is bound over several frames.
+    partial_binds: std::collections::VecDeque<PartialBind>,
     /// Assets whose next tier should load once no first tier waits.
     upgrades: HashSet<AssetId>,
     /// At most this many loads run at once.
@@ -438,6 +452,7 @@ impl Default for AssetTable {
             budget: DEFAULT_ASSET_CACHE_BUDGET,
             arrived: Vec::new(),
             bind_queue: Vec::new(),
+            partial_binds: std::collections::VecDeque::new(),
             upgrades: HashSet::new(),
             max_in_flight: asset_load_workers() * 2,
             priority: None,
@@ -595,8 +610,14 @@ impl World {
         drop(touched_scope);
         self.start_pending_loads(&mut report);
 
+        // What an earlier pump left of one asset's dependents comes first.
+        let deadline = budget.time.map(|limit| began + limit);
+        if !self.assets.partial_binds.is_empty() {
+            report.bound += self.resume_partial_binds(deadline);
+        }
+
         // Bind, nearest first, in chunks (one column walk per chunk and kind).
-        if !self.assets.bind_queue.is_empty() {
+        if !self.assets.bind_queue.is_empty() && self.assets.partial_binds.is_empty() {
             let mut seen = HashSet::new();
             let mut queue: Vec<AssetId> = std::mem::take(&mut self.assets.bind_queue)
                 .into_iter()
@@ -625,7 +646,7 @@ impl World {
                 let end = (next + fit.clamp(1, BIND_CHUNK)).min(queue.len()).min(max);
                 let chunk: HashSet<AssetId> = queue[next..end].iter().copied().collect();
                 let started = Instant::now();
-                report.bound += self.bind_dependents(&chunk);
+                report.bound += self.bind_dependents(&chunk, deadline);
                 let each = started.elapsed().as_secs_f64() / (end - next) as f64;
                 self.assets.bind_cost = if self.assets.bind_cost > 0.0 {
                     self.assets.bind_cost * 0.7 + each * 0.3
@@ -647,6 +668,7 @@ impl World {
         report.pending = self.assets.outstanding
             + self.assets.arrived.len()
             + self.assets.bind_queue.len()
+            + self.assets.partial_binds.len()
             + self.assets.requested.len()
             + self.assets.upgrades.len();
         report
@@ -865,6 +887,7 @@ impl World {
             || !self.assets.requested.is_empty()
             || !self.assets.arrived.is_empty()
             || !self.assets.bind_queue.is_empty()
+            || !self.assets.partial_binds.is_empty()
             || !self.assets.upgrades.is_empty()
             || self
                 .handle_counts
@@ -1078,8 +1101,16 @@ impl World {
     /// entities, not N. The pump runs under the world's write lock: with each
     /// asset scanning every row itself, a level with thousands of assets and
     /// entities froze every reader for seconds.
-    fn bind_dependents(&mut self, ids: &HashSet<AssetId>) -> usize {
+    ///
+    /// With a `deadline`, an asset whose dependents outlast it is bound as far
+    /// as the time allows and the rest is kept for the next pump
+    /// ([`Self::resume_partial_binds`]): the entities are checked against the
+    /// clock every [`BIND_SLICE`], so one mesh shared by thousands of entities
+    /// is not one frame-sized step.
+    fn bind_dependents(&mut self, ids: &HashSet<AssetId>, deadline: Option<Instant>) -> usize {
         profiling::profile_scope!("Assets::bind_dependents");
+        // A new bind of an asset covers every dependent: what was waiting is moot.
+        self.assets.partial_binds.retain(|partial| !ids.contains(&partial.id));
         let mut by_kind: HashMap<&'static str, Vec<AssetId>> = HashMap::new();
         for &id in ids {
             if let Some(entry) = self.assets.entries.get(&id) {
@@ -1125,11 +1156,64 @@ impl World {
                     let Some(entities) = found.get(&id.handle()) else {
                         continue;
                     };
-                    for &entity in entities {
+                    for (at, &entity) in entities.iter().enumerate() {
+                        if at >= BIND_SLICE
+                            && at % BIND_SLICE == 0
+                            && deadline.is_some_and(|limit| Instant::now() >= limit)
+                        {
+                            self.assets.partial_binds.push_back(PartialBind {
+                                id,
+                                kind,
+                                apply: binding.apply.clone(),
+                                entities: entities[at..].iter().rev().copied().collect(),
+                            });
+                            break;
+                        }
                         (binding.apply)(self, entity, &view);
                         bound += 1;
                     }
                 }
+            }
+        }
+        bound
+    }
+
+    /// Bind the dependents an earlier pump left (see [`Self::bind_dependents`]),
+    /// oldest first, until `deadline`. At least one slice is bound, so a pump
+    /// always makes progress.
+    fn resume_partial_binds(&mut self, deadline: Option<Instant>) -> usize {
+        profiling::profile_scope!("Assets::resume_partial_binds");
+        let mut bound = 0;
+        while let Some(mut partial) = self.assets.partial_binds.pop_front() {
+            let Some(entry) = self.assets.entries.get(&partial.id) else {
+                continue;
+            };
+            let source = entry.source.clone();
+            let state = entry.state.clone();
+            let payload = entry.payload.clone();
+            let view = AssetView {
+                id: partial.id,
+                kind: partial.kind,
+                source: &source,
+                state: &state,
+                version: entry.version,
+                tier: entry.tier,
+                complete: entry.complete,
+                payload: payload.as_ref(),
+            };
+            let mut slice = 0;
+            while let Some(entity) = partial.entities.pop() {
+                (partial.apply)(self, entity, &view);
+                bound += 1;
+                slice += 1;
+                if slice % BIND_SLICE == 0 && deadline.is_some_and(|limit| Instant::now() >= limit)
+                {
+                    break;
+                }
+            }
+            if !partial.entities.is_empty() {
+                self.assets.partial_binds.push_front(partial);
+                break;
             }
         }
         bound

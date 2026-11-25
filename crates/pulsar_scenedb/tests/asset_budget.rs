@@ -311,3 +311,46 @@ fn a_time_budget_limits_binds_by_what_they_cost() {
         "binds per call: {per_call:?}"
     );
 }
+
+/// One asset shared by thousands of entities (a mesh used by every chair in a
+/// level) is not one indivisible step: a pump that runs out of time binds as
+/// many as it reached, and the next ones the rest.
+#[test]
+fn one_asset_shared_by_many_entities_is_bound_over_several_pumps() {
+    register_loader("b-shared", |_| Ok(Arc::new(1u32) as AssetPayload));
+    register_binding::<Thing>("b-shared", |thing, view| {
+        // A bind that costs something, so the clock is reached.
+        std::thread::sleep(Duration::from_micros(40));
+        bind_thing(thing, view);
+    });
+    let mut world = World::new();
+    let id = AssetId::declare("b-shared", "shared/chair");
+    let entities: Vec<_> = (0..2000)
+        .map(|rank| {
+            let entity = world.spawn();
+            world.insert(entity, Thing::new(id, rank));
+            entity
+        })
+        .collect();
+    let budget = AssetBudget {
+        max_assets: 8,
+        time: Some(Duration::from_millis(5)),
+    };
+    let (mut pumps, mut largest) = (0, 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let report = world.pump_assets_within(budget);
+        pumps += 1;
+        largest = largest.max(report.bound);
+        if report.pending == 0 && !world.asset_work_pending() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never settled: {report:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(pumps >= 4, "2000 binds of 40 us at 5 ms a pump took {pumps} pumps");
+    assert!(largest < 1500, "a pump bound {largest} of them");
+    for entity in entities {
+        assert_eq!(world.get::<Thing>(entity).unwrap().binds, 1, "bound exactly once");
+    }
+}
