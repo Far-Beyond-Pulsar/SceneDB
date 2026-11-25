@@ -1303,6 +1303,11 @@ impl TextureStore {
         Ok(slot)
     }
 
+    /// The keys the waiting uploads were staged with.
+    pub fn staged_keys(&self) -> Vec<u128> {
+        self.staged.iter().map(|job| job.key).collect()
+    }
+
     /// Whether staged uploads are waiting.
     pub fn has_staged_uploads(&self) -> bool {
         !self.staged.is_empty()

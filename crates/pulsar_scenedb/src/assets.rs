@@ -355,6 +355,19 @@ struct Completion {
 /// say). `None` ranks last.
 pub type AssetPriorityFn = Arc<dyn Fn(&World, Entity) -> Option<f32> + Send + Sync>;
 
+/// Where the viewer is and what it sees, for ranking loads and uploads
+/// ([`World::set_asset_viewer`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AssetViewer {
+    /// The eye, world space.
+    pub eye: [f64; 3],
+    /// The unit direction the viewer looks along.
+    pub forward: [f32; 3],
+    /// Tangent of the half field of view across and up the frame: the cone
+    /// that holds the frustum has the half angle `atan(hypot(x, y))`.
+    pub tan_half_fov: [f32; 2],
+}
+
 const UNRANKED: f32 = f32::MAX;
 /// Ids bound per column walk while a pump has time left.
 const BIND_CHUNK: usize = 16;
@@ -427,6 +440,9 @@ pub(crate) struct AssetTable {
     scored_at: u64,
     /// Where the viewer is; the priority function reads it.
     focus: [f64; 3],
+    /// Which way the viewer looks and how wide it sees, when the host says
+    /// ([`World::set_asset_viewer`]); the priority function reads it.
+    view: Option<AssetViewer>,
     /// Seconds one asset takes to bind (a moving average): how many a pump
     /// with a time budget binds before it checks the clock again.
     bind_cost: f64,
@@ -457,6 +473,7 @@ impl Default for AssetTable {
             scores: HashMap::new(),
             scored_at: 0,
             focus: [0.0; 3],
+            view: None,
             bind_cost: 0.0,
         }
     }
@@ -804,6 +821,20 @@ impl World {
     /// frame; requests still waiting are rescored from it periodically.
     pub fn set_asset_focus(&mut self, focus: [f64; 3]) {
         self.assets.focus = focus;
+        self.assets.view = None;
+    }
+
+    /// Where the viewer is and what it sees, in world space: the focus plus
+    /// the direction and field of view a priority function ranks by, so what is
+    /// in view loads and uploads before what is behind the viewer.
+    pub fn set_asset_viewer(&mut self, view: AssetViewer) {
+        self.assets.focus = view.eye;
+        self.assets.view = Some(view);
+    }
+
+    /// What [`Self::set_asset_viewer`] set, if the host did.
+    pub fn asset_viewer(&self) -> Option<AssetViewer> {
+        self.assets.view
     }
 
     /// The point [`Self::set_asset_focus`] set.
@@ -860,7 +891,7 @@ impl World {
     /// The frame thread's half of a texture upload: the cook ran on a loader,
     /// the copy to the GPU happens here, a few block rows at a time.
     #[cfg(feature = "gpu")]
-    pub fn advance_texture_uploads(&self, budget: crate::gpu::UploadBudget) -> crate::gpu::UploadReport {
+    pub fn advance_texture_uploads(&mut self, budget: crate::gpu::UploadBudget) -> crate::gpu::UploadReport {
         profiling::profile_scope!("Assets::advance_texture_uploads");
         let Some(mirror) = self.gpu_mirror() else {
             return Default::default();
@@ -868,12 +899,40 @@ impl World {
         let Some(store) = mirror.texture_store() else {
             return Default::default();
         };
-        let scores = &self.assets.scores;
-        let priority = |key: u128| scores.get(&AssetId(key)).copied().unwrap_or(UNRANKED);
-        let Ok(mut store) = store.write() else {
+        // A load's score is dropped when it completes, so a staged texture has
+        // none: rank each by the viewer now (the same function and view that
+        // order loads, so the nearest, and what is in view when the host says
+        // which way it looks, is written first). Scores are kept for the
+        // staged ones, rescored every few pumps as the camera moves.
+        let staged: Vec<AssetId> = match store.read() {
+            Ok(store) => store.staged_keys().into_iter().map(AssetId).collect(),
+            Err(_) => return Default::default(),
+        };
+        if staged.is_empty() {
+            return Default::default();
+        }
+        self.refresh_scores(&staged);
+        let Some(mirror) = self.gpu_mirror() else {
             return Default::default();
         };
-        store.advance_uploads(mirror.queue(), budget, Some(&priority as &crate::gpu::UploadPriorityFn<'_>))
+        let scores = &self.assets.scores;
+        let priority = |key: u128| scores.get(&AssetId(key)).copied().unwrap_or(UNRANKED);
+        let Ok(mut guard) = store.write() else {
+            return Default::default();
+        };
+        let report = guard.advance_uploads(
+            mirror.queue(),
+            budget,
+            Some(&priority as &crate::gpu::UploadPriorityFn<'_>),
+        );
+        let waiting: HashSet<u128> = guard.staged_keys().into_iter().collect();
+        drop(guard);
+        for id in staged {
+            if !waiting.contains(&id.0) {
+                self.assets.scores.remove(&id);
+            }
+        }
+        report
     }
 
     /// Whether [`Self::pump_assets`] has anything to do: a load in flight,
