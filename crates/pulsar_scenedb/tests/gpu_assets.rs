@@ -1523,3 +1523,29 @@ fn adopting_a_texture_into_a_full_store_is_a_hard_error() {
     tiny.register_shared(texture.clone()).expect("fits");
     assert_eq!(tiny.register_shared(texture), Err(TextureError::SlotsExhausted));
 }
+
+#[test]
+fn reserved_slots_are_never_handed_out_or_recycled() {
+    let ctx = test_context();
+    let mut store = TextureStore::with_reserved_slots(16, 1);
+    assert_eq!(store.slot_count(), 1, "the reserved slot is part of the table's extent");
+    assert!(store.texture(0).is_none(), "a reserved slot holds no texture");
+    assert_eq!(store.unregister(0), Err(TextureError::SlotVacant), "a reserved slot cannot be released into the free list");
+
+    let first = store
+        .register(ctx.device(), ctx.queue(), &rgba_desc(1, 1), &[1u8, 1, 1, 1])
+        .expect("register");
+    assert_eq!(first, 1, "the first texture takes the first slot after the reserved ones");
+    store.unregister(first).expect("unregister");
+    let again = store
+        .register(ctx.device(), ctx.queue(), &rgba_desc(1, 1), &[2u8, 2, 2, 2])
+        .expect("recycled register");
+    assert_eq!(again, 1, "recycling hands back the freed slot, never a reserved one");
+    assert_eq!(store.slot_count(), 2);
+}
+
+#[test]
+#[should_panic(expected = "exceed max_slots")]
+fn reserving_more_slots_than_the_store_holds_is_refused() {
+    let _ = TextureStore::with_reserved_slots(2, 3);
+}

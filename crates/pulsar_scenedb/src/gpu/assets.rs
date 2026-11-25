@@ -1055,6 +1055,8 @@ pub struct TextureStore {
     free: Vec<u32>,
     next: u32,
     max_slots: u32,
+    /// Slots from 0 that are never allocated ([`Self::with_reserved_slots`]).
+    reserved: u32,
     upload_count: u64,
     /// Uploads written a band at a time ([`Self::register_mips_staged`]).
     staged: Vec<StagedUpload>,
@@ -1076,10 +1078,29 @@ impl TextureStore {
             free: Vec::new(),
             next: 0,
             max_slots,
+            reserved: 0,
             upload_count: 0,
             staged: Vec::new(),
             upload_rate: 0.0,
         }
+    }
+
+    /// A store whose first `reserved` slots are never handed out: they hold no
+    /// texture (`texture(slot)` is `None`, `unregister` refuses them) but count
+    /// in [`Self::slot_count`], so a bindless table covering the store covers
+    /// them. A reader binds its own fallback view at a reserved slot and maps
+    /// "no texture" to it (Helio: `helio_core::TEXTURE_TABLE_RESERVED_SLOTS`).
+    /// `reserved` must not exceed `max_slots`.
+    pub fn with_reserved_slots(max_slots: u32, reserved: u32) -> Self {
+        assert!(
+            reserved <= max_slots,
+            "reserved slots ({reserved}) exceed max_slots ({max_slots})"
+        );
+        let mut store = Self::new(max_slots);
+        store.next = reserved;
+        store.textures.resize_with(reserved as usize, || None);
+        store.reserved = reserved;
+        store
     }
 
     /// Allocates a slot (LIFO free-list reuse, else the next fresh index;
@@ -1434,6 +1455,9 @@ impl TextureStore {
     pub fn unregister(&mut self, slot: u32) -> Result<(), TextureError> {
         if slot >= self.next {
             return Err(TextureError::SlotOutOfRange);
+        }
+        if slot < self.reserved {
+            return Err(TextureError::SlotVacant);
         }
         // An upload still being written has no texture in the slot yet; leaving
         // cancels it.
