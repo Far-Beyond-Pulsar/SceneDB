@@ -358,8 +358,6 @@ pub type AssetPriorityFn = Arc<dyn Fn(&World, Entity) -> Option<f32> + Send + Sy
 const UNRANKED: f32 = f32::MAX;
 /// Ids bound per column walk while a pump has time left.
 const BIND_CHUNK: usize = 16;
-/// Entities bound between two looks at the clock inside one asset's dependents.
-const BIND_SLICE: usize = 64;
 /// Pumps between rescoring requests that still wait.
 const RESCORE_PUMPS: u64 = 30;
 
@@ -1105,8 +1103,9 @@ impl World {
     /// With a `deadline`, an asset whose dependents outlast it is bound as far
     /// as the time allows and the rest is kept for the next pump
     /// ([`Self::resume_partial_binds`]): the entities are checked against the
-    /// clock every [`BIND_SLICE`], so one mesh shared by thousands of entities
-    /// is not one frame-sized step.
+    /// clock after each entity, so one mesh shared by thousands of entities is
+    /// not one frame-sized step (a bind costs microseconds and up; a clock read
+    /// is tens of nanoseconds).
     fn bind_dependents(&mut self, ids: &HashSet<AssetId>, deadline: Option<Instant>) -> usize {
         profiling::profile_scope!("Assets::bind_dependents");
         // A new bind of an asset covers every dependent: what was waiting is moot.
@@ -1157,10 +1156,7 @@ impl World {
                         continue;
                     };
                     for (at, &entity) in entities.iter().enumerate() {
-                        if at >= BIND_SLICE
-                            && at % BIND_SLICE == 0
-                            && deadline.is_some_and(|limit| Instant::now() >= limit)
-                        {
+                        if at >= 1 && deadline.is_some_and(|limit| Instant::now() >= limit) {
                             self.assets.partial_binds.push_back(PartialBind {
                                 id,
                                 kind,
@@ -1179,7 +1175,7 @@ impl World {
     }
 
     /// Bind the dependents an earlier pump left (see [`Self::bind_dependents`]),
-    /// oldest first, until `deadline`. At least one slice is bound, so a pump
+    /// oldest first, until `deadline`. At least one entity is bound, so a pump
     /// always makes progress.
     fn resume_partial_binds(&mut self, deadline: Option<Instant>) -> usize {
         profiling::profile_scope!("Assets::resume_partial_binds");
@@ -1201,13 +1197,10 @@ impl World {
                 complete: entry.complete,
                 payload: payload.as_ref(),
             };
-            let mut slice = 0;
             while let Some(entity) = partial.entities.pop() {
                 (partial.apply)(self, entity, &view);
                 bound += 1;
-                slice += 1;
-                if slice % BIND_SLICE == 0 && deadline.is_some_and(|limit| Instant::now() >= limit)
-                {
+                if deadline.is_some_and(|limit| Instant::now() >= limit) {
                     break;
                 }
             }

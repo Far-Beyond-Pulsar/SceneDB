@@ -956,6 +956,11 @@ pub struct UploadReport {
 /// Ranks a staged upload by the key it was staged with: lower is written first.
 pub type UploadPriorityFn<'a> = dyn Fn(u128) -> f32 + 'a;
 
+/// The smallest band a time budget shrinks to, bytes.
+const MIN_BAND: usize = 64 * 1024;
+/// Bytes a nanosecond until a band has been timed (1 GB/s: slow on purpose).
+const FIRST_BAND_RATE: f64 = 1.0;
+
 /// A texture being written in bands.
 struct StagedUpload {
     slot: u32,
@@ -1053,6 +1058,9 @@ pub struct TextureStore {
     upload_count: u64,
     /// Uploads written a band at a time ([`Self::register_mips_staged`]).
     staged: Vec<StagedUpload>,
+    /// Bytes per nanosecond a band has been written at (a moving average; 0 =
+    /// not measured yet): what turns a time budget into a size for the next band.
+    upload_rate: f64,
 }
 
 impl TextureStore {
@@ -1070,6 +1078,7 @@ impl TextureStore {
             max_slots,
             upload_count: 0,
             staged: Vec::new(),
+            upload_rate: 0.0,
         }
     }
 
@@ -1339,10 +1348,29 @@ impl TextureStore {
                 if spent && report.bytes > 0 {
                     break 'jobs;
                 }
-                let Some(written) = job.write_band(queue, budget.bytes.saturating_sub(report.bytes).max(1)) else {
+                // A band is no bigger than what is left of the byte budget, nor
+                // than the time left should take at the rate seen so far: the
+                // clock is read between bands, so one big band would overshoot it.
+                let mut room = budget.bytes.saturating_sub(report.bytes).max(1);
+                if let Some(limit) = budget.time {
+                    let left = limit.saturating_sub(started.elapsed()).as_nanos() as f64;
+                    let rate = if self.upload_rate > 0.0 { self.upload_rate } else { FIRST_BAND_RATE };
+                    room = room.min(((left * rate) as usize).max(MIN_BAND));
+                }
+                let band_started = std::time::Instant::now();
+                let Some(written) = job.write_band(queue, room) else {
                     break;
                 };
                 report.bytes += written;
+                let took = band_started.elapsed().as_nanos().max(1) as f64;
+                if written >= MIN_BAND / 4 {
+                    let rate = written as f64 / took;
+                    self.upload_rate = if self.upload_rate > 0.0 {
+                        self.upload_rate * 0.8 + rate * 0.2
+                    } else {
+                        rate
+                    };
+                }
             }
             // `write_band` has nothing left to write: the texture is whole.
             let job = self.staged.remove(0);
