@@ -1138,12 +1138,13 @@ fn payload_size(kind: &str, payload: &AssetPayload) -> usize {
 
 pub(crate) type LoadJob = Box<dyn FnOnce() + Send>;
 
-/// How many threads run loaders: the machine's parallelism, at least 4, so
-/// one slow load does not hold up the rest. Loads beyond it queue.
+/// How many threads run loaders: half the machine's parallelism, at least 4,
+/// so one slow load does not hold up the rest and the other half stays free
+/// for the frame thread, the renderer's encoder threads and physics (a load
+/// is a cook: all-core CPU work that would otherwise preempt them and show up
+/// as frame-time spikes while a level streams in). Loads beyond it queue.
 pub fn asset_load_workers() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .max(4)
+    (std::thread::available_parallelism().map_or(8, |n| n.get()) / 2).max(4)
 }
 
 /// Queue `job` on the loader threads, starting them on first use.
