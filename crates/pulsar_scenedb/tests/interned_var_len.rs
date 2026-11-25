@@ -281,3 +281,49 @@ fn same_id_different_bytes_collision_keeps_first_writers_bytes() {
     let h2 = MeshComponent::vertices_gpu_handle(&store, e2.index()).unwrap();
     assert_eq!(h1, h2, "both entities resolve to the SAME (first-writer) range");
 }
+
+/// The same component with its geometry held shared (`Arc<[T]>`), the way a
+/// mesh instance holds the loaded asset's: the derive takes it as the same
+/// variable-length field, and instances of one asset hold one allocation.
+#[derive(Clone, Debug, SceneStore)]
+struct SharedMeshComponent {
+    asset: MeshAssetKey,
+    #[gpu(mirror = Once, content_id = "asset")]
+    vertices: Arc<[u32]>,
+    #[gpu(mirror = Once, content_id = "asset")]
+    indices: Arc<[u32]>,
+}
+
+#[test]
+fn shared_geometry_instances_hold_one_cpu_allocation_and_one_gpu_range() {
+    let (mut world, store, _queue) = mirrored_world();
+    let id = HandleId(40);
+    let vertices: Arc<[u32]> = vec![1, 2, 3].into();
+    let indices: Arc<[u32]> = vec![0, 1, 2].into();
+    let entities: Vec<Entity> = (0..10)
+        .map(|_| {
+            let e = world.spawn();
+            world.insert(
+                e,
+                SharedMeshComponent {
+                    asset: MeshAssetKey(id),
+                    vertices: Arc::clone(&vertices),
+                    indices: Arc::clone(&indices),
+                },
+            );
+            e
+        })
+        .collect();
+    // One CPU allocation: this handle plus the ten instances'.
+    assert_eq!(Arc::strong_count(&vertices), 11);
+    let vpool = store
+        .interned_var_len_pool::<u32>(BufferKey::of("SharedMeshComponent::vertices"))
+        .expect("registered on first insert");
+    assert_eq!(vpool.audit(), vec![(id, 10, 12)], "one shared GPU allocation, refcounted by all 10");
+    let handles: Vec<_> = entities
+        .iter()
+        .map(|e| SharedMeshComponent::vertices_gpu_handle(&store, e.index()).unwrap())
+        .collect();
+    assert!(handles.iter().all(|h| *h == handles[0]));
+    assert_eq!(handles[0].count, 3);
+}

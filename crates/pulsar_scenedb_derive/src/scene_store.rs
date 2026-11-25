@@ -325,22 +325,33 @@ pub enum VarLenShape {
 /// shadows the name), and the alternative (requiring the literal path
 /// `std::vec::Vec` or `alloc::vec::Vec`) would reject the overwhelmingly
 /// common bare `Vec<T>` spelling most callers actually write.
+///
+/// `Arc<[T]>` is accepted as the same thing held **shared**: a content-id
+/// interned field reads its elements only to upload them the first time the
+/// content id appears, so rows showing the same content can hold one
+/// allocation between them (an `Arc` clone each) instead of a `Vec` copy each.
+/// Everything the codegen does with the field (`len`, `&data.field` as a
+/// `&[T]`) is the slice's, so no other site distinguishes the two.
 pub(crate) fn as_vec_elem_type(ty: &Type) -> Option<Type> {
     let Type::Path(type_path) = ty else {
         return None;
     };
     let last = type_path.path.segments.last()?;
-    if last.ident != "Vec" {
-        return None;
-    }
     let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
         return None;
     };
     if args.args.len() != 1 {
         return None;
     }
-    match args.args.first()? {
-        syn::GenericArgument::Type(t) => Some(t.clone()),
+    let syn::GenericArgument::Type(arg) = args.args.first()? else {
+        return None;
+    };
+    match last.ident.to_string().as_str() {
+        "Vec" => Some(arg.clone()),
+        "Arc" => match arg {
+            Type::Slice(slice) => Some((*slice.elem).clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
