@@ -2,10 +2,12 @@
 members = [
     "crates/pulsar_scenedb",
     "crates/pulsar_scenedb_derive",
-    "crates/scenedb_dylib",
     "crates/scenedb_dashboard",
     "crates/scenedb_inspector",
 ]
+# The shared library crate builds inside Pulsar-Native's workspace (its dependencies on the other
+# shared libraries resolve there, through its `[patch]` entries): it is not a member of this one.
+exclude = ["crates/scenedb_dylib"]
 resolver = "2"
 
 [workspace.package]

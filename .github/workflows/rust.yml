@@ -66,6 +66,7 @@ jobs:
         --test world_gpu_mirror
         --test world_gpu_mirror_growable
         --test gpu_packed_layout
+        --test gpu_texture_mips
         --test world_gpu_mirror_liveness
         --test world_gpu_mirror_dirty_tracked
         --test world_gpu_mirror_reservation_shrink
@@ -120,9 +121,10 @@ jobs:
     - name: Install nightly toolchain with Miri
       run: |
         rustup toolchain install nightly --component miri
-        rustup default nightly
+        # `rust-toolchain.toml` pins the stable toolchain for this checkout, which `rustup default` cannot
+        # override, so Miri is invoked with an explicit `+nightly`.
     - name: Run Miri over the replication module
-      run: cargo miri test -p pulsar_scenedb --no-default-features --lib replication
+      run: cargo +nightly miri test -p pulsar_scenedb --no-default-features --lib replication
 
   fuzz:
     # Coverage-guided (libFuzzer) fuzzing, bounded to a fixed wall-clock

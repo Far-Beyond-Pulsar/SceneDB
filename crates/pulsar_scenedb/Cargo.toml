@@ -222,3 +222,8 @@ required-features = ["gpu"]
 [[test]]
 name = "tier_storage_benchmarks"
 required-features = ["gpu"]
+
+# Needs wgpu: without this entry a plain `cargo test` (no `gpu` feature) fails to compile it.
+[[test]]
+name = "gpu_texture_mips"
+required-features = ["gpu"]
