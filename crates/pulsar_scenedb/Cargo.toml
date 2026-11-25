@@ -227,3 +227,8 @@ required-features = ["gpu"]
 [[test]]
 name = "gpu_texture_mips"
 required-features = ["gpu"]
+
+# Needs wgpu (the staged texture uploads): gated like gpu_texture_mips.
+[[test]]
+name = "gpu_texture_staged"
+required-features = ["gpu"]
