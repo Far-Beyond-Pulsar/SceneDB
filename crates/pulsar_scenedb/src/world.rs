@@ -1596,7 +1596,8 @@ impl World {
     /// Returns a shared reference to component `T` on `entity`, if present.
     #[inline]
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
-        profiling::profile_scope_loc!("World::get");
+        // No scope: this is a per-entity accessor called thousands of times a
+        // frame (a scope costs more than the read, and floods a recording).
         if !self.is_alive(entity) {
             return None;
         }

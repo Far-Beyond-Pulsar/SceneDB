@@ -227,3 +227,87 @@ fn an_unreferenced_asset_is_not_upgraded() {
     settle(&mut world);
     assert_eq!(*FINE_LOADS.lock().unwrap(), 0);
 }
+
+/// Loads that finish faster than the frame binds them must not pile up: what
+/// loaded and is not bound yet counts against the in-flight cap, so the
+/// loaders wait for the frame and what they cooked is still hot when it binds.
+#[test]
+fn loads_wait_for_the_frame_to_bind_what_already_loaded() {
+    static LOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    register_loader("b-backlog", |_| {
+        LOADED.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(1u32) as AssetPayload)
+    });
+    register_binding::<Thing>("b-backlog", bind_thing);
+    let mut world = World::new();
+    world.set_max_loads_in_flight(2);
+    for index in 0..30 {
+        let id = AssetId::declare("b-backlog", &format!("backlog/{index}"));
+        let entity = world.spawn();
+        world.insert(entity, Thing::new(id, index));
+    }
+    let budget = AssetBudget {
+        max_assets: 1,
+        time: None,
+    };
+    let (mut bound, mut worst_backlog) = (0usize, 0usize);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // Let any started load finish, as a slow frame would.
+        std::thread::sleep(Duration::from_millis(2));
+        let report = world.pump_assets_within(budget);
+        bound += report.bound;
+        worst_backlog = worst_backlog.max(LOADED.load(Ordering::SeqCst).saturating_sub(bound));
+        if report.pending == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never settled: {report:?}");
+    }
+    assert_eq!(bound, 30);
+    assert!(
+        worst_backlog <= 3,
+        "{worst_backlog} loaded assets waited unbound at once; the cap is 2"
+    );
+}
+
+/// A bind that costs milliseconds must not be repeated a chunk at a time
+/// without looking at the clock: once the pump knows what a bind costs it
+/// binds only as many as the time left holds.
+#[test]
+fn a_time_budget_limits_binds_by_what_they_cost() {
+    register_loader("b-cost", |_| Ok(Arc::new(1u32) as AssetPayload));
+    register_binding::<Thing>("b-cost", |thing, view| {
+        std::thread::sleep(Duration::from_millis(6));
+        bind_thing(thing, view);
+    });
+    let mut world = World::new();
+    for index in 0..12 {
+        let id = AssetId::declare("b-cost", &format!("cost/{index}"));
+        let entity = world.spawn();
+        world.insert(entity, Thing::new(id, index));
+    }
+    let budget = AssetBudget {
+        max_assets: 8,
+        time: Some(Duration::from_millis(8)),
+    };
+    let mut per_call = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(3));
+        let report = world.pump_assets_within(budget);
+        if report.bound > 0 {
+            per_call.push(report.bound);
+        }
+        if report.pending == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never settled: {report:?}");
+    }
+    assert_eq!(per_call.iter().sum::<usize>(), 12);
+    // Once the cost is known (after the first calls) a call binds at most two
+    // 6 ms assets inside the 8 ms budget, never the 8 the count would allow.
+    assert!(
+        per_call.iter().skip(2).all(|&n| n <= 2),
+        "binds per call: {per_call:?}"
+    );
+}

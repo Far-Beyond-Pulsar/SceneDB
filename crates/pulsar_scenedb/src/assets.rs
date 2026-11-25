@@ -415,6 +415,9 @@ pub(crate) struct AssetTable {
     scored_at: u64,
     /// Where the viewer is; the priority function reads it.
     focus: [f64; 3],
+    /// Seconds one asset takes to bind (a moving average): how many a pump
+    /// with a time budget binds before it checks the clock again.
+    bind_cost: f64,
 }
 
 /// The default [`World::set_asset_cache_budget`]: 256 MiB of payloads no
@@ -441,6 +444,7 @@ impl Default for AssetTable {
             scores: HashMap::new(),
             scored_at: 0,
             focus: [0.0; 3],
+            bind_cost: 0.0,
         }
     }
 }
@@ -489,6 +493,7 @@ impl World {
         };
         let mut report = AssetPumpReport::default();
         self.assets.pumps += 1;
+        let completions_scope = profiling::ProfileScope::new_static("Assets::apply_completed_loads");
 
         // Finished loads: take them all off the channel, apply the nearest
         // first while the budget lasts.
@@ -562,6 +567,8 @@ impl World {
             self.assets.bind_queue.push(id);
         }
 
+        drop(completions_scope);
+        let touched_scope = profiling::ProfileScope::new_static("Assets::collect_touched");
         // Assets that components started referencing since the last pump.
         let touched = self
             .handle_counts
@@ -585,6 +592,7 @@ impl World {
             }
         }
 
+        drop(touched_scope);
         self.start_pending_loads(&mut report);
 
         // Bind, nearest first, in chunks (one column walk per chunk and kind).
@@ -601,9 +609,29 @@ impl World {
             });
             let mut next = 0usize;
             while next < queue.len() && next < max && !out_of_time(next) {
-                let end = (next + BIND_CHUNK).min(queue.len()).min(max);
+                // A chunk is one column walk, so bigger is cheaper per asset;
+                // but a bind can cost milliseconds (a material uploads its
+                // textures) and the clock is read between chunks only: take as
+                // many as the time left holds at the cost seen so far, at
+                // least one.
+                let fit = match budget.time {
+                    Some(limit) if self.assets.bind_cost > 0.0 => {
+                        let left = limit.saturating_sub(began.elapsed()).as_secs_f64();
+                        (left / self.assets.bind_cost) as usize
+                    }
+                    Some(_) => 1,
+                    None => BIND_CHUNK,
+                };
+                let end = (next + fit.clamp(1, BIND_CHUNK)).min(queue.len()).min(max);
                 let chunk: HashSet<AssetId> = queue[next..end].iter().copied().collect();
+                let started = Instant::now();
                 report.bound += self.bind_dependents(&chunk);
+                let each = started.elapsed().as_secs_f64() / (end - next) as f64;
+                self.assets.bind_cost = if self.assets.bind_cost > 0.0 {
+                    self.assets.bind_cost * 0.7 + each * 0.3
+                } else {
+                    each
+                };
                 next = end;
             }
             self.assets.bind_queue = queue.split_off(next);
@@ -627,10 +655,15 @@ impl World {
     /// Start the nearest requested loads, up to the in-flight cap; finer
     /// tiers only once no first tier waits.
     fn start_pending_loads(&mut self, report: &mut AssetPumpReport) {
-        let free = self
-            .assets
-            .max_in_flight
-            .saturating_sub(self.assets.outstanding);
+        profiling::profile_scope!("Assets::start_pending_loads");
+        // Backpressure: what loaded but is not bound yet counts against the
+        // cap. Loads that finish faster than the frame binds them would pile up
+        // their cooked data until the residency cache evicts the oldest of it
+        // (which the bind then rebuilds on the frame thread).
+        let backlog = self.assets.outstanding
+            + self.assets.arrived.len()
+            + self.assets.bind_queue.len();
+        let free = self.assets.max_in_flight.saturating_sub(backlog);
         if free == 0 {
             return;
         }
@@ -686,6 +719,7 @@ impl World {
     /// camera moves; one walk of each bound component's column serves every
     /// id of its kind.
     fn refresh_scores(&mut self, ids: &[AssetId]) {
+        profiling::profile_scope!("Assets::refresh_scores");
         let Some(priority) = self.assets.priority.clone() else {
             return;
         };
@@ -885,6 +919,7 @@ impl World {
     /// payloads, least recently referenced first, until they fit the budget.
     /// Returns how many were dropped.
     fn enforce_asset_cache_budget(&mut self) -> usize {
+        profiling::profile_scope!("Assets::enforce_cache_budget");
         let pump = self.assets.pumps;
         let mut unreferenced: Vec<(u64, AssetId, usize)> = Vec::new();
         let mut cached = 0usize;
@@ -1000,6 +1035,7 @@ impl World {
     /// asset scanning every row itself, a level with thousands of assets and
     /// entities froze every reader for seconds.
     fn bind_dependents(&mut self, ids: &HashSet<AssetId>) -> usize {
+        profiling::profile_scope!("Assets::bind_dependents");
         let mut by_kind: HashMap<&'static str, Vec<AssetId>> = HashMap::new();
         for &id in ids {
             if let Some(entry) = self.assets.entries.get(&id) {
@@ -1015,10 +1051,13 @@ impl World {
                 .cloned()
                 .unwrap_or_default();
             let wanted: HashSet<HandleId> = kind_ids.iter().map(|id| id.handle()).collect();
+            let find_scope = profiling::interned_scope("Assets::find_referencing ", kind);
             let found: Vec<HashMap<HandleId, Vec<Entity>>> = kind_bindings
                 .iter()
                 .map(|binding| self.entities_referencing((binding.component)(), &wanted))
                 .collect();
+            drop(find_scope);
+            let _apply_scope = profiling::interned_scope("Assets::apply_bindings ", kind);
             for id in kind_ids {
                 let Some(entry) = self.assets.entries.get(&id) else {
                     continue;
