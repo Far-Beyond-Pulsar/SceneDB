@@ -69,7 +69,8 @@ pub(crate) fn test_device() -> (wgpu::Device, wgpu::Queue) {
 pub use assets::{
     ArenaError, ClusterBuffer, ClusterError, ClusterNode, GeometryArena, MaterialError,
     MaterialRegistry, MaterialRow, MeshError, MeshMetadata, MeshRegistry, MeshletBuffer,
-    MeshletEntry, MeshletError, TextureError, TextureStore, CLUSTER_BUFFER_KEY,
+    MeshletEntry, MeshletError, MipSource, TextureError, TextureStore, UploadBudget,
+    UploadPriorityFn, UploadReport, CLUSTER_BUFFER_KEY,
     GEOMETRY_INDEX_BUFFER_KEY, GEOMETRY_VERTEX_BUFFER_KEY, MATERIAL_BUFFER_KEY,
     MAX_TEXTURE_SLOTS, MESHLET_BUFFER_KEY, MESH_METADATA_BUFFER_KEY, TEXTURE_STORE_KEY,
 };

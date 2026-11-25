@@ -6,6 +6,7 @@
 //! system owns the source blobs for any future re-upload).
 
 use super::freelist::RangeList;
+use std::sync::Arc;
 use super::{BufferAccess, BufferKey, BufferRegistrationError, EngineGpuContext, GpuBufferRegistry, MirrorMode};
 
 /// Issue #41's "Collapse map": the documented `BufferKey`s each asset store
@@ -920,6 +921,124 @@ pub enum TextureError {
     MipSizeMismatch,
 }
 
+/// Where a staged upload reads its texels from: the levels of a texture, in
+/// the layout [`TextureStore::register_mips`] takes (tightly packed rows of
+/// blocks). Held by the upload until it is whole, so it must outlive the call
+/// that staged it.
+pub trait MipSource: Send + Sync {
+    /// How many levels there are; the descriptor's `mip_level_count`.
+    fn level_count(&self) -> u32;
+    /// Level `level`'s bytes.
+    fn level(&self, level: u32) -> &[u8];
+}
+
+/// What one [`TextureStore::advance_uploads`] call may write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadBudget {
+    /// Bytes handed to the queue. The call always writes one band, so 0 still
+    /// makes progress.
+    pub bytes: usize,
+    /// Wall time after which no further band starts.
+    pub time: Option<std::time::Duration>,
+}
+
+/// What an [`TextureStore::advance_uploads`] call did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadReport {
+    /// Bytes written.
+    pub bytes: usize,
+    /// Textures that became whole.
+    pub finished: usize,
+    /// Staged uploads still waiting.
+    pub waiting: usize,
+}
+
+/// Ranks a staged upload by the key it was staged with: lower is written first.
+pub type UploadPriorityFn<'a> = dyn Fn(u128) -> f32 + 'a;
+
+/// A texture being written in bands.
+struct StagedUpload {
+    slot: u32,
+    key: u128,
+    texture: wgpu::Texture,
+    source: Arc<dyn MipSource>,
+    /// Per level: the physical extent, bytes per row of blocks, rows of blocks.
+    layouts: Vec<(wgpu::Extent3d, u32, u32)>,
+    level: u32,
+    row: u32,
+    total: u64,
+    written: u64,
+    on_complete: Option<Box<dyn FnOnce(&wgpu::Texture) + Send + Sync>>,
+}
+
+impl StagedUpload {
+    /// Write the next band: whole rows of blocks of the current level, about
+    /// `max_bytes` of them and at least one row. The bytes written, or `None`
+    /// when every level is in.
+    fn write_band(&mut self, queue: &wgpu::Queue, max_bytes: usize) -> Option<usize> {
+        let (physical, bytes_per_row, rows) = *self.layouts.get(self.level as usize)?;
+        let rows_that_fit = (max_bytes as u64 / u64::from(bytes_per_row)).max(1);
+        let band_rows = rows_that_fit.min(u64::from(rows - self.row)) as u32;
+        let (_, block_height) = self.texture.format().block_dimensions();
+        let start = self.row as usize * bytes_per_row as usize;
+        let end = start + band_rows as usize * bytes_per_row as usize;
+        let data = &self.source.level(self.level)[start..end];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: self.level,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: self.row * block_height,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(band_rows),
+            },
+            wgpu::Extent3d {
+                width: physical.width,
+                height: band_rows * block_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.row += band_rows;
+        if self.row == rows {
+            self.level += 1;
+            self.row = 0;
+        }
+        self.written += data.len() as u64;
+        Some(data.len())
+    }
+}
+
+/// Per level of `desc`: the physical extent, bytes per row of blocks and rows
+/// of blocks of tightly packed data.
+fn mip_layouts(desc: &wgpu::TextureDescriptor<'_>) -> Vec<(wgpu::Extent3d, u32, u32)> {
+    let (block_width, block_height) = desc.format.block_dimensions();
+    let block_size = desc
+        .format
+        .block_copy_size(None)
+        .expect("depth-stencil and multi-planar formats have no single block_copy_size");
+    (0..desc.mip_level_count)
+        .map(|level| {
+            let logical = desc
+                .mip_level_size(level)
+                .expect("level is within the descriptor's mip count");
+            let physical = logical.physical_size(desc.format);
+            (
+                physical,
+                (physical.width / block_width) * block_size,
+                physical.height / block_height,
+            )
+        })
+        .collect()
+}
+
 /// SceneDB-owned bindless texture residency (Ownership Law, CONTRACTS C0,
 /// spec §10 G4): SceneDB owns ALL scene data GPU-side. This store holds the
 /// `wgpu::Texture` objects themselves — not views — so they survive renderer
@@ -932,6 +1051,8 @@ pub struct TextureStore {
     next: u32,
     max_slots: u32,
     upload_count: u64,
+    /// Uploads written a band at a time ([`Self::register_mips_staged`]).
+    staged: Vec<StagedUpload>,
 }
 
 impl TextureStore {
@@ -948,6 +1069,7 @@ impl TextureStore {
             next: 0,
             max_slots,
             upload_count: 0,
+            staged: Vec::new(),
         }
     }
 
@@ -1057,22 +1179,7 @@ impl TextureStore {
         if mips.len() != desc.mip_level_count as usize {
             return Err(TextureError::MipCountMismatch);
         }
-        let (block_width, block_height) = desc.format.block_dimensions();
-        let block_size = desc
-            .format
-            .block_copy_size(None)
-            .expect("depth-stencil and multi-planar formats have no single block_copy_size");
-        let layouts: Vec<(wgpu::Extent3d, u32, u32)> = (0..desc.mip_level_count)
-            .map(|level| {
-                let logical = desc
-                    .mip_level_size(level)
-                    .expect("level is within the descriptor's mip count");
-                let physical = logical.physical_size(desc.format);
-                let blocks_wide = physical.width / block_width;
-                let blocks_high = physical.height / block_height;
-                (physical, blocks_wide * block_size, blocks_high)
-            })
-            .collect();
+        let layouts = mip_layouts(desc);
         for (data, (_, bytes_per_row, rows)) in mips.iter().zip(&layouts) {
             if data.len() != (*bytes_per_row as usize) * (*rows as usize) {
                 return Err(TextureError::MipSizeMismatch);
@@ -1107,6 +1214,150 @@ impl TextureStore {
         }
         self.textures[index] = Some(texture);
         Ok(slot)
+    }
+
+
+    // ── Staged uploads ────────────────────────────────────────────────────────
+    //
+    // `register_mips` writes every level inside the call: a 4K block-compressed
+    // texture is 21 MB, which the frame thread copies in one go (4 ms). A staged
+    // upload creates the texture, then writes it a few block rows at a time
+    // under a per-frame budget ([`Self::advance_uploads`]); the slot keeps what
+    // it showed (nothing, or an earlier quality) until the last row is in, and
+    // the new texture takes it over in one step. Nothing waits.
+
+    /// Start uploading `source` as a texture described by `desc` without
+    /// copying it now. With `replace: Some(slot)` the texture swaps into that
+    /// slot once complete (the slot keeps its current texture until then);
+    /// otherwise a slot is taken, vacant (`texture(slot)` is `None`) until the
+    /// upload completes. A staged upload already waiting for the slot is
+    /// replaced. `priority` orders waiting uploads (lowest first; see
+    /// [`UploadPriorityFn`]); `on_complete` runs, under the store's lock, when
+    /// the texture is whole.
+    ///
+    /// The same checks as [`Self::register_mips`] run before any slot is taken.
+    pub fn register_mips_staged(
+        &mut self,
+        device: &wgpu::Device,
+        desc: &wgpu::TextureDescriptor<'_>,
+        source: Arc<dyn MipSource>,
+        replace: Option<u32>,
+        key: u128,
+        on_complete: Option<Box<dyn FnOnce(&wgpu::Texture) + Send + Sync>>,
+    ) -> Result<u32, TextureError> {
+        assert_eq!(
+            (desc.dimension, desc.size.depth_or_array_layers, desc.sample_count),
+            (wgpu::TextureDimension::D2, 1, 1),
+            "TextureStore::register_mips_staged takes a single-layer, single-sample 2D texture"
+        );
+        if source.level_count() != desc.mip_level_count {
+            return Err(TextureError::MipCountMismatch);
+        }
+        let layouts = mip_layouts(desc);
+        for (level, (_, bytes_per_row, rows)) in layouts.iter().enumerate() {
+            if source.level(level as u32).len() != (*bytes_per_row as usize) * (*rows as usize) {
+                return Err(TextureError::MipSizeMismatch);
+            }
+        }
+        let slot = match replace {
+            Some(slot) => {
+                if slot >= self.next {
+                    return Err(TextureError::SlotOutOfRange);
+                }
+                slot
+            }
+            None => self.allocate_slot()?,
+        };
+        let index = slot as usize;
+        if index >= self.textures.len() {
+            self.textures.resize_with(index + 1, || None);
+        }
+        // A newer upload for the slot makes an older, unfinished one moot.
+        self.staged.retain(|job| job.slot != slot);
+        let texture = device.create_texture(desc);
+        let total: u64 = layouts
+            .iter()
+            .map(|(_, bytes_per_row, rows)| u64::from(*bytes_per_row) * u64::from(*rows))
+            .sum();
+        self.staged.push(StagedUpload {
+            slot,
+            key,
+            texture,
+            source,
+            layouts,
+            level: 0,
+            row: 0,
+            total,
+            written: 0,
+            on_complete,
+        });
+        Ok(slot)
+    }
+
+    /// Whether staged uploads are waiting.
+    pub fn has_staged_uploads(&self) -> bool {
+        !self.staged.is_empty()
+    }
+
+    /// How many staged uploads wait, and the bytes they still have to write.
+    pub fn staged_backlog(&self) -> (usize, u64) {
+        (
+            self.staged.len(),
+            self.staged.iter().map(|job| job.total - job.written).sum(),
+        )
+    }
+
+    /// Write staged uploads, most urgent first, until `budget` is spent; each
+    /// finished texture takes its slot. Always writes at least one band, so a
+    /// zero budget still makes progress. `priority` ranks a waiting upload by
+    /// the key it was staged with (lower is more urgent); `None` keeps the
+    /// order they were staged in.
+    pub fn advance_uploads(
+        &mut self,
+        queue: &wgpu::Queue,
+        budget: UploadBudget,
+        priority: Option<&UploadPriorityFn<'_>>,
+    ) -> UploadReport {
+        let started = std::time::Instant::now();
+        let mut report = UploadReport::default();
+        if self.staged.is_empty() {
+            return report;
+        }
+        if let Some(priority) = priority {
+            // Rank once per call; ties keep staging order (the sort is stable).
+            self.staged.sort_by(|a, b| {
+                priority(a.key)
+                    .partial_cmp(&priority(b.key))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let mut finished: Vec<StagedUpload> = Vec::new();
+        'jobs: while let Some(job) = self.staged.first_mut() {
+            loop {
+                let spent = report.bytes >= budget.bytes
+                    || budget.time.is_some_and(|limit| started.elapsed() >= limit);
+                if spent && report.bytes > 0 {
+                    break 'jobs;
+                }
+                let Some(written) = job.write_band(queue, budget.bytes.saturating_sub(report.bytes).max(1)) else {
+                    break;
+                };
+                report.bytes += written;
+            }
+            // `write_band` has nothing left to write: the texture is whole.
+            let job = self.staged.remove(0);
+            report.finished += 1;
+            finished.push(job);
+        }
+        for job in finished {
+            self.upload_count += 1;
+            if let Some(on_complete) = job.on_complete {
+                on_complete(&job.texture);
+            }
+            self.textures[job.slot as usize] = Some(job.texture);
+        }
+        report.waiting = self.staged.len();
+        report
     }
 
     /// The next free slot (LIFO reuse, else a fresh index), or
@@ -1151,11 +1402,16 @@ impl TextureStore {
         if slot >= self.next {
             return Err(TextureError::SlotOutOfRange);
         }
+        // An upload still being written has no texture in the slot yet; leaving
+        // cancels it.
+        let staged = self.staged.len();
+        self.staged.retain(|job| job.slot != slot);
+        let was_staged = self.staged.len() != staged;
         let entry = self
             .textures
             .get_mut(slot as usize)
             .ok_or(TextureError::SlotOutOfRange)?;
-        if entry.take().is_none() {
+        if entry.take().is_none() && !was_staged {
             return Err(TextureError::SlotVacant);
         }
         self.free.push(slot);

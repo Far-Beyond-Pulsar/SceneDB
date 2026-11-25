@@ -803,6 +803,13 @@ impl World {
             // Settled: nothing loading, waiting, unapplied, unbound or left to
             // upgrade (every tier is loaded).
             if report.pending == 0 {
+                // Staged textures are written whole: a caller that waits for
+                // the world wants every texture in, not a frame's share.
+                #[cfg(feature = "gpu")]
+                self.advance_texture_uploads(crate::gpu::UploadBudget {
+                    bytes: usize::MAX,
+                    time: None,
+                });
                 // One more pump binds anything the last one completed.
                 return true;
             }
@@ -813,11 +820,48 @@ impl World {
         }
     }
 
+    /// Whether textures staged on the GPU mirror's store are still being
+    /// written ([`Self::advance_texture_uploads`]). Cheap, `&self`.
+    pub fn texture_uploads_pending(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            if let Some(store) = self.gpu_mirror().and_then(|mirror| mirror.texture_store()) {
+                return store
+                    .read()
+                    .map(|store| store.has_staged_uploads())
+                    .unwrap_or(false);
+            }
+        }
+        false
+    }
+
+    /// Write staged textures within `budget`, most urgent first (the same
+    /// ranking that orders loads: nearest the viewer, [`Self::set_asset_focus`]).
+    /// The frame thread's half of a texture upload: the cook ran on a loader,
+    /// the copy to the GPU happens here, a few block rows at a time.
+    #[cfg(feature = "gpu")]
+    pub fn advance_texture_uploads(&self, budget: crate::gpu::UploadBudget) -> crate::gpu::UploadReport {
+        profiling::profile_scope!("Assets::advance_texture_uploads");
+        let Some(mirror) = self.gpu_mirror() else {
+            return Default::default();
+        };
+        let Some(store) = mirror.texture_store() else {
+            return Default::default();
+        };
+        let scores = &self.assets.scores;
+        let priority = |key: u128| scores.get(&AssetId(key)).copied().unwrap_or(UNRANKED);
+        let Ok(mut store) = store.write() else {
+            return Default::default();
+        };
+        store.advance_uploads(mirror.queue(), budget, Some(&priority as &crate::gpu::UploadPriorityFn<'_>))
+    }
+
     /// Whether [`Self::pump_assets`] has anything to do: a load in flight,
     /// one requested, or an asset newly referenced. Cheap and `&self`, so a
     /// frame loop can skip taking the world mutably when it is `false`.
     pub fn asset_work_pending(&self) -> bool {
         self.assets.outstanding > 0
+            || self.texture_uploads_pending()
             || !self.assets.requested.is_empty()
             || !self.assets.arrived.is_empty()
             || !self.assets.bind_queue.is_empty()
