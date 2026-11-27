@@ -985,6 +985,7 @@ impl TierEngine {
                 return Err(TierError::ReadUnsupported);
             }
         }
+        let _vram_owner = super::vram::owner();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scenedb-tier-materialization"),
             size: wgpu::Extent3d { width: spec.width, height: spec.height, depth_or_array_layers: 1 },

@@ -12,6 +12,7 @@ pub struct GenerationBuffer {
 
 impl GenerationBuffer {
     pub fn new(device: &wgpu::Device, max_slots: u32) -> Self {
+        let _vram_owner = super::vram::owner();
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scenedb-generations"),
             size: max_slots as u64 * 4,

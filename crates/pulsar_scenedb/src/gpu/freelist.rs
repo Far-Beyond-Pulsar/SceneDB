@@ -22,6 +22,11 @@ impl RangeList {
         Self { free: vec![(0, total)] }
     }
 
+    /// The length of every free span together.
+    pub(crate) fn free_total(&self) -> u64 {
+        self.free.iter().map(|&(_, len)| len).sum()
+    }
+
     pub(crate) fn alloc(&mut self, len: u64, align: u64) -> Option<u64> {
         debug_assert!(align.is_power_of_two());
         for i in 0..self.free.len() {

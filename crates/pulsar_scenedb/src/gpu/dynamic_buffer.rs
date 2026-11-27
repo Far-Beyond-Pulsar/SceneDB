@@ -150,6 +150,7 @@ impl<T: Pod> DynamicGpuBuffer<T> {
     }
 
     fn alloc(device: &wgpu::Device, label: &str, capacity: u32, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let _vram_owner = super::vram::owner();
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: capacity as u64 * std::mem::size_of::<T>() as u64,
@@ -385,6 +386,12 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         self.capacity
     }
 
+    /// The label every (re)allocation of the buffer carries: the name the
+    /// device's allocator report lists it under.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     /// Bumped by exactly one on every reallocation caused by
     /// [`Self::ensure_capacity`]. Compare against a previously-cached value
     /// to know whether a bind group built against [`Self::buffer`] needs
@@ -403,6 +410,7 @@ mod tests {
     }
 
     fn readback(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+        let _vram_owner = super::vram::owner();
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,

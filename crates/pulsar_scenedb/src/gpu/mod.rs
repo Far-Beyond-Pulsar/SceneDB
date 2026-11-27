@@ -37,6 +37,7 @@ mod tier_layout;
 mod tracker;
 mod var_len_pool;
 mod view_upload;
+mod vram;
 pub mod world_mirror;
 
 /// The one device every GPU unit test in this crate shares (SceneDB#59).
@@ -110,6 +111,7 @@ pub use tier::{
 pub use tier_layout::{register_segment_layout, register_segment_layout_for_type, LayoutError, Segment};
 pub use tracker::SubmissionTracker;
 pub use var_len_pool::{VarLenBufferRef, VarLenGpuPool, VarLenHandle};
+pub use vram::{set_owner_hook, vram_use, OwnerHook, VramUse};
 pub use view_upload::ViewTokenBuffers;
 pub use world_mirror::{
     clear_derived_row, free_interned_var_len_field_at_row, free_var_len_field_at_row, write_gpu_columns_at_row,

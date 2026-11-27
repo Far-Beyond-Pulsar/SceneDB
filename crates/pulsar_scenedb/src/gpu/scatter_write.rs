@@ -138,6 +138,7 @@ impl ScatterWritePipeline {
             compilation_options: Default::default(),
             cache: None,
         });
+        let _vram_owner = super::vram::owner();
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scenedb-scatter-write-params"),
             size: 8,

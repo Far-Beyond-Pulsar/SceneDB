@@ -110,6 +110,7 @@ pub struct SceneBuffer<T: Pod> {
 impl<T: Pod> SceneBuffer<T> {
     pub fn new(device: &wgpu::Device, label: &str, capacity: u32) -> Self {
         let size = capacity as u64 * std::mem::size_of::<T>() as u64;
+        let _vram_owner = super::vram::owner();
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,

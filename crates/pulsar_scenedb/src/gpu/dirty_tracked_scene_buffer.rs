@@ -607,6 +607,7 @@ mod tests {
     }
 
     fn readback(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+        let _vram_owner = super::vram::owner();
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,

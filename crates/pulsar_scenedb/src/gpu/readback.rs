@@ -65,6 +65,7 @@ pub fn readback_bytes(
         src.size(),
     );
 
+    let _vram_owner = super::vram::owner();
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scenedb-diagnostic-readback-staging"),
         size: len,

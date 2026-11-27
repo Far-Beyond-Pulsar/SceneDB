@@ -141,6 +141,20 @@ pub struct VarLenGpuPool<T: Pod> {
     inner: RwLock<Inner<T>>,
 }
 
+impl<T: Pod + Send + Sync + 'static> super::vram::VramUser for VarLenGpuPool<T> {
+    fn vram_use(&self) -> super::vram::VramUse {
+        let guard = self.inner.read().expect("VarLenGpuPool lock poisoned");
+        let element = std::mem::size_of::<T>() as u64;
+        let capacity = u64::from(guard.buf.capacity());
+        let free = guard.free.free_total().min(capacity);
+        super::vram::VramUse {
+            label: guard.buf.label().to_owned(),
+            capacity_bytes: capacity * element,
+            used_bytes: (capacity - free) * element,
+        }
+    }
+}
+
 impl<T: Pod + Send + Sync + 'static> VarLenGpuPool<T> {
     pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32) -> Self {
         Self::new_with_usage(device, label, initial_capacity, wgpu::BufferUsages::STORAGE)
@@ -652,6 +666,7 @@ mod tests {
     }
 
     fn readback(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+        let _vram_owner = super::vram::owner();
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,

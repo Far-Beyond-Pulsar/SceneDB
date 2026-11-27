@@ -525,6 +525,8 @@ impl SceneGpuStore {
                 )
                 .expect("slot capacity overflow");
         }
+        // Every buffer this constructor allocates is SceneDB's (`vram::owner`).
+        let _vram_owner = super::vram::owner();
         let store = Self {
             device: Arc::clone(ctx.device()),
             queue: Arc::clone(ctx.queue()),
@@ -2032,6 +2034,8 @@ impl SceneGpuStore {
             initial_capacity,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         ));
+        let weak_pool = Arc::downgrade(&pool);
+        crate::gpu::vram::track(weak_pool);
         // Variable-length pools are first-class SceneDB GPU resources. Keep
         // them in the same keyed registry as fixed columns so renderers and
         // inspector projections receive the payload buffer, not only the

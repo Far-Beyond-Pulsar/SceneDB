@@ -56,6 +56,7 @@ pub struct GeometryArena {
 
 impl GeometryArena {
     pub fn new(ctx: &EngineGpuContext, vertex_bytes: u64, index_bytes: u64) -> Self {
+        let _vram_owner = super::vram::owner();
         let vertex = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("geometry-arena-vertex"),
             size: vertex_bytes,
@@ -69,6 +70,7 @@ impl GeometryArena {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let _vram_owner = super::vram::owner();
         let index = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("geometry-arena-index"),
             size: index_bytes,
@@ -221,6 +223,7 @@ pub struct MeshRegistry {
 
 impl MeshRegistry {
     pub fn new(ctx: &EngineGpuContext, max_meshes: u32) -> Self {
+        let _vram_owner = super::vram::owner();
         let buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh-registry"),
             size: max_meshes as u64 * 72,
@@ -366,6 +369,7 @@ impl ClusterBuffer {
     /// below) — a buffer meant to hold N real appended nodes must be sized
     /// `max_nodes = N + 1`.
     pub fn new(ctx: &EngineGpuContext, max_nodes: u32) -> Self {
+        let _vram_owner = super::vram::owner();
         let buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("cluster-buffer"),
             size: max_nodes as u64 * 48,
@@ -576,6 +580,7 @@ pub struct MeshletBuffer {
 
 impl MeshletBuffer {
     pub fn new(ctx: &EngineGpuContext, max_entries: u32) -> Self {
+        let _vram_owner = super::vram::owner();
         let buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("meshlet-buffer"),
             size: max_entries as u64 * 32,
@@ -790,6 +795,7 @@ pub struct MaterialRegistry {
 
 impl MaterialRegistry {
     pub fn new(ctx: &EngineGpuContext, max_materials: u32) -> Self {
+        let _vram_owner = super::vram::owner();
         let buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("material-registry"),
             size: max_materials as u64 * 64,
@@ -1127,6 +1133,7 @@ impl TextureStore {
     ) -> Result<u32, TextureError> {
         let slot = self.allocate_slot()?;
 
+        let _vram_owner = super::vram::owner();
         let texture = device.create_texture(desc);
 
         // `block_copy_size(None)` returns `Some(_)` for essentially every
@@ -1217,6 +1224,7 @@ impl TextureStore {
         }
 
         let slot = self.allocate_slot()?;
+        let _vram_owner = super::vram::owner();
         let texture = device.create_texture(desc);
         for (level, (data, (physical, bytes_per_row, rows))) in
             mips.iter().zip(&layouts).enumerate()
@@ -1304,6 +1312,7 @@ impl TextureStore {
         }
         // A newer upload for the slot makes an older, unfinished one moot.
         self.staged.retain(|job| job.slot != slot);
+        let _vram_owner = super::vram::owner();
         let texture = device.create_texture(desc);
         let total: u64 = layouts
             .iter()

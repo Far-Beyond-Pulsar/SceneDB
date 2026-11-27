@@ -102,6 +102,7 @@ impl ViewTokenBuffers {
     fn alloc_pair(ctx: &EngineGpuContext, label: &str, capacity: u32) -> (wgpu::Buffer, wgpu::Buffer) {
         let size = capacity as u64 * 4;
         let make = |suffix: &str| {
+            let _vram_owner = super::vram::owner();
             ctx.device().create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("{label}-{suffix}")),
                 size,

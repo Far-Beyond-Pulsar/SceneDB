@@ -738,6 +738,7 @@ mod tests {
     }
 
     fn make_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+        let _vram_owner = super::vram::owner();
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: bytes,
