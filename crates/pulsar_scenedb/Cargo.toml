@@ -14,12 +14,12 @@ telemetry = ["dep:socket2", "dep:serde", "gpu"]
 # (`pulsar_reflection::methods`) that component methods are built on, plus the
 # built-in array registrations from 1c64758. Keep in step with the
 # `pulsar_reflection_codegen` pin in pulsar_scenedb_derive.
-pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "091eae569b4dce9de7def958e8a77ff620b07047" }
+pulsar_reflection = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "ddf351ded5fd23e9a8fda6c22338858fc39c6364" }
 serde_json        = { workspace = true }
 socket2           = { workspace = true, optional = true }
 serde             = { workspace = true, optional = true }
 ahash             = "0.8"
-profiling         = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "12424a5f75166332f9f1d2741281f6fc4847b44d" }
+profiling         = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "71f94766f0899ddbe2d5121c6de653fde432a692" }
 tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
 # Real (non-dev) dependency so `pub use pulsar_scenedb_derive::SceneStore`
