@@ -30,6 +30,7 @@ mod readback;
 mod region;
 mod scatter_write;
 mod scene_store;
+pub mod shared_textures;
 mod slot_allocator;
 mod system_binding;
 mod tier;

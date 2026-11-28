@@ -36,6 +36,30 @@
 //!   are never evicted by the budget. [`World::evict_unreferenced_assets`]
 //!   drops them all.
 //!
+//! # Assets that need assets
+//!
+//! A kind registered with [`register_composer`] says which other assets a
+//! loaded payload needs (a material its textures). The world counts those as
+//! references for as long as it keeps the payload, loads them like any other
+//! asset (tiers, priority, sharing: an asset needed by two others is loaded
+//! once), and, once each has loaded or failed, runs the kind's *compose* step
+//! on a loader thread to make the payload its components are bound to. It
+//! composes again whenever one of them changes (a finer tier, a reload), so
+//! an asset is as sharp as what it needs, and shows its coarsest form first.
+//! No loader reads another asset itself.
+//!
+//! # Release
+//!
+//! An asset is *in use* while a component references it or an asset in use
+//! needs it. A payload the cache keeps does not count. Once an asset this
+//! world had references to has been out of use for
+//! [`World::set_asset_release_delay`] pumps, the GPU textures the world's
+//! store holds for it are given back ([`crate::gpu::shared_textures`]), and
+//! so are those of whatever only it needed. The delay keeps a component that
+//! is rewritten, or a level that is switched, from freeing and uploading the
+//! same textures. Whoever keeps a slot must therefore reference the asset it
+//! came from.
+//!
 //! # Budgets, priority and quality tiers
 //!
 //! [`World::pump_assets`] does all of its work in one call. A frame thread
@@ -263,6 +287,138 @@ pub fn register_binding<T: Component>(kind: &'static str, bind: fn(&mut T, &Asse
     kind_bindings.push(binding);
 }
 
+/// One of the assets a payload needs, as its compose step sees it.
+#[derive(Clone)]
+pub struct AssetDependency {
+    pub id: AssetId,
+    /// [`AssetState::Ready`] or [`AssetState::Failed`].
+    pub state: AssetState,
+    /// Its content version: it changes with every tier and reload, so what
+    /// is made from this asset alone can be told apart by it.
+    pub version: u64,
+    /// The tier of the payload, and whether it is the finest.
+    pub tier: u8,
+    pub complete: bool,
+    payload: Option<AssetPayload>,
+}
+
+impl AssetDependency {
+    /// The payload as `T`, when the asset is ready.
+    pub fn payload<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.payload
+            .clone()
+            .and_then(|payload| payload.downcast::<T>().ok())
+    }
+}
+
+type DependenciesFn = Arc<dyn Fn(&AssetPayload) -> Vec<AssetId> + Send + Sync>;
+type ComposeFn =
+    Arc<dyn Fn(&AssetPayload, &[AssetDependency]) -> Result<AssetPayload, String> + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct Composer {
+    dependencies: DependenciesFn,
+    compose: ComposeFn,
+}
+
+/// Register how `kind`'s assets are made from other assets, replacing any
+/// earlier registration. `dependencies` names what the payload the loader
+/// made needs, by declared ids ([`AssetId::declare`]). `compose` makes the
+/// payload components are bound to from the loader's and the dependencies,
+/// in the order `dependencies` named them; it runs on a loader thread, so it
+/// is where to prepare whatever the frame thread will need of them. An asset
+/// that needs itself, directly or not, fails.
+pub fn register_composer(
+    kind: &'static str,
+    dependencies: impl Fn(&AssetPayload) -> Vec<AssetId> + Send + Sync + 'static,
+    compose: impl Fn(&AssetPayload, &[AssetDependency]) -> Result<AssetPayload, String>
+        + Send
+        + Sync
+        + 'static,
+) {
+    registries()
+        .composers
+        .write()
+        .expect("asset composers poisoned")
+        .insert(
+            kind,
+            Composer {
+                dependencies: Arc::new(dependencies),
+                compose: Arc::new(compose),
+            },
+        );
+}
+
+/// What a world's loading would end with for `payload`, a payload the loader
+/// of `kind` made, on the calling thread: the finest tier of everything it
+/// needs is loaded (with the registered loaders), then composed. For tools
+/// that show an asset outside a world; nothing is cached or shared. A kind
+/// with no composer returns `payload`.
+pub fn compose_asset_now(kind: &str, payload: AssetPayload) -> Result<AssetPayload, String> {
+    compose_now(kind, payload, &mut Vec::new())
+}
+
+fn compose_now(
+    kind: &str,
+    payload: AssetPayload,
+    above: &mut Vec<AssetId>,
+) -> Result<AssetPayload, String> {
+    let Some(composer) = composer(kind) else {
+        return Ok(payload);
+    };
+    let mut needs = Vec::new();
+    for id in (composer.dependencies)(&payload) {
+        let loaded = if above.contains(&id) {
+            Err("the asset needs itself".to_string())
+        } else {
+            load_now(id, above)
+        };
+        needs.push(AssetDependency {
+            id,
+            state: match &loaded {
+                Ok(_) => AssetState::Ready,
+                Err(message) => AssetState::Failed(Arc::from(message.as_str())),
+            },
+            version: 1,
+            tier: 0,
+            complete: true,
+            payload: loaded.ok(),
+        });
+    }
+    (composer.compose)(&payload, &needs)
+}
+
+fn load_now(id: AssetId, above: &mut Vec<AssetId>) -> Result<AssetPayload, String> {
+    let (kind, source) = id.source().ok_or("the asset was never declared")?;
+    let loader = loaders()
+        .read()
+        .expect("asset loaders poisoned")
+        .get(kind)
+        .cloned()
+        .ok_or_else(|| format!("no loader for asset kind `{kind}`"))?;
+    let mut tier = 0;
+    let payload = loop {
+        let load = loader(&source, tier)?;
+        if load.last {
+            break load.payload;
+        }
+        tier += 1;
+    };
+    above.push(id);
+    let composed = compose_now(kind, payload, above);
+    above.pop();
+    composed
+}
+
+fn composer(kind: &str) -> Option<Composer> {
+    registries()
+        .composers
+        .read()
+        .expect("asset composers poisoned")
+        .get(kind)
+        .cloned()
+}
+
 struct Declared {
     kind: &'static str,
     source: Arc<str>,
@@ -287,10 +443,14 @@ pub(crate) struct AssetRegistries {
     loaders: RwLock<HashMap<&'static str, TieredLoadFn>>,
     bindings: RwLock<HashMap<&'static str, Vec<Binding>>>,
     sizes: RwLock<HashMap<&'static str, SizeFn>>,
+    composers: RwLock<HashMap<&'static str, Composer>>,
     /// The residency cache (see [`crate::residency`]).
     pub(crate) residency: Mutex<crate::residency::State>,
     /// The derived-data cache (see [`crate::derived`]).
     pub(crate) derived: Mutex<crate::derived::State>,
+    /// GPU textures made from assets (see [`crate::gpu::shared_textures`]).
+    #[cfg(feature = "gpu")]
+    pub(crate) textures: Mutex<crate::gpu::shared_textures::Table>,
 }
 
 pub(crate) fn registries() -> &'static AssetRegistries {
@@ -336,6 +496,23 @@ struct Entry {
     complete: bool,
     /// A finer tier is loading while the coarser payload stays bound.
     upgrading: bool,
+    /// What the payload is made from, for a kind with a composer.
+    composed: Option<Composed>,
+}
+
+/// The loader's half of a composed asset.
+struct Composed {
+    /// What the loader made.
+    raw: AssetPayload,
+    raw_tier: u8,
+    raw_complete: bool,
+    /// What it needs, each held as a reference in this world.
+    needs: Vec<AssetId>,
+    /// The compose a completion must carry to be applied.
+    token: u64,
+    composing: bool,
+    /// Something it needs changed while it was composing.
+    again: bool,
 }
 
 enum LoadStart {
@@ -348,6 +525,8 @@ struct Completion {
     id: AssetId,
     token: u64,
     tier: u8,
+    /// The result of a compose step, not of the loader.
+    composed: bool,
     result: Result<TierLoad, String>,
 }
 
@@ -371,6 +550,8 @@ pub struct AssetViewer {
 const UNRANKED: f32 = f32::MAX;
 /// Ids bound per column walk while a pump has time left.
 const BIND_CHUNK: usize = 16;
+/// The default [`World::set_asset_release_delay`], pumps.
+pub const DEFAULT_ASSET_RELEASE_DELAY: u64 = 120;
 /// Pumps between rescoring requests that still wait.
 const RESCORE_PUMPS: u64 = 30;
 
@@ -428,6 +609,12 @@ pub(crate) struct AssetTable {
     arrived: Vec<Completion>,
     /// Applied assets whose dependents are not bound yet.
     bind_queue: Vec<AssetId>,
+    /// For each asset another needs, the assets that need it.
+    needed_by: HashMap<AssetId, HashSet<AssetId>>,
+    /// Assets that fell out of use, by the pump that saw it: their GPU forms
+    /// are given back [`Self::release_delay`] pumps later if still unused.
+    releasing: HashMap<AssetId, u64>,
+    release_delay: u64,
     /// Dependents of an asset that a pump ran out of time before reaching: one
     /// asset shared by thousands of entities is bound over several frames.
     partial_binds: std::collections::VecDeque<PartialBind>,
@@ -466,6 +653,9 @@ impl Default for AssetTable {
             budget: DEFAULT_ASSET_CACHE_BUDGET,
             arrived: Vec::new(),
             bind_queue: Vec::new(),
+            needed_by: HashMap::new(),
+            releasing: HashMap::new(),
+            release_delay: DEFAULT_ASSET_RELEASE_DELAY,
             partial_binds: std::collections::VecDeque::new(),
             upgrades: HashSet::new(),
             max_in_flight: asset_load_workers() * 2,
@@ -494,6 +684,8 @@ pub struct AssetPumpReport {
     pub loading: usize,
     /// Unreferenced payloads dropped to stay within the cache budget.
     pub evicted: usize,
+    /// GPU texture slots given back for assets out of use.
+    pub released: usize,
     /// Work left for later pumps: loads not started, in flight or finished
     /// but not applied, finer tiers not loaded, assets not bound. Zero means
     /// the world is settled.
@@ -518,12 +710,12 @@ impl World {
     pub fn pump_assets_within(&mut self, budget: AssetBudget) -> AssetPumpReport {
         let began = Instant::now();
         let max = budget.max_assets.max(1);
-        let out_of_time = |done: usize| {
-            done >= 1 && budget.time.is_some_and(|limit| began.elapsed() >= limit)
-        };
+        let out_of_time =
+            |done: usize| done >= 1 && budget.time.is_some_and(|limit| began.elapsed() >= limit);
         let mut report = AssetPumpReport::default();
         self.assets.pumps += 1;
-        let completions_scope = profiling::ProfileScope::new_static("Assets::apply_completed_loads");
+        let completions_scope =
+            profiling::ProfileScope::new_static("Assets::apply_completed_loads");
 
         // Finished loads: take them all off the channel, apply the nearest
         // first while the budget lasts.
@@ -551,6 +743,15 @@ impl World {
                 break;
             };
             let id = completion.id;
+            if completion.composed {
+                if self.apply_composed(completion) {
+                    report.completed += 1;
+                    applied += 1;
+                } else {
+                    report.stale += 1;
+                }
+                continue;
+            }
             let Some(entry) = self.assets.entries.get_mut(&id) else {
                 report.stale += 1;
                 continue;
@@ -563,6 +764,23 @@ impl World {
             }
             let was_upgrade = entry.upgrading;
             entry.upgrading = false;
+            let composer = composer(entry.kind);
+            if let (Some(composer), Ok(load)) = (composer, &completion.result) {
+                // What the loader made is not what components bind: that is
+                // composed once what it needs is in.
+                let needs = (composer.dependencies)(&load.payload);
+                self.loaded_for_composing(
+                    id,
+                    load.payload.clone(),
+                    completion.tier,
+                    load.last,
+                    needs,
+                );
+                report.completed += 1;
+                applied += 1;
+                continue;
+            }
+            let entry = self.assets.entries.get_mut(&id).expect("entry applied");
             match completion.result {
                 Ok(load) => {
                     entry.version += 1;
@@ -595,6 +813,7 @@ impl World {
             report.completed += 1;
             applied += 1;
             self.assets.bind_queue.push(id);
+            self.dependency_changed(id);
         }
 
         drop(completions_scope);
@@ -680,6 +899,7 @@ impl World {
             .filter(|entry| entry.state == AssetState::Loading)
             .count();
         report.evicted = self.enforce_asset_cache_budget();
+        report.released = self.release_unused_assets();
         report.pending = self.assets.outstanding
             + self.assets.arrived.len()
             + self.assets.bind_queue.len()
@@ -697,9 +917,8 @@ impl World {
         // cap. Loads that finish faster than the frame binds them would pile up
         // their cooked data until the residency cache evicts the oldest of it
         // (which the bind then rebuilds on the frame thread).
-        let backlog = self.assets.outstanding
-            + self.assets.arrived.len()
-            + self.assets.bind_queue.len();
+        let backlog =
+            self.assets.outstanding + self.assets.arrived.len() + self.assets.bind_queue.len();
         let free = self.assets.max_in_flight.saturating_sub(backlog);
         if free == 0 {
             return;
@@ -743,7 +962,10 @@ impl World {
                 match self.start_load(id, 0) {
                     LoadStart::Started => report.started += 1,
                     // No loader: failed on the spot, which its dependents see.
-                    LoadStart::Failed => self.assets.bind_queue.push(id),
+                    LoadStart::Failed => {
+                        self.assets.bind_queue.push(id);
+                        self.dependency_changed(id);
+                    }
                     LoadStart::Undeclared => {}
                 }
             }
@@ -771,8 +993,27 @@ impl World {
         }
         self.assets.scored_at = self.assets.pumps;
         let mut by_kind: HashMap<&'static str, HashSet<HandleId>> = HashMap::new();
-        let mut scored: HashMap<AssetId, f32> = wanted.iter().map(|id| (*id, UNRANKED)).collect();
-        for id in &wanted {
+        // An asset others need has no entity of its own: it ranks as the
+        // nearest of what needs it, so those are scored too.
+        let mut ranked: Vec<AssetId> = wanted.clone();
+        let mut seen: HashSet<AssetId> = ranked.iter().copied().collect();
+        let mut next = 0;
+        while next < ranked.len() {
+            for parent in self
+                .assets
+                .needed_by
+                .get(&ranked[next])
+                .into_iter()
+                .flatten()
+            {
+                if seen.insert(*parent) {
+                    ranked.push(*parent);
+                }
+            }
+            next += 1;
+        }
+        let mut scored: HashMap<AssetId, f32> = ranked.iter().map(|id| (*id, UNRANKED)).collect();
+        for id in &ranked {
             if let Some((kind, _)) = id.source() {
                 by_kind.entry(kind).or_default().insert(id.handle());
             }
@@ -795,6 +1036,19 @@ impl World {
                     *slot = slot.min(best);
                 }
             }
+        }
+        // Parents come after what needs them in `ranked`.
+        for id in ranked.iter().rev() {
+            let best = self
+                .assets
+                .needed_by
+                .get(id)
+                .into_iter()
+                .flatten()
+                .filter_map(|parent| scored.get(parent))
+                .fold(UNRANKED, |best, score| best.min(*score));
+            let slot = scored.entry(*id).or_insert(UNRANKED);
+            *slot = slot.min(best);
         }
         self.assets.scores.extend(scored);
     }
@@ -841,7 +1095,6 @@ impl World {
     pub fn asset_focus(&self) -> [f64; 3] {
         self.assets.focus
     }
-
 
     /// Pump until no load is in flight, or `timeout` passes: for headless
     /// loading and tests. Superseded loads still running count as in
@@ -891,7 +1144,10 @@ impl World {
     /// The frame thread's half of a texture upload: the cook ran on a loader,
     /// the copy to the GPU happens here, a few block rows at a time.
     #[cfg(feature = "gpu")]
-    pub fn advance_texture_uploads(&mut self, budget: crate::gpu::UploadBudget) -> crate::gpu::UploadReport {
+    pub fn advance_texture_uploads(
+        &mut self,
+        budget: crate::gpu::UploadBudget,
+    ) -> crate::gpu::UploadReport {
         profiling::profile_scope!("Assets::advance_texture_uploads");
         let Some(mirror) = self.gpu_mirror() else {
             return Default::default();
@@ -946,11 +1202,122 @@ impl World {
             || !self.assets.bind_queue.is_empty()
             || !self.assets.partial_binds.is_empty()
             || !self.assets.upgrades.is_empty()
-            || self
-                .handle_counts
-                .lock()
-                .expect("World handle_counts: mutex poisoned")
-                .has_touched_assets()
+            || !self.assets.releasing.is_empty()
+            || {
+                let counts = self
+                    .handle_counts
+                    .lock()
+                    .expect("World handle_counts: mutex poisoned");
+                counts.has_touched_assets() || counts.has_unused_assets()
+            }
+    }
+
+    /// How many pumps an asset stays out of use before its GPU textures are
+    /// given back (see the module doc). Defaults to
+    /// [`DEFAULT_ASSET_RELEASE_DELAY`].
+    pub fn set_asset_release_delay(&mut self, pumps: u64) {
+        self.assets.release_delay = pumps;
+    }
+
+    /// Whether a component references `id`, or an asset in use needs it.
+    pub fn asset_in_use(&self, id: AssetId) -> bool {
+        let mut pending = vec![id];
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            // References other than the ones assets hold are components'.
+            let mut held = 0i64;
+            for parent in self.assets.needed_by.get(&id).into_iter().flatten() {
+                if let Some(composed) = self
+                    .assets
+                    .entries
+                    .get(parent)
+                    .and_then(|entry| entry.composed.as_ref())
+                {
+                    held += composed.needs.iter().filter(|need| **need == id).count() as i64;
+                }
+                pending.push(*parent);
+            }
+            if self.asset_ref_count(id) > held {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether releasing `id` could free anything: the world's texture store
+    /// holds slots for it, or it needs other assets.
+    fn may_hold_gpu_forms(&self, id: AssetId) -> bool {
+        #[cfg(feature = "gpu")]
+        if self
+            .gpu_mirror()
+            .is_some_and(|mirror| crate::gpu::shared_textures::holds_asset(mirror, id))
+        {
+            return true;
+        }
+        self.assets
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.composed.as_ref())
+            .is_some_and(|composed| !composed.needs.is_empty())
+    }
+
+    /// Give back the GPU forms of assets that stayed out of use long enough.
+    /// Returns how many texture slots that freed.
+    fn release_unused_assets(&mut self) -> usize {
+        let unused = self
+            .handle_counts
+            .lock()
+            .expect("World handle_counts: mutex poisoned")
+            .take_unused_assets();
+        let pump = self.assets.pumps;
+        for handle in unused {
+            let id = AssetId(handle.0);
+            // With nothing to give back, now or through what it needs, there
+            // is no wait and no pumps are asked for.
+            if self.may_hold_gpu_forms(id) {
+                self.assets.releasing.entry(id).or_insert(pump);
+            }
+        }
+        let delay = self.assets.release_delay;
+        let mut due: Vec<AssetId> = self
+            .assets
+            .releasing
+            .iter()
+            .filter(|(_, since)| pump.saturating_sub(**since) >= delay)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut released = 0;
+        let mut seen = HashSet::new();
+        while let Some(id) = due.pop() {
+            self.assets.releasing.remove(&id);
+            if !seen.insert(id) || self.asset_in_use(id) {
+                continue;
+            }
+            profiling::profile_scope!("Assets::release_unused");
+            #[cfg(feature = "gpu")]
+            if let Some(mirror) = self.gpu_mirror() {
+                released += crate::gpu::shared_textures::release(&mirror, id);
+            }
+            // What it needs may only have been in use through it.
+            if let Some(composed) = self
+                .assets
+                .entries
+                .get(&id)
+                .and_then(|entry| entry.composed.as_ref())
+            {
+                due.extend(
+                    composed
+                        .needs
+                        .iter()
+                        .copied()
+                        .filter(|need| !need.is_zero()),
+                );
+            }
+        }
+        released
     }
 
     /// Where `id` stands in this world.
@@ -1067,7 +1434,7 @@ impl World {
             if cached <= self.assets.budget {
                 break;
             }
-            self.assets.entries.remove(&id);
+            self.drop_entry(id);
             cached -= bytes;
             evicted += 1;
         }
@@ -1086,10 +1453,262 @@ impl World {
             })
             .map(|(id, _)| *id)
             .collect();
-        for id in &unreferenced {
-            self.assets.entries.remove(id);
+        for &id in &unreferenced {
+            self.drop_entry(id);
         }
-        unreferenced.len()
+        // Dropping one releases what it needed, which may now be unused.
+        match unreferenced.len() {
+            0 => 0,
+            dropped => dropped + self.evict_unreferenced_assets(),
+        }
+    }
+
+    /// Forget `id`'s entry and give back the references it held.
+    fn drop_entry(&mut self, id: AssetId) {
+        if let Some(composed) = self
+            .assets
+            .entries
+            .remove(&id)
+            .and_then(|entry| entry.composed)
+        {
+            self.set_needs(id, &composed.needs, &[]);
+        }
+    }
+
+    /// Replace the references `parent` holds: `old` with `new`. What it
+    /// newly needs is requested.
+    fn set_needs(&mut self, parent: AssetId, old: &[AssetId], new: &[AssetId]) {
+        {
+            let mut counts = self
+                .handle_counts
+                .lock()
+                .expect("World handle_counts: mutex poisoned");
+            // Acquired before released, so one kept in both never reaches zero.
+            for id in new.iter().filter(|id| !id.is_zero()) {
+                counts.hold(id.handle());
+            }
+            for id in old.iter().filter(|id| !id.is_zero()) {
+                counts.let_go(id.handle());
+            }
+        }
+        for id in old {
+            if let Some(parents) = self.assets.needed_by.get_mut(id) {
+                parents.remove(&parent);
+                if parents.is_empty() {
+                    self.assets.needed_by.remove(id);
+                }
+            }
+        }
+        for &id in new.iter().filter(|id| !id.is_zero()) {
+            self.assets.needed_by.entry(id).or_default().insert(parent);
+            let unresolved = self
+                .assets
+                .entries
+                .get(&id)
+                .is_none_or(|entry| entry.state == AssetState::Unresolved);
+            if unresolved {
+                self.assets.requested.insert(id);
+            }
+        }
+    }
+
+    /// Whether `from` needs `target`, directly or through what it needs.
+    fn needs_asset(&self, from: AssetId, target: AssetId) -> bool {
+        let mut pending = vec![from];
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if id == target {
+                return true;
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(composed) = self
+                .assets
+                .entries
+                .get(&id)
+                .and_then(|entry| entry.composed.as_ref())
+            {
+                pending.extend(composed.needs.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// The loader of a composed asset finished a tier.
+    fn loaded_for_composing(
+        &mut self,
+        id: AssetId,
+        raw: AssetPayload,
+        raw_tier: u8,
+        raw_complete: bool,
+        needs: Vec<AssetId>,
+    ) {
+        if needs.iter().any(|&need| self.needs_asset(need, id)) {
+            let Some(entry) = self.assets.entries.get_mut(&id) else {
+                return;
+            };
+            tracing::warn!(kind = entry.kind, source = %entry.source, "asset needs itself");
+            entry.version += 1;
+            entry.state = AssetState::Failed(Arc::from("the asset needs itself"));
+            entry.payload = None;
+            entry.bytes = 0;
+            entry.complete = true;
+            self.assets.bind_queue.push(id);
+            self.dependency_changed(id);
+            return;
+        }
+        let Some(entry) = self.assets.entries.get_mut(&id) else {
+            return;
+        };
+        let previous = entry.composed.take();
+        let (old, token) = previous.map_or((Vec::new(), 0), |c| (c.needs, c.token));
+        entry.composed = Some(Composed {
+            raw,
+            raw_tier,
+            raw_complete,
+            needs: needs.clone(),
+            // Newer than any compose of the earlier payload still running.
+            token: token + 1,
+            composing: false,
+            again: false,
+        });
+        self.set_needs(id, &old, &needs);
+        self.compose_when_ready(id);
+    }
+
+    /// `id` changed: what needs it composes again.
+    fn dependency_changed(&mut self, id: AssetId) {
+        let parents: Vec<AssetId> = self
+            .assets
+            .needed_by
+            .get(&id)
+            .map(|parents| parents.iter().copied().collect())
+            .unwrap_or_default();
+        for parent in parents {
+            self.compose_when_ready(parent);
+        }
+    }
+
+    /// Start `id`'s compose step if everything it needs has loaded or failed.
+    fn compose_when_ready(&mut self, id: AssetId) {
+        let Some(entry) = self.assets.entries.get(&id) else {
+            return;
+        };
+        let (kind, Some(composed)) = (entry.kind, entry.composed.as_ref()) else {
+            return;
+        };
+        let mut complete = composed.raw_complete;
+        let mut needs = Vec::with_capacity(composed.needs.len());
+        for &need in &composed.needs {
+            if need.is_zero() {
+                needs.push(AssetDependency {
+                    id: need,
+                    state: AssetState::Failed(Arc::from("no asset")),
+                    version: 0,
+                    tier: 0,
+                    complete: true,
+                    payload: None,
+                });
+                continue;
+            }
+            let Some(other) = self.assets.entries.get(&need) else {
+                return;
+            };
+            if !matches!(other.state, AssetState::Ready | AssetState::Failed(_)) {
+                return;
+            }
+            complete &= other.complete;
+            needs.push(AssetDependency {
+                id: need,
+                state: other.state.clone(),
+                version: other.version,
+                tier: other.tier,
+                complete: other.complete,
+                payload: other.payload.clone(),
+            });
+        }
+        let Some(composer) = composer(kind) else {
+            return;
+        };
+        let composed = self
+            .assets
+            .entries
+            .get_mut(&id)
+            .and_then(|entry| entry.composed.as_mut())
+            .expect("checked above");
+        if composed.composing {
+            composed.again = true;
+            return;
+        }
+        composed.composing = true;
+        composed.token += 1;
+        let (token, tier, raw) = (composed.token, composed.raw_tier, composed.raw.clone());
+        self.assets.outstanding += 1;
+        let sender = self.assets.sender.clone();
+        run_load(Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (composer.compose)(&raw, &needs)
+            }))
+            .unwrap_or_else(|_| Err("the compose step panicked".to_owned()))
+            .map(|payload| TierLoad {
+                payload,
+                last: complete,
+            });
+            let _ = sender.send(Completion {
+                id,
+                token,
+                tier,
+                composed: true,
+                result,
+            });
+        }));
+    }
+
+    /// Apply a finished compose step. `false` when a newer one superseded it.
+    fn apply_composed(&mut self, completion: Completion) -> bool {
+        let id = completion.id;
+        let Some(entry) = self.assets.entries.get_mut(&id) else {
+            return false;
+        };
+        let Some(composed) = entry.composed.as_mut() else {
+            return false;
+        };
+        if composed.token != completion.token || !composed.composing {
+            return false;
+        }
+        composed.composing = false;
+        let again = std::mem::take(&mut composed.again);
+        let raw_complete = composed.raw_complete;
+        entry.version += 1;
+        entry.tier = completion.tier;
+        match completion.result {
+            Ok(load) => {
+                entry.bytes = payload_size(entry.kind, &load.payload);
+                entry.state = AssetState::Ready;
+                entry.payload = Some(load.payload);
+                entry.complete = load.last;
+            }
+            Err(message) => {
+                tracing::warn!(kind = entry.kind, source = %entry.source, %message, "asset failed to compose");
+                entry.state = AssetState::Failed(Arc::from(message));
+                entry.payload = None;
+                entry.bytes = 0;
+                entry.complete = true;
+            }
+        }
+        if !raw_complete {
+            self.assets.upgrades.insert(id);
+        }
+        if entry.complete {
+            self.assets.scores.remove(&id);
+        }
+        self.assets.bind_queue.push(id);
+        if again {
+            self.compose_when_ready(id);
+        }
+        self.dependency_changed(id);
+        true
     }
 
     /// Queue a worker load of `id`. An id whose kind has no loader is marked
@@ -1113,6 +1732,7 @@ impl World {
             tier: 0,
             complete: false,
             upgrading: false,
+            composed: None,
         });
         entry.token = token;
         let loader = loaders()
@@ -1145,6 +1765,7 @@ impl World {
                 id,
                 token,
                 tier,
+                composed: false,
                 result,
             });
         }));
@@ -1168,7 +1789,9 @@ impl World {
     fn bind_dependents(&mut self, ids: &HashSet<AssetId>, deadline: Option<Instant>) -> usize {
         profiling::profile_scope!("Assets::bind_dependents");
         // A new bind of an asset covers every dependent: what was waiting is moot.
-        self.assets.partial_binds.retain(|partial| !ids.contains(&partial.id));
+        self.assets
+            .partial_binds
+            .retain(|partial| !ids.contains(&partial.id));
         let mut by_kind: HashMap<&'static str, Vec<AssetId>> = HashMap::new();
         for &id in ids {
             if let Some(entry) = self.assets.entries.get(&id) {

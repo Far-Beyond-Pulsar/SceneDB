@@ -113,9 +113,10 @@ pub mod world_telemetry;
 
 pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use assets::{
-    asset_load_workers, register_binding, register_loader, register_payload_size,
-    register_tiered_loader, AssetBudget, AssetViewer, AssetId, AssetPriorityFn, TierLoad, TieredLoadFn,
+    asset_load_workers, compose_asset_now, register_binding, register_composer, register_loader,
+    register_payload_size, register_tiered_loader, AssetDependency, AssetBudget, AssetViewer, AssetId, AssetPriorityFn, TierLoad, TieredLoadFn,
     AssetPayload, AssetPumpReport, AssetState, AssetView, SizeFn, DEFAULT_ASSET_CACHE_BUDGET,
+    DEFAULT_ASSET_RELEASE_DELAY,
 };
 pub use bundle::Bundle;
 pub use derived::{

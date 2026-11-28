@@ -283,6 +283,9 @@ pub(crate) struct HandleCounts {
     /// reference since [`World::pump_assets`](crate::World::pump_assets)
     /// last took them: the ids it must load or bind.
     touched_assets: std::collections::HashSet<HandleId>,
+    /// The declared asset ids whose last reference went since the last
+    /// [`Self::take_unused_assets`].
+    unused_assets: std::collections::HashSet<HandleId>,
 }
 
 impl HandleCounts {
@@ -291,9 +294,34 @@ impl HandleCounts {
     /// boundary — see the module doc's "Zero-value convention").
     fn acquire(&mut self, id: HandleId) {
         *self.counts.entry(id).or_insert(0) += 1;
+        // In use again: a value rewritten in place releases and acquires.
+        self.unused_assets.remove(&id);
         if crate::assets::is_declared(id) {
             self.touched_assets.insert(id);
         }
+    }
+
+    /// The declared asset ids that lost their last reference since the last
+    /// call.
+    pub(crate) fn take_unused_assets(&mut self) -> Vec<HandleId> {
+        self.unused_assets.drain().collect()
+    }
+
+    /// Whether any declared asset id lost its last reference since the last
+    /// [`Self::take_unused_assets`].
+    pub(crate) fn has_unused_assets(&self) -> bool {
+        !self.unused_assets.is_empty()
+    }
+
+    /// A reference held by the world itself rather than by a component field:
+    /// what one asset needs of another ([`crate::assets`]).
+    pub(crate) fn hold(&mut self, id: HandleId) {
+        self.acquire(id);
+    }
+
+    /// Gives back what [`Self::hold`] took.
+    pub(crate) fn let_go(&mut self, id: HandleId) {
+        self.release(id);
     }
 
     /// The declared asset ids that gained a reference since the last call.
@@ -325,6 +353,9 @@ impl HandleCounts {
                 *count -= 1;
                 if *count <= 0 {
                     e.remove();
+                    if crate::assets::is_declared(id) {
+                        self.unused_assets.insert(id);
+                    }
                 }
             }
             Entry::Vacant(_) => {
