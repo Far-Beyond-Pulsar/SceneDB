@@ -11,4 +11,4 @@ proc-macro = true
 syn = { workspace = true, features = ["full", "extra-traits"] }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
-pulsar_reflection_codegen = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "ddf351ded5fd23e9a8fda6c22338858fc39c6364" }
+pulsar_reflection_codegen = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Reflection", rev = "25c37a3f54cda2bed8b4a15402b288305d5ba2ca" }
